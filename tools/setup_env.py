@@ -103,7 +103,7 @@ def _pip_check(profile: str, python: Path, *, dry_run: bool) -> None:
     allowed = []
     if profile == "macos":
         allowed.append("mlx-vlm 0.3.9 has requirement opencv-python>=4.12.0.88")
-    if profile == "falcon-cu118":
+    if profile in {"linux", "falcon-cu118"}:
         allowed.append("decord 0.6.0 is not supported on this platform")
     if output and all(any(marker in line for marker in allowed) for line in output.splitlines()):
         print(f"Ignoring known {profile} pip check warning:")
