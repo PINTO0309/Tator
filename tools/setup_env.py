@@ -11,6 +11,7 @@ import os
 import shlex
 import subprocess
 import sys
+import tempfile
 import venv
 from dataclasses import dataclass
 from pathlib import Path
@@ -18,6 +19,8 @@ from typing import Iterable
 
 
 ROOT_DIR = Path(__file__).resolve().parents[1]
+LINUX_TORCH_REQUIREMENTS = ["torch==2.12.0", "torchvision==0.27.0"]
+GPTQMODEL_REQUIREMENT = "gptqmodel==7.0.0"
 
 
 @dataclass(frozen=True)
@@ -111,12 +114,60 @@ def _pip_check(profile: str, python: Path, *, dry_run: bool) -> None:
     raise SystemExit(proc.returncode)
 
 
+def _install_requirements_excluding(
+    python: Path,
+    requirements: Path,
+    excluded_packages: set[str],
+    extra_args: list[str],
+    *,
+    dry_run: bool,
+) -> None:
+    filtered_path: Path | None = None
+    try:
+        with tempfile.NamedTemporaryFile(
+            "w",
+            encoding="utf-8",
+            prefix=f"{requirements.stem}-",
+            suffix=".txt",
+            delete=False,
+        ) as filtered:
+            filtered_path = Path(filtered.name)
+            for line in requirements.read_text(encoding="utf-8").splitlines():
+                body = line.split("#", 1)[0].strip()
+                package_name = (
+                    body.split("=", 1)[0].split("<", 1)[0].split(">", 1)[0].strip()
+                )
+                if package_name.lower().replace("_", "-") in excluded_packages:
+                    continue
+                filtered.write(f"{line}\n")
+        _pip_install(python, ["-r", str(filtered_path), *extra_args], dry_run=dry_run)
+    finally:
+        if filtered_path is not None:
+            filtered_path.unlink(missing_ok=True)
+
+
 def _install_bootstrap(python: Path, *, dry_run: bool) -> None:
     _pip_install(
         python,
         ["--upgrade", "pip", "wheel", "setuptools<81"],
         dry_run=dry_run,
     )
+
+
+def _install_gptqmodel(
+    python: Path,
+    *,
+    dry_run: bool,
+    constraints: Path | None = None,
+    no_deps: bool = False,
+) -> None:
+    args = ["--no-build-isolation"]
+    if no_deps:
+        args.append("--no-deps")
+    args.append(GPTQMODEL_REQUIREMENT)
+    if constraints is not None:
+        args.extend(["-c", str(constraints)])
+    _pip_install(python, args, dry_run=dry_run)
 
 
 def _install_macos(args: argparse.Namespace, python: Path) -> None:
@@ -137,6 +188,8 @@ def _install_macos(args: argparse.Namespace, python: Path) -> None:
 
 def _install_linux(args: argparse.Namespace, python: Path) -> None:
     _install_bootstrap(python, dry_run=args.dry_run)
+    _pip_install(python, LINUX_TORCH_REQUIREMENTS, dry_run=args.dry_run)
+    _install_gptqmodel(python, dry_run=args.dry_run)
     _pip_install(python, ["-r", "requirements.txt"], dry_run=args.dry_run)
     if args.dev:
         _pip_install(python, ["-r", "requirements-dev.txt"], dry_run=args.dry_run)
@@ -157,9 +210,17 @@ def _install_falcon(args: argparse.Namespace, python: Path) -> None:
         ],
         dry_run=args.dry_run,
     )
-    _pip_install(
+    _install_gptqmodel(
         python,
-        ["-r", "requirements.txt", "-c", "constraints/falcon-cu118.txt"],
+        dry_run=args.dry_run,
+        constraints=ROOT_DIR / "constraints" / "falcon-cu118.txt",
+        no_deps=True,
+    )
+    _install_requirements_excluding(
+        python,
+        ROOT_DIR / "requirements.txt",
+        {"gptqmodel", "torch", "torchvision"},
+        ["-c", "constraints/falcon-cu118.txt"],
         dry_run=args.dry_run,
     )
     if args.dev:
