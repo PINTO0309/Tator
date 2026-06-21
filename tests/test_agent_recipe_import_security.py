@@ -77,6 +77,18 @@ def test_agent_recipe_import_basic_success(tmp_path: Path) -> None:
     assert "crops/sample.png" in persisted["crops"]
 
 
+def test_agent_recipe_import_prefers_root_recipe_json(tmp_path: Path) -> None:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("clip_head/meta.json", json.dumps({"label": "shadow"}))
+        zf.writestr("recipe.json", json.dumps({"id": "r1", "label": "root"}))
+
+    old_id, persisted = _call_import(buf.getvalue(), tmp_path)
+
+    assert old_id == "r1"
+    assert persisted["label"] == "root"
+
+
 def test_agent_recipe_import_rejects_symlink_entry(tmp_path: Path) -> None:
     buf = BytesIO()
     with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
@@ -91,6 +103,39 @@ def test_agent_recipe_import_rejects_symlink_entry(tmp_path: Path) -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "agent_recipe_import_symlink_unsupported"
+
+
+@pytest.mark.parametrize("member_name", ["C:/escape.json", "\\\\server\\share\\escape.json"])
+def test_agent_recipe_import_rejects_windows_absolute_members(
+    tmp_path: Path,
+    member_name: str,
+) -> None:
+    payload = _make_zip(
+        {
+            "recipe.json": json.dumps({"id": "r1", "label": "demo"}).encode("utf-8"),
+            member_name: b"{}",
+        }
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        _call_import(payload, tmp_path)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "agent_recipe_import_invalid_path"
+
+
+def test_agent_recipe_import_rejects_duplicate_members(tmp_path: Path) -> None:
+    buf = BytesIO()
+    with zipfile.ZipFile(buf, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("recipe.json", json.dumps({"id": "r1", "label": "demo"}))
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zf.writestr("recipe.json", json.dumps({"id": "r2", "label": "shadow"}))
+
+    with pytest.raises(HTTPException) as exc_info:
+        _call_import(buf.getvalue(), tmp_path)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "agent_recipe_import_duplicate_files"
 
 
 def test_agent_recipe_import_rejects_oversize_entry(tmp_path: Path) -> None:

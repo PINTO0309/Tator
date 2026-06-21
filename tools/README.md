@@ -1,5 +1,9 @@
 Tools
 
+- macOS backend launcher
+  - Run: `tools/run_macos_backend.sh`
+  - Optional port override: `PORT=8080 tools/run_macos_backend.sh`
+
 - Labelmap reorder via Hungarian assignment
   - Run: `python tools/reorder_labelmap.py --help`
 
@@ -10,15 +14,41 @@ Tools
 - Qwen prepass smoke test (10-image baseline)
   - Run: `bash tools/run_qwen_prepass_smoke.sh --count 10 --seed 42 --dataset qwen_dataset`
 
+- Class Split Qwen review benchmark
+  - Run: `python tools/run_class_split_qwen_review_benchmark.py --job-id ... --source-run ... --count 100 --run-label ... --audit`
+  - Use `--source-backend-tier`, `--source-decision`, `--source-disposition`, `--source-disposition-signal`, `--source-guarded-only`, and `--source-reviewable-only` to filter a prior source run before `--start/--count` slicing.
+  - Analyze saved runs with `python tools/analyze_class_split_qwen_review_benchmark.py <run.json> --fail-on-unsafe`.
+  - Compare reviewer models on the same vignette set with `python tools/run_class_split_vlm_model_matrix.py --job-id ... --source-run ... --preset smoke-mlx --count 10`.
+  - Add `--enable-thinking` plus optional `--thinking-effort` / `--thinking-scale-factor` when explicitly benchmarking the two-phase thinking protocol. This adds a thinking scratchpad pass; schema-producing review calls stay thinking-disabled.
+
 - Refactor validation (py_compile + Tier-0/Tier-1 fuzz)
   - Run: `BASE_URL=http://127.0.0.1:8000 SKIP_GPU=1 tools/run_refactor_validation.sh`
   - Add `RUN_UNUSED_SCAN=1` to include the unused-def scan.
 
 - Fuzz smoke + lite (Tier-0/Tier-1)
   - Run: `BASE_URL=http://127.0.0.1:8000 SKIP_GPU=1 tools/run_fuzz_fast.sh`
+  - GPU-enabled Tier-1 Qwen prepass/caption checks can run longer than the
+    default request guard; set `REQUEST_TIMEOUT=300` for intentional long
+    runs. If a Qwen request times out, the harness requests `/qwen/cancel` and
+    writes the partial summary before exiting nonzero.
+
+- UI endpoint and contract checks
+  - Endpoint method map: `python tools/run_ui_endpoint_method_check.py http://127.0.0.1:8000`
+  - UI contract checks: `python tools/run_ui_contract_tests.py http://127.0.0.1:8000`
+  - UI smoke: `python tools/run_ui_smoke.py --base-url http://127.0.0.1:8000`
+  - UI concurrency smoke: `python tools/run_ui_concurrency_smoke.py --base-url http://127.0.0.1:8000`
+  - UI data-ops smoke: `python tools/run_ui_data_ops_tests.py --base-url http://127.0.0.1:8000`
+  - Playwright control coverage: `python tools/check_playwright_control_coverage.py`
+
+- Calibration job watcher
+  - Run: `tools/watch_calibration_job.sh --base-url http://127.0.0.1:8000 <job_id>`
+  - Optional interval override: `INTERVAL=2 tools/watch_calibration_job.sh <job_id>`
 
 - Unused-def scanner (heuristic, module-level only)
   - Run: `python tools/scan_unused_defs.py`
+  - Source definitions are reported only from first-party runtime packages;
+    references from tests and tools are still counted so maintained
+    compatibility wrappers do not appear as dead code.
   - Add `--include-underscore` to include private helpers.
   - Increase sensitivity with `--max-uses 1` to include definitions referenced only once.
 

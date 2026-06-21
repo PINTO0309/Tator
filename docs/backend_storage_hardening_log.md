@@ -3,6 +3,121 @@
 This log keeps implementation checkpoints out of the README front page while
 preserving the exact validation story for storage and artifact-write fixes.
 
+## 2026-06-13: Direct Tool Import Hygiene
+
+- Re-ran direct `--help` checks for all top-level Python tools and found two
+  path-invocation failures: `tools/clip_training.py` could not resolve
+  `utils.*`, and `tools/policy_runtime.py` could not resolve `tools.*`.
+- Added the standard repo-root bootstrap to both modules so they work as
+  importable modules and as direct script entrypoints.
+- Added a regression covering direct execution without traceback.
+- Validation: `py_compile` for the touched modules and regression file,
+  direct `--help` for both previously failing tools,
+  `tests/test_validation_cleanup_tools.py` (`28 passed`), and a full top-level
+  Python tool `--help` audit (`88` tools, no failures).
+
+## 2026-06-13: UI Data-Ops and Calibration Watcher Portability
+
+- Made `tools/run_ui_data_ops_tests.py` honor `BASE_URL`, an optional
+  positional backend URL, and `--base-url` so its glossary, recipe, and
+  dataset-glossary smoke checks follow the documented backend port override
+  flow.
+- Made `tools/watch_calibration_job.sh` self-contained by replacing the
+  undeclared `/tmp/print_job.py` helper with `python3 -m json.tool`, and added
+  `BASE_URL`, `--base-url`, and interval controls.
+- Added regression coverage for import safety, base URL precedence, shell
+  syntax, and watcher help output.
+- Validation: `py_compile` for `tools/run_ui_data_ops_tests.py` and regression
+  coverage, `bash -n tools/watch_calibration_job.sh`,
+  `tests/test_validation_cleanup_tools.py` (`27 passed`), both updated
+  `--help` paths, live `tools/run_ui_data_ops_tests.py --base-url
+  http://127.0.0.1:8000`, `git diff --check`, and `SKIP_GPU=1
+  BASE_URL=http://127.0.0.1:8000 tools/run_refactor_validation.sh`.
+
+## 2026-06-13: UI Smoke Tool Base URL Support
+
+- Made `tools/run_ui_smoke.py` and `tools/run_ui_concurrency_smoke.py`
+  honor `BASE_URL`, an optional positional backend URL, and the documented
+  `--base-url` flag so validation works after launching the backend on a
+  non-default port.
+- Made `tools/run_ui_concurrency_smoke.py` import-side-effect-free and added
+  clean `--help` handling for both smoke tools.
+- Added regression coverage for import safety and base URL precedence.
+- Validation: `py_compile` for the two smoke tools and their regression tests,
+  `tests/test_validation_cleanup_tools.py` (`24 passed`), both smoke-tool
+  `--help` commands, `git diff --check`, and live
+  `tools/run_ui_concurrency_smoke.py` checks against `http://127.0.0.1:8000`
+  using both `BASE_URL` and `--base-url`; `SKIP_GPU=1
+  BASE_URL=http://127.0.0.1:8000 tools/run_refactor_validation.sh` also
+  passed.
+
+## 2026-06-13: Dataset Registry Labelmap Windows Metadata
+
+- Resolved Windows absolute, Windows-drive, UNC-style, and backslash-relative
+  `yolo_labelmap_path` metadata for registry datasets inside the dataset
+  registry directory.
+- Kept existing source-root read-only behavior and final registry-root
+  containment checks before using any metadata labelmap.
+- Added regressions for linked registry datasets whose metadata was written on
+  Windows or with Windows-style relative paths.
+- Validation: `118 passed, 8 warnings` for linked-root status, dataset
+  metadata IO, and linked annotation flow coverage.
+
+## 2026-06-13: CLIP Labelmap Windows Metadata Hints
+
+- Resolved Windows absolute, Windows-drive, UNC-style, and backslash-relative
+  CLIP labelmap metadata hints into registry-contained labelmap paths.
+- Kept existing alias, symlink, extension, and root-containment checks before
+  returning any labelmap file.
+- Added regressions for Windows path hints and nested backslash-relative
+  labelmap metadata.
+- Validation: `113 passed, 8 warnings` for CLIP registry download, CLIP
+  artifact publication, and backend path-containment coverage.
+
+## 2026-06-13: COCO Windows Path Import Fallback
+
+- Treated Windows absolute, Windows-drive, and UNC-style COCO image names like
+  other absolute/traversal names by falling back to the image basename.
+- Kept existing containment checks for resolved candidate image files under the
+  dataset/image roots.
+- Added regressions for Windows-style COCO image names and matching YOLO label
+  relpath generation.
+- Validation: `118 passed, 8 warnings` for COCO conversion, COCO IO, dataset
+  metadata IO, and linked annotation flow coverage.
+
+## 2026-06-13: Calibration Image Reference Portability Guard
+
+- Rejected Windows absolute, Windows-drive, and UNC-style image names before
+  resolving calibration dataset images.
+- Kept existing relative split image lookup behavior unchanged for normal YOLO
+  dataset layouts.
+- Added regressions beside the existing traversal and symlink-escape checks.
+- Validation: `88 passed, 8 warnings` for calibration helper, report bundle,
+  recipe, progress, worker, metrics, and UI contract coverage.
+
+## 2026-06-13: Auto-Label Result Job Id Guard
+
+- Rejected path-like, Windows-drive, and UNC-style job ids before writing
+  auto-label result artifacts.
+- Kept normal generated UUID-style auto-label job ids unchanged.
+- Added a regression that invalid portable path ids do not create the
+  auto-label root or any nested result directories.
+- Validation: `19 passed` for `tests/test_auto_labeling_runner.py`; `56
+  passed, 8 warnings` for adjacent backend job-start, auto-labeling, and job
+  helper coverage.
+
+## 2026-06-13: Qwen Training Portable Image References
+
+- Rejected Windows absolute and UNC-style image references in Qwen training
+  manifests before resolving image files on macOS/Linux.
+- Kept existing support for relative POSIX and backslash-separated relative
+  image names under the dataset split image roots.
+- Added regressions for `C:/...` and UNC-style image references alongside the
+  existing traversal, absolute-path, directory, and symlink-escape tests.
+- Validation: `13 passed` for `tests/test_qwen_training_backend.py`; `98
+  passed, 8 warnings` for Qwen training, MLX runtime, and dataset upload
+  security coverage.
+
 ## 2026-05-24: SAM3 and Shared Training Split Roots
 
 - Rejected symlink components anywhere in shared Qwen/SAM3 training split roots
@@ -2282,3 +2397,1063 @@ preserving the exact validation story for storage and artifact-write fixes.
   ybat-master/ybat.js`, `git diff --check`, focused route/layout/calibration UI
   contracts, focused class-analysis coverage, live backend checks for `/`,
   `/tator.html`, `/ybat.html`, `/ybat.js`, and `/system/health_summary`.
+
+## 2026-06-08: Shortcut Remapping And Qwen Specificity Probe Closeout
+
+- Replaced the static Label Images shortcut explainer with a registry-backed
+  shortcut panel that lists the active bindings, stores browser-local
+  customizations, and supports reset, clear, import, and export actions.
+- Added remappable actions for next/previous image, next/previous class, start
+  drawing, end drawing, cancel drawing/focus, box deletion, latest-box deletion,
+  SAM point and multi-point controls, region-detect hold, Auto/SAM mode toggles,
+  YOLO-caption export, SAM3 similarity, and direct class ID slots `0` through
+  `19`.
+- Kept the shortcut editor inside the Label Images sidebar instead of adding
+  another top-level tab, and updated light, dark, and Pip-Boy theme styling so
+  key chips and remap rows remain readable.
+- Added the Class Split Qwen specificity probe and region-contrast evidence
+  path: the review loop can render clean context, target-only pixels,
+  target-removed context, and strongest-overlap pixels, then ask Qwen to
+  separate target-specific evidence from background/overlap cues before final
+  review.
+- Extended benchmark audit output with specificity-probe status, margin,
+  reconciliation, guarded signal strength, and confirm-current rebuttal checks.
+- Validation: `node --check ybat-master/ybat.js`, `py_compile` for
+  `localinferenceapi.py`, the Qwen benchmark tools, and the focused tests;
+  `tests/test_labeling_panel_layout_contract.py` (`23 passed`),
+  `tests/test_tator_ui_routes.py` (`1 passed`), and combined
+  `tests/test_class_analysis.py tests/test_qwen_review_benchmark_audit.py`
+  (`251 passed`). `git diff --check` passed. The in-app browser surface was not
+  available in this Codex session, so browser verification was limited to route
+  and static contract tests.
+
+## 2026-06-12: Dataset Upload Session Start Validation
+
+- Re-audited the backend and UI route sanity checks after the broad platform
+  hardening pass. `tools/run_ui_openapi_sanity.py` found that
+  `POST /datasets/upload_session/start` accepted an empty JSON body and created
+  a persistent staged-upload session.
+- Hardened staged dataset uploads so session creation now rejects malformed
+  payloads before creating any session directory. A start request must include a
+  non-empty dataset id or run name, a supported dataset type (`bbox` or `seg`),
+  and a positive expected image count.
+- Added a regression that proves an empty start payload returns a client error
+  and leaves both the upload-session root and in-memory session registry
+  untouched.
+- Validation: `git diff --check`, `py_compile localinferenceapi.py`,
+  `tests/test_dataset_zip_upload_security.py` (`18 passed`), full
+  `pytest -q` (`1536 passed`, `39 skipped`), `tools/run_refactor_validation.sh`
+  with fuzz skipped, `tools/check_ui_endpoints.py http://127.0.0.1:8000`,
+  `tools/run_ui_openapi_sanity.py http://127.0.0.1:8000`,
+  `tools/run_openapi_missing_query_sanity.py http://127.0.0.1:8000`,
+  `tools/run_ui_smoke.py --base-url http://127.0.0.1:8000`, rendered
+  Playwright control coverage, and full `RUN_UI_E2E=1` browser E2E
+  (`41 passed`) against the restarted backend.
+
+## 2026-06-12: UI Parameter Sweep Preconditions
+
+- Re-ran the live UI concurrency, endpoint, contract, fuzz, and parameter-sweep
+  checks against the running backend. The parameter sweep was incorrectly
+  classifying detector `412 Precondition Failed` responses as regressions when
+  no active YOLO or RF-DETR model was configured.
+- Made `tools/run_ui_param_sweep.py` import-safe and gave it the same explicit
+  negative-path contract used by the other UI validation tools. Optional
+  detector routes may return `412` when their active model precondition is not
+  satisfied; that is a clean validation result, not a product failure.
+- Added regression coverage proving the sweep no longer performs backend calls
+  during import and that detector precondition responses remain accepted.
+- Validation: `py_compile tools/run_ui_param_sweep.py`,
+  `tests/test_validation_cleanup_tools.py` (`7 passed`), and
+  `tools/run_ui_param_sweep.py http://127.0.0.1:8000` (`failures: []`).
+  Broader validation also passed: `git diff --check`, `node --check
+  ybat-master/ybat.js`, UI endpoint method check (`276` fetches, no failures),
+  UI contract tests (`82` checks, no failures), UI concurrency smoke, OpenAPI
+  sanity (`167` tested, no failures), missing-query sanity (`5` tested, no
+  failures), backend health summary (`ok: true`), and full `pytest -q`
+  (`1538 passed`, `39 skipped`).
+
+## 2026-06-12: Validation Script Python Resolution
+
+- Continued the broad validation pass and found that
+  `tools/run_refactor_validation.sh` failed on the current macOS shell because
+  it called `python` directly. The project validation path should not depend on
+  callers manually prepending `.venv-macos/bin` to `PATH`.
+- Hardened `tools/run_refactor_validation.sh` and `tools/run_fuzz_fast.sh` so
+  they resolve Python in a predictable order: explicit `PYTHON`, repo-local
+  `.venv-macos`, repo-local `.venv`, then `python3`/`python`. Both scripts now
+  anchor to the repository root before invoking project files.
+- The refactor wrapper passes its resolved interpreter into the fuzz wrapper, so
+  nested validation uses the same Python environment.
+- Validation: `SKIP_GPU=1 BASE_URL=http://127.0.0.1:8000
+  tools/run_refactor_validation.sh` completed pycompile and Tier-0/Tier-1 fuzz,
+  and a direct `tools/run_fuzz_fast.sh` run completed with `skip_gpu: true`.
+
+## 2026-06-12: Qwen Benchmark Script Portability
+
+- Extended the script audit to the Qwen benchmark tooling and MLP automation.
+  Both Qwen prepass shell wrappers lacked execute bits and failed through
+  `bash` with `python: command not found`; `tools/auto_mlp_run.sh` also carried
+  an old host-specific checkout path.
+- Made the Qwen prepass smoke and benchmark wrappers executable, repo-root
+  anchored, and Python-resolving using the same explicit `PYTHON` override /
+  repo venv / `python3` fallback policy as the validation scripts.
+- Made `tools/auto_mlp_run.sh` derive its root from the script location unless
+  `ROOT_DIR` is explicitly supplied, create its log directory, select
+  `.venv`/`.venv-macos` when available, and run all Python steps through the
+  resolved interpreter.
+- Added regression coverage that the Qwen wrappers are executable and
+  interpreter-resolving, and that the MLP runner has no host-specific root or
+  bare Python invocations.
+- Validation: shell syntax for all `*.sh` files, direct `--help` execution for
+  `tools/run_qwen_prepass_smoke.sh` and `tools/run_qwen_prepass_benchmark.sh`,
+  and `tests/test_validation_cleanup_tools.py` (`9 passed`). Broader validation
+  also passed: `git diff --check`, `tools/run_refactor_validation.sh` with
+  `SKIP_GPU=1`, UI endpoint method check (`276` fetches, no failures), UI
+  contract tests (`82` checks, no failures), backend health summary
+  (`ok: true`), and full `pytest -q` (`1540 passed`, `39 skipped`).
+
+## 2026-06-12: Documented Tool Entry-Point Hardening
+
+- Continued the validation-tool hardening pass by scanning Python tools for
+  raw `sys.argv` handling and running a full `--help` smoke over `tools/*.py`.
+- Fixed the remaining non-argparse Python entry points used by the local fuzz
+  and training workflows: `tools/fuzz_tier0.py` and
+  `tools/watch_yolo_train_and_activate.py`.
+- Fixed direct-script execution for documented/context-feature tools that
+  import the `tools` package by inserting the repository root into `sys.path`
+  before package imports: `tools/derive_context_feature_variants.py`,
+  `tools/label_candidates_iou90.py`, and
+  `tools/run_context_feature_ablation.py`.
+- Made `tools/detect_missclassifications.py --help` and missing-argument usage
+  work before optional PyQt/CLIP/OpenCV dependencies are imported, so the tools
+  index remains useful on machines without the interactive inspector stack.
+- Made `tools/run_class_split_qwen_review_benchmark.py --help` avoid importing
+  `localinferenceapi` and loading CLIP before printing usage.
+- Added regression coverage for the documented/local workflow entry points so
+  `--help` stays clean, exits zero where appropriate, and does not load CLIP as
+  a side effect.
+- Validation: direct help checks for the repaired scripts, focused
+  validation-tool tests, py-compile for touched scripts/tests, direct fuzz
+  wrapper execution, UI endpoint map check, OpenAPI missing-query sanity,
+  UI/OpenAPI endpoint comparison, `tools/run_refactor_validation.sh`, browser
+  E2E (`41 passed`), and full pytest (`1544 passed`, `39 skipped`).
+
+## 2026-06-12: UI Validation Tool Help Hygiene
+
+- Continued the platform validation pass after the README/tool reference drift
+  fix and audited the validation tools themselves.
+- Found that several live UI validation scripts treated `--help` as a backend
+  URL or raised a traceback instead of printing local command help. This made
+  the documented tools harder to discover and could send confusing requests to
+  fake hosts such as `--help`.
+- Added explicit `argparse` parsing to `tools/check_ui_endpoints.py`,
+  `tools/run_ui_contract_tests.py`, `tools/run_ui_negative_tests.py`, and
+  `tools/run_ui_param_sweep.py` while preserving the existing optional
+  positional `base_url` behavior.
+- Added regression coverage that these validation tools exit cleanly on
+  `--help` without touching the backend or printing a bootstrap failure.
+- Validation: direct `--help` checks for all `tools/run_ui_*.py` scripts plus
+  `tools/check_ui_endpoints.py`, py-compile for touched scripts/tests, focused
+  validation-tool tests, live normal invocations of endpoint, contract,
+  negative-path, and parameter-sweep checks against `http://127.0.0.1:8000`,
+  browser E2E (`41 passed`), and full pytest (`1544 passed`, `39 skipped`).
+
+## 2026-06-12: GPU Validation Interrupt Cleanup
+
+- Re-ran the GPU validation suite as part of the backend hardening sweep and
+  found a bad failure mode: if the suite was interrupted during bootstrap or a
+  long job poll, the generated validation dataset could remain registered and
+  the event log did not clearly show the in-flight request.
+- Added request-start/request-end events around every suite HTTP call, so a
+  timeout or hang leaves the method, path, timeout, payload shape, status, and
+  duration in `events.jsonl`.
+- Wrote the cleanup manifest immediately after the generated dataset upload,
+  then refreshed it whenever bootstrap completed, a job started, or a derived
+  segmentation dataset was registered. An interrupted run now has enough
+  provenance to clean its own generated data instead of relying on memory of
+  what had already happened.
+- Added API-level cancellation for known run-started jobs during cleanup before
+  deleting their source datasets. This covers calibration, agent mining, YOLO,
+  YOLO head-graft, RF-DETR, SAM3, and Qwen training jobs.
+- Added SIGTERM/KeyboardInterrupt handling so normal terminal interrupts still
+  write reports and run cleanup instead of leaving the suite half-finished.
+- Validation: focused cleanup-tool tests (`14 passed`), `py_compile` for the
+  touched suite/tests, `git diff --check`, live SIGTERM probe against
+  `http://127.0.0.1:8000` (`exit_code=130`, reports written, no active
+  `codex_sigterm_probe_20260612` dataset remained), and backend
+  `/system/health_summary` (`ok: true`, dataset count `10`).
+
+## 2026-06-12: README Tool Reference Drift Check
+
+- Audited the README developer/tooling section after the extended validation
+  pass and found several historical utility names that no longer exist in the
+  current `tools/` tree.
+- Replaced those stale entries with the live setup, dataset-inspection,
+  Class Split/Qwen benchmark, and validation command entry points. Updated the
+  tools index with the backend launcher and UI validation commands that the
+  README now points users toward.
+- Expanded the README validation section with the actual local hardening ladder
+  used for recent backend/UI work: diff whitespace checks, focused validation
+  tests, refactor/fuzz validation, UI endpoint checks, contract checks,
+  Playwright control coverage, and browser E2E.
+- Added a README reference regression so future changes fail if first-layer
+  README `tools/` or `tests/` references point to missing files.
+
+## 2026-06-12: Browser E2E Default Harness
+
+- Rechecked the browser E2E command used in the hardening ladder and found that
+  `RUN_UI_E2E=1 pytest tests/ui/e2e` still skipped most browser coverage unless
+  `UI_PAGE_URL` and `UI_DATASET_PATH` were set manually.
+- Updated the E2E environment helper to use the backend-served UI at
+  `${UI_API_ROOT:-http://127.0.0.1:8000}/tator.html` by default and the
+  repo-local `tests/fixtures/fuzz_pack` dataset by default. Explicit
+  `UI_PAGE_URL`, `UI_DATASET_PATH`, staging, and API-root overrides are still
+  honored.
+- Added regression coverage for the default URL/dataset behavior and explicit
+  override behavior.
+- Validation: `tests/test_ui_e2e_env_defaults.py` (`2 passed`) and
+  `RUN_UI_E2E=1 tests/ui/e2e` (`41 passed`) against the running backend.
+  Broader validation also passed: `git diff --check`, `py_compile` for the E2E
+  env helper, focused validation-tool tests (`11 passed`), `node --check
+  ybat-master/ybat.js`, UI endpoint method check (`276` fetches, no failures),
+  UI contract tests (`82` checks, no failures), backend health summary
+  (`ok: true`), OpenAPI missing-param sanity (`76` tested, no failures), UI
+  negative tests (`18` tested, no failures), UI smoke, UI data-ops
+  create/get/delete and dataset-glossary restore checks, and full `pytest -q`
+  (`1542 passed`, `39 skipped`).
+
+## 2026-06-13: Qwen Prepass Progress Lifecycle
+
+- Investigated an abandoned GPU-validation Qwen prepass that left
+  `/qwen/progress` stuck at `active: true` after the request stopped
+  heartbeating. The browser could keep presenting Qwen/prepass work as active
+  even though no new progress was possible from that request.
+- Added a generic `/qwen/cancel` endpoint for active Qwen work. Caption cancel
+  remains available at `/qwen/caption/cancel`, while prepass/inference can now
+  use the same backend cancellation event instead of only aborting the browser
+  fetch.
+- Added stale-progress expiry on `/qwen/progress` reads. Active Qwen progress
+  that has not updated for `TATOR_QWEN_PROGRESS_STALE_SECONDS` is marked
+  terminal and the UI is released. The default is 1800 seconds. If the
+  underlying ML runtime is still blocked inside a non-interruptible Metal/CUDA
+  call, the message tells the user to restart the backend.
+- Added detector-step progress heartbeats and cooperative cancel checks to the
+  deep prepass detector/SAM3 loops, so the trace and progress UI name the
+  current detector mode before long YOLO/RF-DETR/SAM3 calls.
+- Validation: Python compile for touched backend modules, `node --check
+  ybat-master/ybat.js`, focused Qwen progress tests (`25 passed`), and focused
+  prepass detector/source-score tests (`20 passed`).
+
+## 2026-06-13: Annotation Snapshot Retry Guard
+
+- Found a browser-side retry storm after an annotation snapshot failure: a
+  failed text-caption blur save plus a blocked Close left the unchanged dirty
+  snapshot eligible for the 1.5 s background autosave interval.
+- Added an exact dirty-snapshot failure signature in the annotation workspace.
+  Background autosave skips only that unchanged failed payload, while explicit
+  Save, Close, and workflow preflight retries remain available so the user can
+  recover without data loss.
+- Stopped failed snapshot responses from draining queued follow-up saves, and
+  suppressed stale caption autosave timers
+  for the same image/text value after a failed attempt.
+- Extended the close-block E2E regression to assert that no additional
+  `/annotation/snapshot` requests are fired after the UI reports "close
+  blocked" for the failed payload.
+- Validation: `node --check ybat-master/ybat.js`, focused browser regression
+  (`1 passed`), dataset annotation browser file (`11 passed`), full browser E2E
+  (`41 passed`), and `git diff --check`.
+
+## 2026-06-13: Validation Tooling And Schema Cleanup
+
+- Continued the broad post-hardening sweep by running the unused-definition
+  scanner after the full UI/API/Python validation ladder.
+- Fixed `tools/scan_unused_defs.py` so first-party `models/` package references
+  and maintained test/tool references count as uses. This removed false
+  positives for actively used Pydantic compatibility helpers and public
+  compatibility wrappers.
+- Removed the stale `PromptHelperPreset` schema and import. Prompt-helper
+  presets are persisted and returned as service dictionaries; the removed
+  Pydantic class was not attached to any request/response model.
+- Removed an unused data-ingestion media-file helper left behind after the
+  backend upload/reference flow moved to dedicated dataset media-row builders.
+- Validation: `py_compile` for touched modules, focused validation-tool,
+  data-ingestion, prompt-helper, and path-containment coverage (`122 passed` in
+  focused runs), UI endpoint path/method checks, full pytest suite (`1554
+  passed, 39 skipped`), and strict unused-definition scan (`--max-uses 0`, no
+  output).
+
+## 2026-06-13: Startup Docs And Tool Entry Audit
+
+- Ran a `--help` entry-point sweep over argparse-style `tools/*.py` scripts
+  under `.venv-macos`; all 80 checked tool commands exited cleanly.
+- Rechecked the UI serving path after the `tator.html` rename. Backend routes
+  still serve `/` and `/tator.html`, while `/ybat.html` remains a legacy
+  redirect.
+- Clarified the frontend-only static server notes in the browser UI and macOS
+  setup docs so port `8080` is not mistaken for the normal backend address.
+- Removed host-specific checkout paths from historical validation docs while
+  preserving the run-scoped artifact provenance.
+- Validation: `git diff --check`, documentation reference checks, and the UI
+  route test (`2 passed` in focused pytest).
+
+## 2026-06-13: Cross-Platform UI/API Validation Sweep
+
+- Continued the open hardening sweep without narrowing scope to a single
+  feature area. The shipped browser UI has no duplicate static HTML ids, no
+  missing backend routes from fetch calls, and no UI/OpenAPI method mismatches.
+- Confirmed ignored local browser backup files are neither tracked nor served by
+  the backend UI whitelist; no cleanup was performed because they are local
+  non-shipped files.
+- Verified the Qwen auto-label panel remains intentionally absent from the
+  Label Images sidebar while backend job discovery still reports auto-label jobs
+  in the automation overview.
+- Validation: backend health (`HTTP 200`, `ok: true`), `node --check
+  ybat-master/ybat.js`, UI endpoint method check (`277` fetches, no failures),
+  legacy endpoint checker (`184` UI endpoints, no missing paths or method
+  mismatches), UI contract runner (`82` checks, no failures), Playwright control
+  coverage (`83` controls), route/layout focused pytest (`30 passed`), full
+  browser E2E with `RUN_UI_E2E=1` (`41 passed`), full pytest suite (`1554
+  passed, 39 skipped`), UI negative tests (`18` checks), UI data-ops smoke,
+  OpenAPI sanity (`167` tested, no failures), endpoint map check (`170` paths),
+  and `SKIP_GPU=1` refactor/fuzz validation.
+
+## 2026-06-13: Destructive Path Helper Hardening
+
+- Audited dataset, upload-session, annotation snapshot, detector run,
+  data-ingestion, class-analysis, agent-mining, Qwen, and SAM3 lifecycle tests
+  for destructive path handling and stale-state cleanup.
+- Hardened the generic `_purge_directory` helper so it refuses to purge through
+  a symlinked root. Current callers already validate their cache roots, but the
+  helper is now fail-closed if reused from another cleanup path later.
+- Added a regression proving a symlinked purge root leaves the target directory
+  and files untouched.
+- Validation: direct purge-helper regression and SAM3 purge checks (`4
+  passed`), pycompile for touched files, and the broader data-safety/lifecycle
+  focused suite (`657 passed`).
+
+## 2026-06-13: Tool Entrypoint Portability Sweep
+
+- Audited tracked project shell scripts and Python tool entrypoints after the
+  startup-doc cleanup.
+- Normalized remaining `#!/usr/bin/env python` shebangs in maintained Python
+  tools to `#!/usr/bin/env python3`, matching the repository's Python 3-only
+  runtime and avoiding failures on systems without a `python` alias.
+- Confirmed local Swift worker build artifacts under
+  `tools/mlx_dinov3_worker/.build/` are ignored and not part of the tracked
+  project script surface.
+- Validation: `bash -n` over all 12 tracked shell entrypoints, pycompile for
+  tracked `tools/*.py`, strict unused-definition scan (`--max-uses 0`, no
+  output), OpenAPI missing-query and missing-param sanity checks, and argparse
+  `--help` sweep (`80` checked tools, no failures).
+
+## 2026-06-13: Schema Default And OpenAPI Integrity Sweep
+
+- Audited route/schema/model-selection surfaces after the tool-entrypoint
+  cleanup. Live OpenAPI had no duplicate operation IDs, malformed operations,
+  missing operation IDs, or duplicate method/path route registrations.
+- Replaced remaining mutable literal defaults on Pydantic models with
+  `Field(default_factory=list)` for active model labelmap entries and SAM
+  multi-point prompts.
+- Added an AST regression that scans `localinferenceapi.py`, `models/*.py`, and
+  `api/*.py` for mutable literal defaults on Pydantic `BaseModel` classes.
+- Validation: focused API/schema/config/model-selection tests (`318 passed`),
+  focused schema regression slice (`48 passed`), pycompile for touched files,
+  local mutable-default scan (`0` findings), live UI/OpenAPI endpoint sanity
+  checks, OpenAPI missing-query and missing-param sanity checks, live OpenAPI
+  operation-id/route-table audit, and backend health (`HTTP 200`, `ok: true`).
+
+## 2026-06-13: Runtime Assert Removal Sweep
+
+- Audited backend runtime code for assertion-based validation that could vanish
+  under optimized Python execution.
+- Replaced remaining `assert` statements in `localinferenceapi.py` with explicit
+  HTTP errors for dataset upload session invariants, local SALAD head loading,
+  and windowed Qwen caption sizing.
+- Added an AST regression that fails if `localinferenceapi.py` reintroduces
+  runtime `assert` statements.
+- Validation: JS syntax, UI endpoint method/map/openapi checks, UI contract and
+  negative checks, UI data-ops smoke, Playwright control coverage, UI parameter
+  sweep, full UI E2E (`41 passed`), startup doc link check, tracked Python
+  pycompile (`369` files), data-safety/path tests (`141 passed`), focused
+  upload/data-ingestion/caption tests (`174 passed, 2 skipped`), UI smoke,
+  and `SKIP_GPU=1` refactor validation.
+
+## 2026-06-13: Frontend DOM Binding Drift Sweep
+
+- Audited static `document.getElementById(...)` bindings against shipped
+  `tator.html` ids after the Class Split and Qwen UI reshaping work.
+- Removed stale JavaScript bindings for removed Qwen Auto Label controls while
+  keeping the backend/programmatic auto-label job code intact for automation
+  status and future explicit entry points.
+- Removed the remaining Class Split cluster-overlay ghost binding and test-hook
+  fields. Subclass cluster proposals still run through the selected-class
+  cluster-search controls; hull traces remain disabled.
+- Added a regression that fails if future static DOM id bindings point at
+  missing HTML ids, with only the dynamically created hover-preview ids
+  allowlisted.
+- Validation: `node --check ybat-master/ybat.js`, stale-id scan (`1094`
+  static refs, `0` missing), focused contract tests (`30 passed`), full pytest
+  (`1558 passed, 39 skipped`), focused navigation/auto-label/Class Split UI E2E
+  (`18 passed`), full UI E2E (`41 passed`), UI endpoint method check (`277`
+  fetches), UI contract runner (`82` checks), endpoint map (`170` paths), UI
+  OpenAPI sanity (`167` tested), UI negative tests (`18` checks), UI data-ops
+  smoke, OpenAPI missing-query sanity (`5` checks), OpenAPI missing-param
+  sanity (`76` checks), and `git diff --check`.
+
+## 2026-06-13: Annotation Form Submit Guard Sweep
+
+- Audited the shipped annotation HTML for controls that can accidentally submit
+  the UI-only form and reload the app.
+- Fixed the SAM3 split-cache purge control, which was the only shipped
+  `<button>` without an explicit `type`. Inside the annotation form, that
+  defaulted to browser submit behavior instead of a pure action button.
+- Added a startup guard that prevents submit navigation from UI-only forms, so
+  pressing Enter in annotation controls such as image search cannot reload the
+  app and lose transient UI state.
+- Added static coverage requiring every shipped button to declare `type`, plus
+  a browser E2E regression that presses Enter in the Label Images search field
+  and proves the app did not reload.
+- Validation: `node --check ybat-master/ybat.js`, `git diff --check`, focused
+  static form-submit tests (`2 passed`), focused browser Enter-key regression
+  (`1 passed`), full pytest (`1560 passed, 40 skipped`), full UI E2E (`42
+  passed`), UI endpoint method check (`277` fetches), UI contract runner (`82`
+  checks), endpoint map (`170` paths), UI OpenAPI sanity (`167` tested), UI
+  negative tests (`18` checks), UI data-ops smoke, OpenAPI missing-query sanity
+  (`5` checks), OpenAPI missing-param sanity (`76` checks), UI smoke, and
+  legacy UI endpoint check (`184` endpoints).
+
+## 2026-06-13: Linked Dataset Delete Failure Sweep
+
+- Audited dataset delete/finalize cleanup paths after the UI guard sweep,
+  focusing on places where backend state could report success while filesystem
+  cleanup failed.
+- Changed the linked-dataset registry-record delete primitive to fail closed
+  instead of using `shutil.rmtree(..., ignore_errors=True)`. Linked dataset
+  source roots were already protected from deletion; now the registry record
+  also remains visible if the backend cannot remove it.
+- Added a regression that simulates a registry-record removal failure and
+  proves the API returns `dataset_delete_failed:*` while preserving both the
+  linked source data and the registry record.
+- Validation: focused linked dataset lifecycle tests (`95 passed`), focused
+  dataset/Data Ingestion/Qwen active/UI contract tests (`228 passed`), focused
+  Dataset Management/Data Ingestion/navigation UI E2E (`15 passed`),
+  `py_compile localinferenceapi.py`, `node --check ybat-master/ybat.js`,
+  `git diff --check`, UI endpoint method/map checks (`277` fetches, `170`
+  paths), UI OpenAPI sanity (`167` tested), UI negative tests (`18` checks),
+  UI data-ops smoke, OpenAPI missing-query sanity (`5` checks), and OpenAPI
+  missing-param sanity (`76` checks), full pytest (`1561 passed, 40 skipped`),
+  and full UI E2E (`42 passed`).
+
+## 2026-06-13: Tier-1 Qwen Fuzz Timeout Cleanup Sweep
+
+- Ran the broader validation/fuzz layer after the linked-dataset delete sweep.
+  Tier-0 fuzz, UI smoke, UI contract checks, Playwright control coverage,
+  parameter sweep, and concurrency smoke were clean, but live Tier-1 fuzz timed
+  out while `/qwen/prepass` was in RF-DETR SAHI detector phase.
+- The server cancellation endpoint worked, but the harness exited with a
+  traceback and could leave the backend with an active Qwen prepass after the
+  client-side timeout. That made validation itself a source of stale backend
+  state.
+- Hardened `tools/fuzz_tier1.py` so timed-out Qwen prepass/caption requests
+  request `/qwen/cancel?force=false`, record the failed step in the JSON
+  summary, and exit nonzero without hiding the failure. `tools/run_fuzz_fast.sh`
+  now exposes `REQUEST_TIMEOUT` for intentional long GPU fuzz runs.
+- Fixed the Playwright dataset cleanup helper so generated E2E datasets retry
+  transient annotation-lock and active-job delete conflicts. This prevents
+  failed/fast-following browser tests from silently leaving `pw_*` cards in the
+  Dataset Manager while still keeping production dataset deletes fail-closed.
+- Updated the tools README to document the timeout knob and cleanup behavior.
+- Validation: focused validation-tool tests (`20 passed`), `py_compile
+  tools/fuzz_tier1.py` and the E2E helper, `tools/fuzz_tier1.py --help`,
+  skip-GPU fuzz wrapper smoke, live timeout smoke proving the tool exits with a
+  structured `timeout_after_*` summary while backend Qwen progress becomes
+  inactive and cancelled, full pytest (`1566 passed, 40 skipped`), full UI E2E
+  (`42 passed`), UI contract runner (`82` checks), UI endpoint method check
+  (`277` fetches), UI OpenAPI sanity (`167` tested), OpenAPI missing-param
+  sanity (`76` checks), OpenAPI missing-query sanity (`5` checks), and `git
+  diff --check`. A post-E2E dataset list confirmed no generated `pw_*` datasets
+  remained.
+
+## 2026-06-13: Dataset Upload Cancel Cleanup Sweep
+
+- Audited user-visible upload cancellation paths after the Tier-1 fuzz cleanup
+  sweep, focusing on endpoints that can return success after deleting staged
+  upload state.
+- Found that both Dataset Management chunked dataset uploads and Qwen dataset
+  uploads could remove the upload job from the in-memory registry and return
+  `"cancelled"` even when staging-root cleanup was only best-effort. That could
+  leave temporary chunks on disk without a visible upload-session handle.
+- Changed both cancel flows to fail closed: staging cleanup is validated and
+  completed before the upload job/session is removed from the registry. If
+  cleanup fails or the staging path is invalid, the API now raises an explicit
+  error and keeps the job/session visible for retry or inspection.
+- Preserved the existing symlink safety invariant: a symlinked staging child can
+  be unlinked without following it, while a symlinked staging parent is treated
+  as an invalid path and never causes target deletion.
+- Validation: `py_compile localinferenceapi.py` and touched tests, focused
+  upload/UI contract tests (`78 passed`) covering Dataset Management chunked
+  upload, Qwen upload, upload security, and layout contracts, full pytest
+  (`1568 passed, 40 skipped`), full UI E2E (`42 passed`), UI contract runner
+  (`82` checks), endpoint map (`184` endpoints), Playwright control coverage
+  (`83` controls), UI endpoint method check (`277` fetches), UI OpenAPI sanity
+  (`167` tested), OpenAPI missing-param sanity (`76` checks), OpenAPI
+  missing-query sanity (`5` checks), UI negative tests (`18` checks), UI
+  data-ops smoke, UI smoke, Tier-0 fuzz, skip-GPU fast fuzz wrapper, backend
+  health summary, `node --check ybat-master/ybat.js`, and `git diff --check`.
+  A post-E2E dataset list confirmed no generated `pw_*` datasets remained.
+
+## 2026-06-13: Cache Purge Failure Sweep
+
+- Continued the backend storage hardening pass on user-triggered cleanup
+  controls. The next fail-open class was cache purge endpoints that could skip
+  failed removals while still returning a successful purge response.
+- Hardened Agent Mining cache purge so file, symlink, and directory removal
+  failures now raise `agent_cache_purge_failed:*` instead of being ignored.
+- Hardened SAM3 and Qwen training split-cache purge through the shared purge
+  helper. These endpoints now raise `sam3_cache_purge_failed:*` or
+  `qwen_cache_purge_failed:*` when a real cache entry cannot be removed. Internal
+  best-effort cleanup can still call the helper without strict failure reporting.
+- Preserved existing symlink safety behavior: symlinked cache entries are
+  unlinked without following them, and symlinked cache roots still do not purge
+  target directories.
+- Validation: `py_compile localinferenceapi.py` and touched tests, focused
+  Agent Mining/Qwen/SAM3 cache lifecycle tests (`57 passed`), full pytest
+  (`1571 passed, 40 skipped`), full UI E2E (`42 passed`), UI contract runner
+  (`82` checks), UI endpoint method check (`277` fetches), endpoint map (`184`
+  endpoints), UI OpenAPI sanity (`167` tested), OpenAPI missing-param sanity
+  (`76` checks), OpenAPI missing-query sanity (`5` checks), UI negative tests
+  (`18` checks), UI data-ops smoke, Playwright control coverage (`83`
+  controls), UI smoke, Tier-0 fuzz, skip-GPU fast fuzz wrapper, backend health
+  summary, `node --check ybat-master/ybat.js`, and `git diff --check`. A
+  post-E2E dataset list confirmed no generated `pw_*` datasets remained.
+
+## 2026-06-13: CLIP Classifier Sidecar Failure Sweep
+
+- Continued the user-facing storage sweep on CLIP classifier registry actions,
+  where model files and `.meta.pkl` sidecars must remain in sync after rename
+  or delete operations.
+- Found that classifier delete removed the main `.pkl` first and then attempted
+  best-effort metadata cleanup. If sidecar removal failed, the UI could report a
+  successful delete while stale classifier metadata remained on disk.
+- Found that classifier rename moved the main `.pkl` first and then attempted
+  best-effort metadata movement. If sidecar movement failed, the UI could report
+  a successful rename while leaving metadata under the old name.
+- Hardened delete so metadata cleanup is attempted before the classifier file is
+  removed. A metadata cleanup failure now raises
+  `classifier_meta_delete_failed:*` and leaves the classifier file untouched.
+- Hardened rename so safe sidecar metadata is moved before the classifier file,
+  failures raise `classifier_meta_rename_failed:*`, and metadata is rolled back
+  if the final classifier rename fails.
+- Preserved the existing metadata symlink invariant: metadata reads only use
+  resolved regular files within the classifier root, while delete may unlink a
+  metadata symlink itself without following it.
+- Validation: `py_compile localinferenceapi.py` and touched tests, focused CLIP
+  registry and artifact-publish tests (`83 passed`), full pytest (`1574
+  passed, 40 skipped`), full UI E2E (`42 passed`), UI contract runner (`82`
+  checks), UI endpoint method check (`277` fetches), endpoint map (`184`
+  endpoints), Playwright control coverage (`83` controls), UI OpenAPI sanity
+  (`167` tested), OpenAPI missing-param sanity (`76` checks), OpenAPI
+  missing-query sanity (`5` checks), UI negative tests (`18` checks), UI
+  data-ops smoke, UI smoke, Tier-0 fuzz, skip-GPU fast fuzz wrapper, backend
+  health summary, `node --check ybat-master/ybat.js`, and `git diff --check`.
+  A post-E2E dataset list confirmed no generated `pw_*` datasets remained.
+
+## 2026-06-13: CLIP Training Artifact Publish Sweep
+
+- Continued the CLIP registry hardening pass into the training completion path.
+  A successful Train Class Predictor run must publish the classifier, metadata,
+  and labelmap together before the UI is told that the job succeeded.
+- Found that `_publish_clip_training_artifacts` swallowed publish failures with
+  warning logs. If copying/linking the classifier, `.meta.pkl`, or labelmap
+  failed, the training worker could still mark the job as succeeded and return
+  temp artifact paths that were not actually in the registry.
+- Hardened publish into a staged transaction. All three artifacts are first
+  copied or hardlinked to hidden staging files; only after staging succeeds are
+  visible registry files replaced. If a visible replace fails, previous visible
+  files are restored from backups and the job fails with
+  `clip_artifact_publish_failed:*` instead of reporting success.
+- Missing generated artifacts now fail the training job with
+  `clip_artifact_publish_missing:<kind>:*`. Artifact paths in the success payload
+  are only rewritten to registry paths after the commit succeeds.
+- Added regressions for missing metadata, staging failure before registry
+  mutation, and commit failure after an earlier file has been replaced.
+- Validation: `py_compile localinferenceapi.py` and touched tests, focused CLIP
+  artifact/registry/job lifecycle tests (`115 passed`), full pytest (`1577
+  passed, 40 skipped`), full UI E2E (`42 passed`), UI contract runner (`82`
+  checks), UI endpoint method check (`277` fetches), endpoint map (`184`
+  endpoints), Playwright control coverage (`83` controls), UI OpenAPI sanity
+  (`167` tested), OpenAPI missing-param sanity (`76` checks), OpenAPI
+  missing-query sanity (`5` checks), UI negative tests (`18` checks), UI
+  data-ops smoke, UI smoke, Tier-0 fuzz, skip-GPU fast fuzz wrapper, backend
+  storage health summary, `node --check ybat-master/ybat.js`, and `git diff
+  --check`. A post-E2E dataset list confirmed no generated `pw_*` datasets
+  remained.
+
+## 2026-06-13: Qwen Training Metadata Publish Sweep
+
+- Continued the training-output registry sweep on Qwen training runs. A Qwen
+  run is only useful from the UI if its `metadata.json` is written in the run
+  directory and the model registry can discover it later.
+- Found that `_persist_qwen_run_metadata` ignored the boolean result from
+  `_write_qwen_run_metadata_file`. A symlinked result path, symlinked parent, or
+  unwritable `metadata.json` could skip the metadata write while the worker still
+  marked the job as succeeded and returned a success-looking metadata payload.
+- Hardened the publish path so a failed metadata write raises
+  `qwen_run_metadata_write_failed`. The training worker now reports the job as
+  failed instead of successful when metadata cannot be written.
+- Preserved the existing escape-protection behavior: symlinked result
+  directories or parents still do not write through to outside targets, but they
+  now fail closed instead of silently skipping the registry metadata.
+- Added regressions for worker-level metadata publish failure, symlinked result
+  directory rejection, symlinked result parent rejection, and unwritable
+  metadata path rejection.
+- Validation: `py_compile localinferenceapi.py` and touched tests, focused Qwen
+  runtime/active/registry/job lifecycle tests (`106 passed`), full pytest (`1579
+  passed, 40 skipped`), full UI E2E (`42 passed`), UI contract runner (`82`
+  checks), UI endpoint method check (`277` fetches), endpoint map (`184`
+  endpoints), Playwright control coverage (`83` controls), UI OpenAPI sanity
+  (`167` tested), OpenAPI missing-param sanity (`76` checks), OpenAPI
+  missing-query sanity (`5` checks), UI negative tests (`18` checks), UI
+  data-ops smoke, UI smoke, Tier-0 fuzz, skip-GPU fast fuzz wrapper, backend
+  storage health summary, `node --check ybat-master/ybat.js`, and `git diff
+  --check`. A post-E2E dataset list confirmed no generated `pw_*` datasets
+  remained.
+
+## 2026-06-13: Detector Training Missing Checkpoint Sweep
+
+- Continued the training-output publish sweep on detector jobs. A successful
+  detector training run must leave a usable top-level checkpoint in the run
+  directory before the UI can safely present it as a selectable model.
+- Found that YOLO training could finish without copying or producing
+  `best.pt`, then still mark the job as succeeded with a null `best_path`.
+  The worker now fails closed with `yolo_best_checkpoint_missing` when no
+  top-level `best.pt` exists after training.
+- Found the same class of fail-open behavior in RF-DETR training: if no best
+  checkpoint was discovered, the worker could still report success with a null
+  `best_path`. The worker now fails closed with
+  `rfdetr_best_checkpoint_missing` before export/result publication.
+- Added worker-level regressions for both missing-checkpoint paths. The tests
+  assert failed job state, failed metadata, no success result, and no bogus
+  published checkpoint.
+- Validation: `py_compile localinferenceapi.py` and touched tests, focused
+  detector lifecycle/metadata/start-validation tests (`92 passed`), adjacent
+  detector tests (`18 passed`), full pytest before the backend reconnect
+  (`1581 passed, 40 skipped`), UI contract runner (`82` checks), UI endpoint
+  method check (`277` fetches), Playwright control coverage (`83` controls),
+  UI OpenAPI sanity (`167` tested), OpenAPI missing-param sanity (`76`
+  checks), OpenAPI missing-query sanity (`5` checks), UI negative tests (`18`
+  checks), UI data-ops smoke, UI smoke, backend storage health summary,
+  `node --check ybat-master/ybat.js`, and `git diff --check`.
+
+## 2026-06-13: SAM3 Training Missing Checkpoint Sweep
+
+- Continued the successful-job artifact sweep on SAM3 training. A completed
+  SAM3 run must expose a safe checkpoint under the run `checkpoints/`
+  directory before the UI can offer it as a trained model.
+- Found that `_start_sam3_training_worker` could report success with
+  `"checkpoint": null` when the training subprocess exited with code `0` but
+  emitted no checkpoint file. The worker now fails closed with
+  `sam3_checkpoint_missing` in that case.
+- Aligned SAM3 latest-checkpoint discovery with the activation path: `.ckpt`,
+  `.pth`, and `.pt` files are accepted, `last.ckpt` is preferred, symlinked
+  files are ignored, and resolved files must stay within the checkpoint
+  directory. This avoids both false missing-checkpoint failures for normal
+  `last.ckpt` outputs and success on symlink escapes.
+- Added regressions for safe latest-checkpoint selection and worker-level
+  missing-checkpoint failure.
+- Validation: focused SAM3 lifecycle tests (`35 passed`), adjacent SAM3/start
+  validation/storage tests (`35 passed`), `py_compile localinferenceapi.py` and
+  touched tests, and `git diff --check`.
+
+## 2026-06-13: Segmentation Build Worker Failure Sweep
+
+- Continued the generated-dataset publication sweep on the segmentation builder.
+  A segmentation build must not publish or report completion after any image
+  conversion worker fails, because that would leave the user with a partial
+  mask dataset that looks complete in the UI.
+- Found that per-image futures caught worker exceptions, logged warnings, and
+  allowed the job to continue into COCO conversion and completion. The worker
+  loop now records all future failures and fails the job with
+  `segmentation_builder_worker_failed:<count>:<first_error>` before conversion
+  or metadata publication.
+- Added a regression that forces a mask worker failure and asserts the job is
+  failed, no result is published, and COCO conversion is not called for the
+  partial output tree.
+- Validation: segmentation-linked dataset subset
+  (`tests/test_dataset_linked_annotation_flows.py -k segmentation`, `6
+  passed`), segmentation thread-start rollback regression (`1 passed`),
+  `py_compile localinferenceapi.py` and touched tests, and `git diff --check`.
+
+## 2026-06-13: Data Ingestion Accepted Preview Atomicity
+
+- Continued the Data Ingestion output-lifecycle audit from the accepted-candidate
+  export surface. A preview generation failure after the first thumbnail write
+  could leave a partial `accepted_exports/preview_*` directory behind, making a
+  failed preview look like durable review state.
+- Made accepted-output preview creation fail closed: if manifest or thumbnail
+  rendering raises before the preview response is returned, the backend removes
+  the whole preview directory under the job-owned root and re-raises the original
+  error.
+- Added a regression that forces the second preview thumbnail render to fail and
+  asserts that no partial preview artifacts remain.
+- Validation: accepted-export Data Ingestion regressions
+  (`tests/test_data_ingestion.py -k accepted_export`, `8 passed`), full
+  Data Ingestion test module (`90 passed`), `py_compile localinferenceapi.py`,
+  and `git diff --check`.
+
+## 2026-06-13: Detector Run Download Completeness
+
+- Continued the detector artifact-lifecycle sweep on user-downloadable YOLO and
+  RF-DETR run ZIPs. The existing export helper safely skipped symlink escapes,
+  but the normal run download endpoints could still serve a ZIP missing the
+  runnable checkpoint, label map, or run metadata.
+- Added explicit required-file gates for detector run downloads. YOLO ZIPs now
+  require `best.pt`, `labelmap.txt`, and `run.json`; RF-DETR ZIPs require a safe
+  best checkpoint plus `labelmap.txt` and `run.json`. Optional logs, metrics, and
+  plots remain best-effort archive entries.
+- Updated symlink-escape regressions so required checkpoint escapes fail closed
+  with `*_run_download_incomplete` instead of producing a broken partial ZIP, and
+  added positive coverage that missing optional files do not block downloads.
+- Validation: detector lifecycle suite
+  (`tests/test_detector_active_lifecycle.py`, `44 passed`), `py_compile
+  localinferenceapi.py tests/test_detector_active_lifecycle.py`, and
+  `git diff --check`.
+
+## 2026-06-13: CLIP Classifier Bundle Sidecar Completeness
+
+- Continued the user-downloadable artifact sweep on CLIP classifier bundle ZIPs.
+  The endpoint correctly refused to archive an unsafe classifier file and
+  intentionally ignored symlinked sidecar metadata, but if metadata or a labelmap
+  had already resolved as a bundle sidecar, a later write failure could silently
+  omit it.
+- Made resolved sidecars fail closed: a metadata sidecar that cannot be written
+  returns `clip_classifier_zip_meta_missing`, and a resolved labelmap that cannot
+  be written returns `clip_classifier_zip_labelmap_missing`. Classifier-only
+  legacy bundles and pre-filtered symlink sidecars remain supported.
+- Added regressions for both sidecar write-failure paths while preserving the
+  existing symlink-meta escape behavior.
+- Validation: CLIP registry download suite
+  (`tests/test_clip_registry_downloads.py`, `35 passed`), `py_compile
+  localinferenceapi.py tests/test_clip_registry_downloads.py`, and
+  `git diff --check`.
+
+## 2026-06-13: Dataset Export Overlay Revalidation
+
+- Continued the dataset-download data-loss sweep on linked-dataset annotation
+  overlays. Export planning correctly filtered unsafe overlay symlinks, but
+  planned override files were only checked with `exists()`/`is_file()` at ZIP
+  write time. If an overlay disappeared after planning, the export could omit
+  the user's edited label/text file; if it was swapped to a symlink, the writer
+  could follow a changed path.
+- Dataset ZIP exports now revalidate every planned overlay or registry labelmap
+  override against the guarded dataset metadata root immediately before writing.
+  A missing, swapped, or unsafe planned override fails the export with
+  `dataset_export_override_unavailable` and removes the transient ZIP staging
+  directory.
+- Added regressions for planned overlay disappearance and planned overlay
+  symlink replacement, while preserving the existing behavior that overlay
+  symlinks present during planning are ignored rather than archived.
+- Validation: linked dataset export regressions
+  (`tests/test_dataset_linked_annotation_flows.py -k "download_dataset_entry or
+  download_linked_dataset"`, `8 passed`), full linked dataset/download cleanup
+  bundle (`tests/test_dataset_linked_annotation_flows.py
+  tests/test_dataset_download_cleanup.py`, `100 passed`), `py_compile
+  localinferenceapi.py tests/test_dataset_linked_annotation_flows.py`, and
+  `git diff --check`.
+
+## 2026-06-13: Agent Recipe/Cascade Cached ZIP Manifests
+
+- Continued the user-facing export sweep on saved SAM3 recipe and cascade
+  bundles. Existing cached ZIPs were rebuilt when corrupt, but any valid ZIP was
+  reused even if it lacked the required top-level manifest (`recipe.json` or
+  `cascade.json`), allowing a stale or wrong archive to be served as the saved
+  object export.
+- Recipe ZIP cache reuse now requires both a clean ZIP test and `recipe.json`.
+  Cascade ZIP cache reuse now requires both a clean ZIP test and `cascade.json`.
+  Valid-but-wrong cached archives are rebuilt atomically before being returned.
+- Added regressions for valid cached recipe/cascade ZIPs missing their required
+  manifest entries.
+- Validation: recipe/cascade ZIP export robustness suites
+  (`tests/test_agent_recipe_zip_export_robustness.py
+  tests/test_agent_cascade_export_safety.py`, `33 passed`), `py_compile`
+  on touched service/test modules, and `git diff --check`.
+
+## 2026-06-13: EDR Package ZIP Completeness
+
+- Continued the portable artifact sweep on EDR package downloads and imports.
+  The export endpoint previously returned an existing `package.edr.zip` as long
+  as it was a regular file, so a corrupt archive or a valid ZIP missing core EDR
+  files could be served as a usable package.
+- Added explicit EDR package ZIP validation before export: cached package zips
+  must pass `testzip()` and contain both `edr_manifest.json` and
+  `saved_recipe.json`. Invalid cached packages now fail closed instead of being
+  downloaded.
+- Added import-time completeness validation after package-id validation and
+  before registry mutation, so incomplete portable packages cannot create
+  backend package records. Package-id traversal checks still fire before
+  missing-sidecar checks.
+- The EDR export route now maps invalid cached package state to `412` with the
+  service detail, separating broken package state from not-found packages and
+  internal backend errors.
+- Validation: focused EDR package suite (`tests/test_edr_packages.py`,
+  `41 passed`), adjacent prepass recipe import/export coverage
+  (`tests/test_prepass_recipe_config_validation.py
+  tests/test_prepass_recipe_import_security.py`, `47 passed`), and
+  `py_compile localinferenceapi.py services/edr_packages.py
+  tests/test_edr_packages.py`, plus `git diff --check`.
+
+## 2026-06-13: Prepass Recipe Export Scratch Cleanup
+
+- Continued the portable recipe artifact sweep on saved prepass recipe exports.
+  The export helper created a staging directory under
+  `uploads/prepass_recipe_exports` and left that directory behind after writing
+  the ZIP, so repeated exports could accumulate unmanaged staging trees.
+- Revalidated the prepass recipe export root at export time, created staging
+  directories only as direct children of that guarded root, and cleaned staging
+  trees after the archive is written.
+- Replaced `shutil.make_archive` with a guarded ZIP writer that only includes
+  regular files still contained by the staging tree, so a symlink introduced
+  during staging is skipped instead of being followed into the archive.
+- Mapped invalid EDR package state through the prepass recipe export route as a
+  controlled `412` when the saved recipe is an EDR-package wrapper, matching the
+  direct EDR package export endpoint.
+- Validation: focused prepass/export route coverage
+  (`tests/test_prepass_recipe_config_validation.py
+  tests/test_agent_export_file_responses.py`, `48 passed`), focused EDR package
+  suite (`tests/test_edr_packages.py`, `41 passed`), adjacent prepass
+  import/agent export bundle (`tests/test_prepass_recipe_import_security.py
+  tests/test_agent_recipe_zip_export_robustness.py
+  tests/test_agent_cascade_export_safety.py`, `40 passed`), `py_compile
+  localinferenceapi.py services/prepass_recipes.py
+  tests/test_prepass_recipe_config_validation.py
+  tests/test_agent_export_file_responses.py`, and `git diff --check`.
+
+## 2026-06-13: Data Ingestion Accepted Export ZIP Completeness
+
+- Continued the data-ingestion accepted-output export sweep. The download route
+  already guarded source containment, duplicate output paths, render failures,
+  and cleanup, but it did not re-open the finished ZIP before serving it.
+- Added a final accepted-export ZIP validation step that runs `testzip()` and
+  verifies every selected output member plus `manifest.json` and `summary.json`
+  is present before returning the `FileResponse`.
+- A corrupt or incomplete accepted-data archive now fails closed with an
+  `accepted_export_zip_*` detail and removes the transient ZIP staging directory
+  instead of serving a broken dataset download.
+- Added a regression that simulates a ZIP writer silently dropping `summary.json`
+  and verifies the endpoint rejects the archive and cleans temporary staging.
+- Validation: focused accepted export coverage
+  (`tests/test_data_ingestion.py -k accepted_export`, `9 passed`), full data
+  ingestion suite (`tests/test_data_ingestion.py`, `91 passed`), `py_compile
+  localinferenceapi.py tests/test_data_ingestion.py`, and `git diff --check`.
+
+## 2026-06-13: Dataset Download ZIP Completeness
+
+- Continued the dataset-management preservation sweep on managed and linked
+  dataset downloads. The export route had strong source containment and overlay
+  revalidation, but it still trusted the just-written ZIP without re-opening it
+  before handing it to the browser.
+- Generalized the created-ZIP validation helper and applied it to dataset
+  downloads. The exporter now records every dataset or overlay member it intends
+  to archive, verifies the finished ZIP with `testzip()`, and fails closed if
+  any planned member is missing.
+- A broken dataset ZIP export now returns a controlled `dataset_export_zip_*`
+  error and removes the transient export directory instead of serving a partial
+  archive as a valid user dataset backup.
+- Added a regression that simulates the ZIP writer silently omitting an archived
+  dataset file and verifies the endpoint rejects the archive before serving it.
+- Validation: dataset download, linked dataset, and dataset ZIP upload coverage
+  (`tests/test_dataset_download_cleanup.py
+  tests/test_dataset_linked_annotation_flows.py
+  tests/test_dataset_zip_upload_security.py`, `120 passed`), accepted export
+  coverage (`tests/test_data_ingestion.py -k accepted_export`, `9 passed`),
+  full data ingestion suite (`tests/test_data_ingestion.py`, `91 passed`), and
+  `py_compile localinferenceapi.py tests/test_dataset_download_cleanup.py
+  tests/test_dataset_linked_annotation_flows.py tests/test_data_ingestion.py`,
+  plus `git diff --check`.
+
+## 2026-06-13: Detector Run Bundle Required-Write Guards
+
+- Continued the generated artifact sweep on YOLO, RF-DETR, and YOLO head-graft
+  bundle downloads. These routes preflighted required files before building the
+  in-memory ZIP, but the actual `_zip_write_safe_file` return value was ignored
+  in the write loop.
+- Required detector artifacts now fail closed at write time if they disappear,
+  become unsafe, or otherwise cannot be added after preflight. Optional files
+  still skip cleanly when absent.
+- RF-DETR downloads now treat the concrete selected best checkpoint as required
+  during ZIP construction, in addition to required metadata and labelmap files.
+- Added regressions for required YOLO, RF-DETR, and YOLO head-graft files that
+  pass preflight but fail during ZIP writing.
+- Validation: focused detector bundle coverage
+  (`tests/test_detector_active_lifecycle.py -k "download_yolo_run or
+  download_rfdetr_run"`, `6 passed`;
+  `tests/test_yolo_head_graft_flow.py -k head_graft_bundle`, `3 passed`) and
+  full affected detector coverage (`tests/test_detector_active_lifecycle.py
+  tests/test_yolo_head_graft_flow.py`, `57 passed`),
+  `py_compile localinferenceapi.py tests/test_detector_active_lifecycle.py
+  tests/test_yolo_head_graft_flow.py`, plus `git diff --check`.
+
+## 2026-06-13: Crop ZIP Duplicate Member Names
+
+- Continued the in-memory ZIP export sweep on annotation crop downloads. Crop
+  archive member names were derived from source image stem, class name, and bbox
+  index, so two source images with the same filename and class could produce
+  duplicate ZIP member names.
+- Duplicate ZIP members are legal, but many unzip tools hide or overwrite one
+  member on extraction. That made this a real data-loss risk for crop exports.
+- Crop ZIP export now preserves the readable base name when unique and appends a
+  deterministic `-dupN` suffix only when a collision occurs.
+- Added a regression that submits two same-named source images with the same
+  class/bbox index and verifies both crops are present under unique archive
+  names.
+- Validation: crop ZIP coverage (`tests/test_crop_zip_safety.py`, `3 passed`)
+  and `py_compile localinferenceapi.py tests/test_crop_zip_safety.py`.
+
+## 2026-06-13: Dataset Upload Finalize Failure Recovery
+
+- Continued the dataset-upload preservation sweep on streamed dataset upload
+  sessions. Finalization removed the upload-session manifest before moving the
+  staged dataset into the managed registry, so a failed move could leave staged
+  images on disk without the manifest needed for restart recovery or cleanup.
+- Finalization now keeps the upload-session manifest in the staging directory
+  until the move succeeds. Normal success still removes the staging-only
+  manifest from the final managed dataset, recomputes the dataset signature, and
+  rewrites `dataset.json`.
+- Post-move metadata cleanup is deliberately best effort: once the dataset has
+  moved into the registry, a cleanup/signature warning must not delete the
+  user's newly uploaded files.
+- Added regressions for move failure recovery, staging-manifest removal on
+  normal success, and successful dataset preservation when post-move metadata
+  cleanup fails.
+- Validation: focused upload finalization coverage
+  (`tests/test_dataset_zip_upload_security.py -k
+  "dataset_upload_session_finalize"`, `3 passed`), full dataset ZIP upload
+  coverage (`tests/test_dataset_zip_upload_security.py`, `21 passed`), and
+  `py_compile localinferenceapi.py tests/test_dataset_zip_upload_security.py`.
+
+## 2026-06-13: Qwen Dataset Upload Orphan Cleanup
+
+- Continued the destructive-operation sweep on Qwen dataset upload staging. The
+  Qwen upload cancel endpoint could clean live in-memory jobs, but after a
+  backend restart the same staged directory became an unmanageable orphan
+  because the missing-job path returned `missing` without checking disk.
+- Qwen upload cancellation now mirrors the managed dataset upload session
+  behavior: when the in-memory job is absent, a sanitized same-id staging
+  directory is cleaned if present and reported as an orphan cancellation.
+- The Qwen upload job-dir helper no longer creates the upload staging root when
+  called with `create=False`, so a no-op cancel for a missing job does not leave
+  new empty storage behind.
+- Added regressions for restart-orphan cleanup and missing-job no-op behavior.
+- Validation: full Qwen dataset upload coverage
+  (`tests/test_qwen_dataset_upload.py`, `19 passed`), adjacent Qwen upload
+  security coverage (`tests/test_qwen_dataset_upload_security.py`,
+  `12 passed`), `py_compile localinferenceapi.py
+  tests/test_qwen_dataset_upload.py`, and `git diff --check`.
+
+## 2026-06-13: Detector Run Non-Directory Guards
+
+- Continued the run-management sweep on YOLO and RF-DETR trained-run
+  endpoints. A malformed file at a run-id path was contained, but several
+  endpoints treated it like an existing partial run and could return
+  precondition failures or deletion-time 500s instead of a controlled
+  run-not-found response.
+- YOLO and RF-DETR active selection, summary, download, deletion, and direct
+  detector-runtime selection now require the run path to be a directory before
+  proceeding.
+- Added endpoint-level regressions that create a file at the requested run id
+  and verify every affected YOLO/RF-DETR run surface returns the expected 404
+  without modifying the file.
+- Validation: detector lifecycle coverage
+  (`tests/test_detector_active_lifecycle.py`, `48 passed`) and `py_compile
+  localinferenceapi.py tests/test_detector_active_lifecycle.py`.
+
+## 2026-06-13: CLIP Classifier Bundle Duplicate Members
+
+- Continued the model/artifact export sweep on CLIP classifier bundles. The
+  classifier ZIP kept artifact names flat, so a classifier and labelmap with
+  the same filename could both be written as the same ZIP member name.
+- Duplicate ZIP members are legal but extraction tools commonly hide or
+  overwrite one copy, making classifier bundles ambiguous to restore.
+- CLIP classifier bundles now preserve the existing flat names when unique and
+  move only colliding members into deterministic subfolders such as
+  `labelmaps/<name>`.
+- Added a regression with `classifiers/head.pkl` and `labelmaps/head.pkl` that
+  verifies the bundle contains both payloads under unique member names.
+- Validation: CLIP registry download coverage
+  (`tests/test_clip_registry_downloads.py`, `36 passed`) and `py_compile
+  localinferenceapi.py tests/test_clip_registry_downloads.py`.
+
+## 2026-06-13: Agent Cascade CLIP Metadata Sidecars
+
+- Continued the archive/export sweep on Agent Cascade bundles. Cascade export
+  looked for CLIP classifier metadata as `<classifier>.pkl.meta.pkl`, while the
+  classifier registry stores metadata as `<classifier>.meta.pkl`.
+- This could silently export a cascade with the classifier weights but without
+  the encoder/head metadata needed after re-import.
+- Cascade export now prefers the canonical registry sidecar, tolerates the old
+  `<classifier>.pkl.meta.pkl` sidecar as a legacy fallback, and always writes
+  the metadata archive member back under the canonical `<classifier>.meta.pkl`
+  name.
+- Added a nested-path regression that verifies `classifiers/nested/safe.pkl`
+  exports with `classifiers/nested/safe.meta.pkl` and never with the stale
+  `safe.pkl.meta.pkl` member.
+- Validation: Agent Cascade export safety coverage
+  (`tests/test_agent_cascade_export_safety.py`, `22 passed`), adjacent import
+  security coverage (`tests/test_agent_cascade_import_security.py`,
+  `12 passed`), `py_compile services/agent_cascades.py
+  tests/test_agent_cascade_export_safety.py`, and `git diff --check`.
+
+## 2026-06-13: Portable ZIP Duplicate Member Rejection
+
+- Continued the user-supplied archive import sweep. Agent Recipe, Agent
+  Cascade, legacy prepass recipe, and EDR package imports already rejected
+  path traversal, symlinks, and oversized payloads, but duplicate ZIP member
+  names were still accepted.
+- Duplicate ZIP members can make one apparent manifest or recipe shadow
+  another depending on whether the code path reads by name or extracts the full
+  archive, so portable imports now fail closed before parsing or extraction.
+- EDR cached package export validation also rejects duplicate members before
+  serving a package ZIP back to the user.
+- Added duplicate-entry regressions for Agent Recipe import, Agent Cascade
+  import, legacy prepass recipe import, EDR import, and cached EDR export.
+- Validation: portable import/export security coverage
+  (`tests/test_agent_recipe_import_security.py`,
+  `tests/test_agent_cascade_import_security.py`,
+  `tests/test_prepass_recipe_import_security.py`, and
+  `tests/test_edr_packages.py`, `69 passed`), `py_compile
+  services/prepass_recipes.py services/agent_cascades.py
+  services/edr_packages.py` plus affected tests, and `git diff --check`.
+
+## 2026-06-13: Portable Manifest Selection Hardening
+
+- Continued the archive import review after duplicate-member rejection. Agent
+  Recipe import previously accepted the first JSON member in a portable ZIP,
+  and Agent Cascade import accepted the first member whose basename was
+  `cascade.json`.
+- A malicious or malformed bundle could therefore put auxiliary or nested JSON
+  before the real root manifest and change what the importer parsed.
+- Agent Recipe import now requires the root `recipe.json`; Agent Cascade import
+  validates every member path and then requires the root `cascade.json`.
+- Added regressions where `clip_head/meta.json` or `nested/cascade.json`
+  appears before the root manifest and verified the importer still uses the
+  canonical root manifest.
+- Validation: affected portable import coverage
+  (`tests/test_agent_recipe_import_security.py` and
+  `tests/test_agent_cascade_import_security.py`, `20 passed`) and `py_compile
+  services/prepass_recipes.py services/agent_cascades.py` plus affected tests.
+
+## 2026-06-13: Portable Import Windows-Absolute Path Guards
+
+- Continued the portable ZIP import review across platforms. Agent Recipe and
+  legacy prepass recipe imports already rejected POSIX absolute paths,
+  traversal, duplicate members, and symlinks, but did not explicitly reject
+  Windows drive or UNC-style absolute member names.
+- Added a shared ZIP member path guard in the prepass recipe service that
+  rejects empty names, POSIX absolute paths, Windows absolute/drive paths,
+  leading backslash paths, and `..` traversal before parsing or extraction.
+- Added regressions for `C:/...` and UNC-style archive members in both Agent
+  Recipe import and legacy prepass recipe import.
+- Validation: affected portable import coverage
+  (`tests/test_agent_recipe_import_security.py` and
+  `tests/test_prepass_recipe_import_security.py`, `18 passed`) and `py_compile
+  services/prepass_recipes.py` plus affected tests.

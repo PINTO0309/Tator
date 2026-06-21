@@ -5,6 +5,7 @@ import stat
 import zipfile
 from io import BytesIO
 from pathlib import Path
+from typing import Any, Dict
 
 import pytest
 from fastapi import HTTPException
@@ -331,6 +332,22 @@ def test_dataset_upload_session_chunks_finalize_yolo_dataset(
     assert (dataset_root / api.DATASET_META_NAME).exists()
 
 
+def test_dataset_upload_session_start_rejects_empty_payload_without_creating_session(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    session_root = tmp_path / "upload_sessions"
+    monkeypatch.setattr(api, "YOLO_DATASET_UPLOAD_SESSION_ROOT", session_root)
+    api.DATASET_UPLOAD_SESSIONS.clear()
+
+    with pytest.raises(HTTPException) as exc_info:
+        api.init_dataset_upload_session({})
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "dataset_upload_session_dataset_id_required"
+    assert not session_root.exists()
+    assert not api.DATASET_UPLOAD_SESSIONS
+
+
 def test_dataset_upload_session_finalize_recovers_after_restart(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -358,7 +375,84 @@ def test_dataset_upload_session_finalize_recovers_after_restart(
 
     assert meta["id"] == "recover_me"
     assert (registry_root / "recover_me" / "train" / "images" / "a.jpg").exists()
+    assert not (registry_root / "recover_me" / api.DATASET_UPLOAD_SESSION_META_NAME).exists()
     assert not (session_root / session_id).exists()
+
+
+def test_dataset_upload_session_finalize_preserves_session_metadata_when_move_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry_root = tmp_path / "registry"
+    session_root = tmp_path / "upload_sessions"
+    monkeypatch.setattr(api, "DATASET_REGISTRY_ROOT", registry_root)
+    monkeypatch.setattr(api, "YOLO_DATASET_UPLOAD_SESSION_ROOT", session_root)
+    api.DATASET_UPLOAD_SESSIONS.clear()
+    session_id = api.init_dataset_upload_session(
+        {"dataset_id": "move_fails", "classes": ["building"], "total_images": 1}
+    )["session_id"]
+    api.upload_dataset_session_batch(
+        session_id,
+        json.dumps({"rows": [{"filename": "a.jpg", "split": "train", "label_text": ""}]}),
+        [UploadFile(filename="a.jpg", file=BytesIO(b"img"))],
+    )
+
+    def fail_move(*_args, **_kwargs):
+        raise OSError("forced move failure")
+
+    monkeypatch.setattr(api.shutil, "move", fail_move)
+    with pytest.raises(HTTPException) as exc_info:
+        api.finalize_dataset_upload_session(session_id)
+
+    assert exc_info.value.status_code == 500
+    assert str(exc_info.value.detail).startswith("dataset_upload_finalize_failed:")
+    assert (session_root / session_id / api.DATASET_UPLOAD_SESSION_META_NAME).exists()
+    assert (session_root / session_id / "train" / "images" / "a.jpg").exists()
+    assert not (registry_root / "move_fails").exists()
+
+    api.DATASET_UPLOAD_SESSIONS.clear()
+    listed = api.list_dataset_upload_sessions()
+    assert any(row["session_id"] == session_id and row["source"] == "disk" for row in listed)
+
+    api.cancel_dataset_upload_session(session_id)
+    api.DATASET_UPLOAD_SESSIONS.clear()
+
+
+def test_dataset_upload_session_finalize_keeps_dataset_when_post_move_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    registry_root = tmp_path / "registry"
+    session_root = tmp_path / "upload_sessions"
+    monkeypatch.setattr(api, "DATASET_REGISTRY_ROOT", registry_root)
+    monkeypatch.setattr(api, "YOLO_DATASET_UPLOAD_SESSION_ROOT", session_root)
+    api.DATASET_UPLOAD_SESSIONS.clear()
+    session_id = api.init_dataset_upload_session(
+        {"dataset_id": "cleanup_fails", "classes": ["building"], "total_images": 1}
+    )["session_id"]
+    api.upload_dataset_session_batch(
+        session_id,
+        json.dumps({"rows": [{"filename": "a.jpg", "split": "train", "label_text": ""}]}),
+        [UploadFile(filename="a.jpg", file=BytesIO(b"img"))],
+    )
+
+    real_persist_dataset_meta = api._persist_dataset_meta
+    persist_calls = 0
+
+    def fail_second_persist(root: Path, meta: Dict[str, Any]) -> Dict[str, Any]:
+        nonlocal persist_calls
+        persist_calls += 1
+        if persist_calls == 2:
+            raise OSError("forced post-move cleanup failure")
+        return real_persist_dataset_meta(root, meta)
+
+    monkeypatch.setattr(api, "_persist_dataset_meta", fail_second_persist)
+
+    meta = api.finalize_dataset_upload_session(session_id)
+
+    assert meta["id"] == "cleanup_fails"
+    assert persist_calls == 2
+    assert (registry_root / "cleanup_fails" / "train" / "images" / "a.jpg").exists()
+    assert not (session_root / session_id).exists()
+    assert session_id not in api.DATASET_UPLOAD_SESSIONS
 
 
 def test_dataset_upload_session_rejects_incomplete_finalize(
@@ -407,6 +501,42 @@ def test_dataset_upload_session_cancel_removes_disk_session_after_restart(
 
     assert result["status"] == "cancelled"
     assert not ((tmp_path / "upload_sessions") / session_id).exists()
+
+
+def test_dataset_upload_session_cancel_keeps_session_when_cleanup_fails(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    monkeypatch.setattr(api, "DATASET_REGISTRY_ROOT", tmp_path / "registry")
+    monkeypatch.setattr(api, "YOLO_DATASET_UPLOAD_SESSION_ROOT", tmp_path / "upload_sessions")
+    api.DATASET_UPLOAD_SESSIONS.clear()
+    session_id = api.init_dataset_upload_session(
+        {"dataset_id": "cleanup_fail", "classes": ["building"], "total_images": 1}
+    )["session_id"]
+    api.upload_dataset_session_batch(
+        session_id,
+        json.dumps({"rows": [{"filename": "a.jpg", "split": "train", "label_text": ""}]}),
+        [UploadFile(filename="a.jpg", file=BytesIO(b"img"))],
+    )
+    original_rmtree = api.shutil.rmtree
+
+    def fail_rmtree(*_args, **_kwargs):
+        raise OSError("forced cleanup failure")
+
+    monkeypatch.setattr(api.shutil, "rmtree", fail_rmtree)
+
+    try:
+        with pytest.raises(HTTPException) as exc_info:
+            api.cancel_dataset_upload_session(session_id)
+
+        assert exc_info.value.status_code == 500
+        assert str(exc_info.value.detail).startswith("dataset_upload_cancel_failed:")
+        with api.DATASET_UPLOAD_SESSIONS_LOCK:
+            assert session_id in api.DATASET_UPLOAD_SESSIONS
+        assert ((tmp_path / "upload_sessions") / session_id).exists()
+    finally:
+        monkeypatch.setattr(api.shutil, "rmtree", original_rmtree)
+        api.cancel_dataset_upload_session(session_id)
+        api.DATASET_UPLOAD_SESSIONS.clear()
 
 
 def test_import_prepass_recipe_closes_upload_handle(monkeypatch: pytest.MonkeyPatch) -> None:

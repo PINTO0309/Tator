@@ -77,6 +77,28 @@ def test_import_prepass_recipe_rejects_archive_path_traversal(tmp_path: Path) ->
     assert exc_info.value.detail == "prepass_recipe_archive_path_traversal"
 
 
+@pytest.mark.parametrize("member_name", ["C:/escape.txt", "\\\\server\\share\\escape.txt"])
+def test_import_prepass_recipe_rejects_windows_absolute_members(
+    tmp_path: Path,
+    member_name: str,
+) -> None:
+    zip_path = tmp_path / "bad_windows_recipe.zip"
+    _write_zip(
+        zip_path,
+        {
+            "manifest.json": json.dumps({"schema_version": 2, "assets": []}),
+            "prepass.meta.json": json.dumps({"name": "bad", "config": {}}),
+            member_name: "nope",
+        },
+    )
+
+    with pytest.raises(HTTPException) as exc_info:
+        _call_import(zip_path, tmp_path)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "prepass_recipe_archive_path_traversal"
+
+
 def test_import_prepass_recipe_accepts_basic_archive(tmp_path: Path) -> None:
     zip_path = tmp_path / "ok_recipe.zip"
     _write_zip(
@@ -115,6 +137,21 @@ def test_import_prepass_recipe_rejects_symlink_member(tmp_path: Path) -> None:
 
     assert exc_info.value.status_code == 400
     assert exc_info.value.detail == "prepass_recipe_archive_symlink_unsupported"
+
+
+def test_import_prepass_recipe_rejects_duplicate_members(tmp_path: Path) -> None:
+    zip_path = tmp_path / "duplicate_recipe.zip"
+    with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+        zf.writestr("manifest.json", json.dumps({"schema_version": 2, "assets": []}))
+        zf.writestr("prepass.meta.json", json.dumps({"name": "ok", "config": {}}))
+        with pytest.warns(UserWarning, match="Duplicate name"):
+            zf.writestr("prepass.meta.json", json.dumps({"name": "shadow", "config": {}}))
+
+    with pytest.raises(HTTPException) as exc_info:
+        _call_import(zip_path, tmp_path)
+
+    assert exc_info.value.status_code == 400
+    assert exc_info.value.detail == "prepass_recipe_archive_duplicate_files"
 
 
 def test_import_prepass_recipe_rejects_invalid_zip(tmp_path: Path) -> None:

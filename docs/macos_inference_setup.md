@@ -85,16 +85,17 @@ cp .env.macos.example .env.macos
 tools/run_macos_backend.sh
 ```
 
-After setup, the daily backend start command is:
+After setup, start the backend from the repository root with this single
+command:
 
 ```bash
 tools/run_macos_backend.sh
 ```
 
-From another directory, `cd` to your clone first:
+Leave that terminal running. From another directory, `cd` to your clone first:
 
 ```bash
-cd /path/to/Tator && tools/run_macos_backend.sh
+cd <your Tator checkout> && tools/run_macos_backend.sh
 ```
 
 Equivalent direct wrapper, for machines without Poetry:
@@ -114,8 +115,9 @@ http://127.0.0.1:8000/
 The backend listens on `http://127.0.0.1:8000` and serves the browser UI at `/`
 and `/tator.html`. The old `/ybat.html` URL redirects to `/tator.html`.
 
-For frontend development, you can run a separate static UI server from the repo
-root:
+For frontend-only development, you can run a separate static UI server from the
+repo root. This is not the backend; keep `tools/run_macos_backend.sh` running on
+`http://127.0.0.1:8000` for live API calls:
 
 ```bash
 python3 -m http.server 8080 -d ybat-master
@@ -205,11 +207,16 @@ On a working Apple Silicon MLX setup, `/qwen/status` should report
 ## Qwen MLX-VLM
 
 The setup script installs `mlx`, the direct MLX-VLM runtime dependencies, and
-then `mlx-vlm==0.3.9` from `requirements-macos-vlm.txt` with `--no-deps`. This
-keeps the main macOS environment on Transformers 4.57 and the SAHI-compatible
-OpenCV line while using the newest Qwen3-capable MLX-VLM 0.3.x release. The backend
-exposes MLX model options through `/qwen/settings` and the browser UI under
-**Backend Config -> Qwen Runtime (advanced)**.
+then `mlx-lm==0.31.3` and `mlx-vlm==0.6.1` from
+`requirements-macos-vlm.txt` with `--no-deps`. This keeps the main macOS
+environment on Transformers 4.57 and the SAHI-compatible OpenCV line while
+adding Qwen3.5/3.6 MoE MLX modules. Transformers 5.x can resolve the official
+Qwen3.6 `qwen3_5_moe` architecture, but it currently breaks the shared RF-DETR
+import path, so Qwen3.6 / SwiReasoning experiments use a separate environment
+profile for now. The backend applies a narrow compatibility shim for Qwen3.5/3.6
+MLX checkpoints whose MoE expert weights are already split into `switch_mlp`
+tensors. The backend exposes MLX model options through `/qwen/settings` and the
+browser UI under **Backend Config -> Qwen Runtime (advanced)**.
 
 Useful environment settings:
 
@@ -218,6 +225,41 @@ QWEN_INFERENCE_PLATFORM=auto
 QWEN_MLX_MODEL_NAME=mlx-community/Qwen3-VL-4B-Instruct-4bit
 QWEN_MLX_DEFAULT_QUANTIZATION=4bit
 ```
+
+Experimental Qwen3.6 / SwiReasoning smoke:
+
+```bash
+tools/setup_qwen36_swir_env.sh
+.venv-qwen36-swir/bin/python tools/qwen36_swir_smoke.py
+.venv-qwen36-swir/bin/python tools/agent_model_smoke.py --json
+```
+
+The helper prefers `.venv-macos/bin/python` or Python 3.11; avoid Python 3.14
+for this environment because native wheels such as `safetensors` may not be
+available yet. The smoke intentionally does not download the full 35B weights.
+It checks the first runtime gate: the isolated Transformers 5.x environment must
+resolve the official `Qwen/Qwen3.6-35B-A3B` config and processor. Full inference
+and SwiReasoning decoding should be benchmarked from this environment before
+the main backend pins move to Transformers 5.x.
+
+The backend also exposes an inference-only agent model catalog through the
+existing `/qwen/models` compatibility endpoint. These entries are available to
+captioning, Qwen/agent prepass, and Class Split reviewer selectors, but every
+non-Qwen training-family entry carries `training_supported=false` so it cannot
+silently appear in the Qwen training picker. The first cataloged families are:
+
+- Qwopus3.6 via `Jackrong/Qwopus3.6-27B-v2` on the Transformers/CUDA path.
+- Qwen3.6 abliterated MAX via
+  `prithivMLmods/Qwen3.6-35B-A3B-abliterated-MAX` on the Transformers/CUDA path.
+- Nex-N2 Mini via `nex-agi/Nex-N2-mini` on the Transformers/CUDA path, plus a
+  metadata-only MLX candidate.
+- Gemma 4 via Huihui/MLX community candidates on the Transformers and MLX paths.
+
+The `tools/agent_model_smoke.py` check verifies config and processor loading for
+the Transformers candidates in the isolated Transformers-5 environment and keeps
+MLX entries metadata-only unless a future benchmark explicitly downloads full
+weights. GGUF and llama.cpp/mmproj inference are intentionally not wired in this
+path yet.
 
 Runtime selection rules:
 
@@ -230,9 +272,19 @@ The UI lists the quantized Qwen3-VL options from the `mlx-community/qwen3-vl`
 collection, including 2B, 4B, 8B, 30B-A3B, 32B, and available 235B-A22B
 variants. It also includes compatible abliterated MLX builds from EZCon,
 alexgusevski, nightmedia, introvoyz041, veeceey, and Goekdeniz-Guelmez where
-those repos expose MLX-format safetensors. Choose a model that fits local
-RAM/VRAM; the list is capability surface, not a guarantee that every model is
-practical on every Mac.
+those repos expose MLX-format safetensors. The experimental
+`vanch007/Huihui-Qwen3.6-35B-A3B-abliterated-mlx-4bit` candidate is selectable
+for inference/review after local vignette-review smoke tests passed; training is
+disabled until tested. The Youssofal Heretic 35B-A3B 4-bit MLX MoE build is
+tracked in the backend catalog as a candidate, but is blocked from UI selection
+because local smoke tests did not produce valid Qwen review output. Choose a
+model that fits local RAM/VRAM; the list is capability surface, not a guarantee
+that every model is practical on every Mac.
+
+Additional MLX agent candidates, including Qwen3.6, Nex-N2, and Gemma 4
+repackages, appear in the same runtime selectors when the catalog marks them
+image-capable. Candidates with failed local smoke evidence remain visible in
+the model registry but blocked from activation.
 
 CUDA machines should use the Transformers model registry in **Qwen Models**.
 That registry exposes the official full and FP8 Qwen3-VL checkpoints, curated
@@ -322,4 +374,8 @@ Upstream SAM3 currently imports a few CUDA/Triton helper modules even when the r
 - Qwen MLX-VLM does not stream tokens yet; streaming endpoints return the final generated text once the MLX call completes.
 - Qwen adapter checkpoints preserve their training runtime. Transformers adapters load through PEFT; MLX adapters load through MLX-VLM with their base model.
 - Qwen3-VL MoE adapter training is wired through Transformers `Qwen3VLMoeForConditionalGeneration`, but practical runs need very large CUDA memory or QLoRA/distributed setups.
-- `pip check` will report the intentional `mlx-vlm==0.3.9` OpenCV metadata mismatch in `.venv-macos`; SAHI requires OpenCV <=4.11, and MLX-VLM works here with the SAHI-compatible OpenCV installed by the setup script.
+- `pip check` will report intentional no-deps MLX metadata mismatches in
+  `.venv-macos`: MLX-VLM 0.6.1 declares newer Transformers, MLX-Audio,
+  Starlette, and OpenCV requirements than this app uses. The setup helper filters
+  those known warnings because the tested Qwen3.6 path works with Transformers
+  4.57 and the SAHI-compatible OpenCV installed by the setup script.

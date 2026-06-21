@@ -163,6 +163,7 @@ celerybeat.pid
 !.env.*.example
 .venv
 .venv-macos/
+.venv-qwen36-swir/
 env/
 venv/
 ENV/
@@ -267,12 +268,11 @@ pyrightconfig.json
 .idea/
 .vscode/
 
-# Local session/agent notes (never commit)
+# Local session notes (never commit). Project-level agent instructions
+# (`AGENTS.md`, `memory.md`) are intentionally tracked.
 SESSION_SUMMARY.txt
 SESSION.md
-memory.md
 recipe_brief_*.txt
-AGENTS.md
 
 # Local vendor clones / docs / screenshots
 Qwen3-VL/
@@ -287,6 +287,7 @@ scrn.png
 
 # Root-level scratch artifacts (do not track)
 /*.txt
+!/requirements-qwen36-swir.txt
 !requirements.txt
 !requirements-dev.txt
 !requirements-macos-inference.txt

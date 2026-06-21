@@ -45,6 +45,50 @@ def test_delete_linked_dataset_only_removes_registry_record(tmp_path, monkeypatc
     assert not record_root.exists(), "registry record should be removed"
 
 
+def test_delete_linked_dataset_reports_registry_remove_failure_without_source_delete(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "linked_source"
+    source_root.mkdir(parents=True, exist_ok=True)
+    (source_root / "keep.txt").write_text("source", encoding="utf-8")
+
+    registry_root = tmp_path / "registry"
+    registry_root.mkdir(parents=True, exist_ok=True)
+    record_root = registry_root / "ds_linked"
+    record_root.mkdir(parents=True, exist_ok=True)
+    (record_root / api.DATASET_META_NAME).write_text("{}", encoding="utf-8")
+
+    monkeypatch.setattr(api, "DATASET_REGISTRY_ROOT", registry_root)
+    monkeypatch.setattr(
+        api,
+        "_resolve_dataset_entry",
+        lambda _dataset_id: {
+            "id": "ds_linked",
+            "dataset_root": str(source_root),
+            "registry_root": str(record_root),
+            "storage_mode": "linked",
+            "linked_root": str(source_root),
+        },
+    )
+
+    original_rmtree = api.shutil.rmtree
+
+    def fail_rmtree(path, *args, **kwargs):
+        if Path(path).resolve(strict=False) == record_root.resolve(strict=False):
+            raise OSError("simulated registry remove failure")
+        return original_rmtree(path, *args, **kwargs)
+
+    monkeypatch.setattr(api.shutil, "rmtree", fail_rmtree)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.delete_dataset_entry("ds_linked")
+
+    assert exc.value.status_code == 500
+    assert str(exc.value.detail).startswith("dataset_delete_failed:")
+    assert source_root.exists(), "linked source must never be deleted"
+    assert record_root.exists(), "registry record must remain when deletion fails"
+
+
 def test_delete_linked_dataset_unlinks_registry_symlink_without_target_delete(
     tmp_path, monkeypatch
 ) -> None:
@@ -799,6 +843,90 @@ def test_download_dataset_entry_applies_overlay_files(tmp_path, monkeypatch) -> 
         )
         assert zf.read(label_name).decode("utf-8").strip() == "0 0.9 0.9 0.2 0.2"
         assert zf.read(text_name).decode("utf-8").strip() == "new"
+
+
+def test_download_dataset_entry_fails_if_planned_overlay_disappears(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "linked_source"
+    (source_root / "labels").mkdir(parents=True, exist_ok=True)
+    (source_root / "labels" / "img1.txt").write_text("0 0.1 0.1 0.1 0.1\n", encoding="utf-8")
+    record_root = tmp_path / "registry" / "ds_linked"
+    overlay_root = record_root / api.DATASET_ANNOTATION_OVERLAY_DIRNAME
+    (overlay_root / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    overlay_label = overlay_root / "labels" / "train" / "img1.txt"
+    overlay_label.write_text("0 0.9 0.9 0.2 0.2\n", encoding="utf-8")
+    entry = {
+        "id": "ds_linked",
+        "dataset_root": str(source_root),
+        "registry_root": str(record_root),
+        "storage_mode": "linked",
+        "linked_root": str(source_root),
+        "yolo_layout": "flat",
+    }
+    monkeypatch.setattr(api, "_resolve_dataset_entry", lambda _dataset_id: entry)
+    real_overlay_entries = api._annotation_overlay_archive_entries
+
+    def disappearing_overlay_entries(entry_arg):
+        entries = real_overlay_entries(entry_arg)
+        overlay_label.unlink()
+        return entries
+
+    monkeypatch.setattr(api, "_annotation_overlay_archive_entries", disappearing_overlay_entries)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.download_dataset_entry("ds_linked")
+
+    assert exc.value.status_code == 412
+    assert exc.value.detail == {
+        "error": "dataset_export_override_unavailable",
+        "path": "labels/img1.txt",
+    }
+
+
+def test_download_dataset_entry_fails_if_planned_overlay_becomes_symlink(
+    tmp_path, monkeypatch
+) -> None:
+    source_root = tmp_path / "linked_source"
+    (source_root / "labels").mkdir(parents=True, exist_ok=True)
+    (source_root / "labels" / "img1.txt").write_text("0 0.1 0.1 0.1 0.1\n", encoding="utf-8")
+    record_root = tmp_path / "registry" / "ds_linked"
+    overlay_root = record_root / api.DATASET_ANNOTATION_OVERLAY_DIRNAME
+    (overlay_root / "labels" / "train").mkdir(parents=True, exist_ok=True)
+    overlay_label = overlay_root / "labels" / "train" / "img1.txt"
+    overlay_label.write_text("0 0.9 0.9 0.2 0.2\n", encoding="utf-8")
+    outside = tmp_path / "outside.txt"
+    outside.write_text("secret\n", encoding="utf-8")
+    entry = {
+        "id": "ds_linked",
+        "dataset_root": str(source_root),
+        "registry_root": str(record_root),
+        "storage_mode": "linked",
+        "linked_root": str(source_root),
+        "yolo_layout": "flat",
+    }
+    monkeypatch.setattr(api, "_resolve_dataset_entry", lambda _dataset_id: entry)
+    real_overlay_entries = api._annotation_overlay_archive_entries
+
+    def symlinked_overlay_entries(entry_arg):
+        entries = real_overlay_entries(entry_arg)
+        overlay_label.unlink()
+        try:
+            overlay_label.symlink_to(outside)
+        except OSError as exc:
+            pytest.skip(f"symlink unsupported: {exc}")
+        return entries
+
+    monkeypatch.setattr(api, "_annotation_overlay_archive_entries", symlinked_overlay_entries)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.download_dataset_entry("ds_linked")
+
+    assert exc.value.status_code == 412
+    assert exc.value.detail == {
+        "error": "dataset_export_override_unavailable",
+        "path": "labels/img1.txt",
+    }
 
 
 def test_download_dataset_entry_rejects_not_allowlisted_linked_record(tmp_path, monkeypatch) -> None:
@@ -3287,6 +3415,73 @@ def test_segmentation_output_text_write_is_atomic_over_symlink_leaves(
     assert label_path.read_text(encoding="utf-8") == "0 0.1 0.1 0.2 0.1 0.2 0.2\n"
     assert outside_tmp.read_text(encoding="utf-8") == "external tmp"
     assert outside_final.read_text(encoding="utf-8") == "external final"
+
+
+def test_segmentation_build_fails_when_image_worker_fails(tmp_path, monkeypatch) -> None:
+    dataset_root = tmp_path / "source_split"
+    _write_test_image(dataset_root / "train" / "images" / "img.jpg")
+    (dataset_root / "train" / "labels").mkdir(parents=True, exist_ok=True)
+    (dataset_root / "train" / "labels" / "img.txt").write_text(
+        "0 0.5 0.5 0.2 0.2\n", encoding="utf-8"
+    )
+    (dataset_root / "labelmap.txt").write_text("building\n", encoding="utf-8")
+    output_root = tmp_path / "sam3_outputs"
+    output_root.mkdir()
+
+    class FailingMiningPool:
+        def __init__(self, _devices):
+            self.workers = [self]
+
+        def process_image(self, **_kwargs):
+            raise RuntimeError("simulated mask failure")
+
+        def close(self):
+            return None
+
+    monkeypatch.setattr(api, "SAM3_DATASET_ROOT", output_root)
+    monkeypatch.setattr(
+        api,
+        "_plan_segmentation_build",
+        lambda _request: (
+            {"id": "seg_out", "classes": ["building"]},
+            {"dataset_root": str(output_root / "seg_out")},
+        ),
+    )
+    monkeypatch.setattr(
+        api,
+        "_resolve_sam3_dataset_meta",
+        lambda _dataset_id: {
+            "id": "source",
+            "dataset_root": str(dataset_root),
+            "classes": ["building"],
+        },
+    )
+    monkeypatch.setattr(api, "_resolve_sam3_mining_devices_impl", lambda *_args, **_kwargs: ["cpu"])
+    monkeypatch.setattr(api, "_Sam3MiningPool", FailingMiningPool)
+
+    def run_job_immediately(*, job, registry, lock, target, args, name=None):
+        with lock:
+            registry[job.job_id] = job
+        target(*args)
+
+    monkeypatch.setattr(api, "_register_job_and_start_thread", run_job_immediately)
+    monkeypatch.setattr(
+        api,
+        "_convert_yolo_dataset_to_coco_impl",
+        lambda _root: (_ for _ in ()).throw(AssertionError("must not publish failed build")),
+    )
+    with api.SEGMENTATION_BUILD_JOBS_LOCK:
+        api.SEGMENTATION_BUILD_JOBS.clear()
+
+    job = api._start_segmentation_build_job(
+        api.SegmentationBuildRequest(source_dataset_id="source", output_name="seg_out")
+    )
+
+    assert job.status == "failed"
+    assert job.error is not None
+    assert job.error.startswith("segmentation_builder_worker_failed:1:")
+    assert "simulated mask failure" in job.error
+    assert job.result is None
 
 
 def test_register_path_dedupes_existing_linked_entry(tmp_path, monkeypatch) -> None:

@@ -58,6 +58,13 @@ def _zip_member_path_is_unsafe(name: str) -> bool:
     )
 
 
+def _zip_member_names_or_duplicate_error(zf: zipfile.ZipFile, *, detail: str) -> List[str]:
+    names = zf.namelist()
+    if len(names) != len(set(names)):
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=detail)
+    return names
+
+
 def _agent_cascade_storage_root(
     root: Path,
     *,
@@ -304,7 +311,7 @@ def _ensure_cascade_zip_impl(
     if zip_raw.exists():
         try:
             with zipfile.ZipFile(zip_raw, "r") as zf:
-                if zf.testzip() is None:
+                if zf.testzip() is None and "cascade.json" in set(zf.namelist()):
                     return zip_raw
         except Exception:
             try:
@@ -395,21 +402,32 @@ def _ensure_cascade_zip_impl(
                         zf.write(resolved_path, arcname=arcname)
                     except Exception:
                         pass
-                meta_path = resolved_path.with_suffix(resolved_path.suffix + ".meta.pkl")
-                try:
-                    meta_path_resolved = meta_path.resolve(strict=True)
-                except Exception:
-                    meta_path_resolved = None
-                if (
-                    meta_path_resolved is not None
-                    and path_is_within_root_fn(meta_path_resolved, classifiers_base)
-                    and meta_path_resolved.is_file()
-                ):
+                meta_archive_rel = _safe_archive_relpath(f"{os.path.splitext(safe_classifier_rel)[0]}.meta.pkl")
+                if not meta_archive_rel:
+                    continue
+                meta_candidates = [
+                    Path(os.path.splitext(str(resolved_path))[0] + ".meta.pkl"),
+                    resolved_path.with_suffix(resolved_path.suffix + ".meta.pkl"),
+                ]
+                seen_meta_paths: set[Path] = set()
+                for meta_path in meta_candidates:
                     try:
-                        meta_rel = f"classifiers/{safe_classifier_rel}.meta.pkl"
-                        zf.write(meta_path_resolved, arcname=meta_rel)
+                        meta_path_resolved = meta_path.resolve(strict=True)
+                    except Exception:
+                        continue
+                    if meta_path_resolved in seen_meta_paths:
+                        continue
+                    seen_meta_paths.add(meta_path_resolved)
+                    if not (
+                        path_is_within_root_fn(meta_path_resolved, classifiers_base)
+                        and meta_path_resolved.is_file()
+                    ):
+                        continue
+                    try:
+                        zf.write(meta_path_resolved, arcname=f"classifiers/{meta_archive_rel}")
                     except Exception:
                         pass
+                    break
         os.replace(temp_zip_path, zip_raw)
     except Exception as exc:  # noqa: BLE001
         try:
@@ -435,14 +453,11 @@ def _import_agent_cascade_zip_obj_impl(
     max_recipe_zip_bytes: Optional[int] = None,
     max_total_uncompressed_bytes: Optional[int] = None,
 ) -> Dict[str, Any]:
-    names = zf.namelist()
-    cascade_name = None
+    names = _zip_member_names_or_duplicate_error(zf, detail="agent_cascade_import_duplicate_files")
     for name in names:
         if _zip_member_path_is_unsafe(name):
             raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="agent_cascade_import_invalid_path")
-        if Path(name).name.lower() == "cascade.json":
-            cascade_name = name
-            break
+    cascade_name = "cascade.json" if "cascade.json" in names else None
     if not cascade_name:
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="agent_cascade_import_no_json")
     info = zf.getinfo(cascade_name)

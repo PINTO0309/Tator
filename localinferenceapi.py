@@ -3,6 +3,7 @@
 from __future__ import annotations
 
 import base64, hashlib, io, zipfile, uuid, os, tempfile, shutil, time, logging, subprocess, sys, json, re, signal, random, gc, queue, functools, math, stat, importlib, warnings
+import copy
 from concurrent.futures import ThreadPoolExecutor, as_completed
 from contextvars import ContextVar
 from pathlib import Path, PureWindowsPath
@@ -158,7 +159,6 @@ from models.schemas import (
     YoloBboxOutput,
     Sam3TextPrompt,
     PromptHelperSuggestRequest,
-    PromptHelperPreset,
     PromptHelperRequest,
     PromptHelperSearchRequest,
     PromptRecipePrompt,
@@ -363,6 +363,7 @@ from services.qwen_runtime import (
 )
 from services.qwen_mlx import (
     QWEN_MLX_DEFAULT_MODEL,
+    QWEN_MLX_MODEL_IDS,
     QWEN_MLX_MODEL_OPTIONS,
     QWEN_MLX_VISION_MODEL_OPTIONS,
     QWEN_PLATFORM_ALIASES,
@@ -370,6 +371,7 @@ from services.qwen_mlx import (
     QWEN_PLATFORM_MLX,
     QWEN_PLATFORM_TRANSFORMERS,
     normalize_qwen_platform,
+    qwen_known_incompatible_mlx_detail,
     qwen_mlx_metadata_for_model,
     resolve_mlx_model_id,
     select_qwen_platform,
@@ -381,6 +383,14 @@ from services.qwen_model_catalog import (
     qwen_transformers_load_kwargs,
     qwen_transformers_metadata_for_model,
     resolve_qwen_training_model_id,
+)
+from services.agent_model_catalog import (
+    AGENT_MLX_MODEL_OPTIONS,
+    AGENT_MODEL_OPTIONS,
+    AGENT_TRANSFORMERS_MODEL_IDS,
+    agent_model_block_detail,
+    agent_model_metadata_for_model,
+    is_agent_mlx_model_id,
 )
 from services.qwen_generation import (
     _BASE_LOGITS_PROCESSOR,
@@ -909,6 +919,10 @@ try:
         Qwen3VLForConditionalGeneration,
         Qwen3VLMoeForConditionalGeneration,
     )
+    try:
+        from transformers import AutoModelForImageTextToText
+    except Exception:  # noqa: BLE001
+        AutoModelForImageTextToText = None  # type: ignore[assignment]
     from qwen_vl_utils import process_vision_info
 except Exception as exc:  # noqa: BLE001
     QWEN_IMPORT_ERROR = exc
@@ -916,6 +930,7 @@ except Exception as exc:  # noqa: BLE001
     Qwen3VLMoeForConditionalGeneration = None  # type: ignore[assignment]
     AutoConfig = None  # type: ignore[assignment]
     AutoModelForCausalLM = None  # type: ignore[assignment]
+    AutoModelForImageTextToText = None  # type: ignore[assignment]
     AutoProcessor = None  # type: ignore[assignment]
     process_vision_info = None  # type: ignore[assignment]
 else:
@@ -1208,6 +1223,12 @@ qwen_llm_call_id_var: ContextVar[Optional[str]] = ContextVar(
     default=None,
 )
 QWEN_CANCEL_RESTART_EXIT_CODE = int(os.environ.get("TATOR_QWEN_CANCEL_RESTART_EXIT_CODE", "75"))
+try:
+    QWEN_PROGRESS_STALE_SECONDS = float(os.environ.get("TATOR_QWEN_PROGRESS_STALE_SECONDS", "1800"))
+except (TypeError, ValueError):
+    QWEN_PROGRESS_STALE_SECONDS = 1800.0
+if not math.isfinite(QWEN_PROGRESS_STALE_SECONDS) or QWEN_PROGRESS_STALE_SECONDS <= 0:
+    QWEN_PROGRESS_STALE_SECONDS = 1800.0
 qwen_progress_state: Dict[str, Any] = {
     "run_id": None,
     "active": False,
@@ -1331,6 +1352,16 @@ def _clear_mlx_cache() -> None:
         MLX_CORE.clear_cache()
     except Exception:
         pass
+
+
+def _qwen_mlx_post_generation_cleanup() -> None:
+    """Release transient MLX buffers after a Qwen generation call."""
+
+    try:
+        gc.collect()
+    except Exception:
+        pass
+    _clear_mlx_cache()
 
 
 def _reset_qwen_runtime() -> None:
@@ -2106,24 +2137,31 @@ def _qwen_progress_cancelled(message: str) -> None:
         )
 
 
-def cancel_qwen_caption(*, force: bool = False) -> Dict[str, Any]:
+def _cancel_qwen_active_request(
+    *,
+    force: bool = False,
+    allowed_kinds: Optional[Set[str]] = None,
+    request_label: str = "Qwen",
+) -> Dict[str, Any]:
     now = time.time()
     with qwen_progress_lock:
         active = bool(qwen_progress_state.get("active"))
         kind = qwen_progress_state.get("kind")
         run_id = qwen_progress_state.get("run_id")
-        if not active or kind != "caption":
+        if not active or (allowed_kinds is not None and kind not in allowed_kinds):
             return {
                 "cancelled": False,
                 "active": active,
                 "kind": kind,
-                "message": "No active Qwen caption request.",
+                "message": f"No active {request_label} request.",
             }
         qwen_cancel_event.set()
+        kind_label = str(kind or request_label or "Qwen").replace("_", " ").strip() or "Qwen"
+        kind_label = kind_label[:1].upper() + kind_label[1:]
         message = (
-            "Caption cancellation requested; restarting backend to stop the active Qwen process"
+            f"{kind_label} cancellation requested; restarting backend to stop the active Qwen process"
             if force
-            else "Caption cancellation requested"
+            else f"{kind_label} cancellation requested"
         )
         qwen_progress_state.update(
             {
@@ -2150,6 +2188,18 @@ def cancel_qwen_caption(*, force: bool = False) -> Dict[str, Any]:
         "force": bool(force),
         "message": message,
     }
+
+
+def cancel_qwen_caption(*, force: bool = False) -> Dict[str, Any]:
+    return _cancel_qwen_active_request(
+        force=force,
+        allowed_kinds={"caption"},
+        request_label="Qwen caption",
+    )
+
+
+def cancel_qwen_request(*, force: bool = False) -> Dict[str, Any]:
+    return _cancel_qwen_active_request(force=force, request_label="Qwen")
 
 
 def _qwen_progress_log(message: str) -> None:
@@ -2934,6 +2984,63 @@ def _qwen_progress_error(message: str) -> None:
         )
 
 
+def _qwen_progress_expire_stale_locked(now: Optional[float] = None) -> bool:
+    """Release stale active Qwen UI state when a worker dies inside a runtime call.
+
+    The underlying ML runtime may still need a backend restart if it is blocked
+    in a non-interruptible Metal/CUDA call, but the UI should never stay locked
+    forever because a progress record stopped heartbeating.
+    """
+
+    if not qwen_progress_state.get("active"):
+        return False
+    timestamp = qwen_progress_state.get("updated_at") or qwen_progress_state.get("started_at")
+    try:
+        last_update = float(timestamp)
+    except (TypeError, ValueError):
+        last_update = 0.0
+    if last_update <= 0.0:
+        return False
+    current_time = time.time() if now is None else float(now)
+    age = current_time - last_update
+    if age < QWEN_PROGRESS_STALE_SECONDS:
+        return False
+    qwen_cancel_event.set()
+    kind = str(qwen_progress_state.get("kind") or "qwen").replace("_", " ")
+    if qwen_progress_state.get("cancel_requested"):
+        phase = "cancelled"
+        phase_label = "Cancelled"
+        error = "cancelled"
+        message = f"Qwen {kind} cancellation was finalized after {int(age)}s without progress updates."
+    else:
+        phase = "error"
+        phase_label = "Stale"
+        error = "stale_progress"
+        message = (
+            f"Qwen {kind} progress became stale after {int(age)}s without an update. "
+            "The UI was released; restart the backend if the runtime is still consuming resources."
+        )
+    lines = qwen_progress_state.get("log_lines")
+    if not isinstance(lines, list):
+        lines = []
+    lines.append(f"{time.strftime('%H:%M:%S')} {message}")
+    qwen_progress_state.update(
+        {
+            "active": False,
+            "phase": phase,
+            "phase_label": phase_label,
+            "progress": 1.0,
+            "message": message,
+            "updated_at": current_time,
+            "completed_at": current_time,
+            "error": error,
+            "cancel_requested": bool(qwen_progress_state.get("cancel_requested")),
+            "log_lines": lines[-80:],
+        }
+    )
+    return True
+
+
 def _http_exception_detail_text(exc: HTTPException) -> str:
     detail = getattr(exc, "detail", None)
     if isinstance(detail, str):
@@ -2948,6 +3055,7 @@ def _http_exception_detail_text(exc: HTTPException) -> str:
 
 def qwen_progress() -> Dict[str, Any]:
     with qwen_progress_lock:
+        _qwen_progress_expire_stale_locked()
         snapshot = dict(qwen_progress_state)
     snapshot["memory"] = _qwen_memory_snapshot()
     snapshot["vram"] = snapshot["memory"]
@@ -5547,6 +5655,10 @@ def _resolve_qwen_runtime_platform(
     if meta_platform == QWEN_PLATFORM_TRANSFORMERS and meta_id and meta_id != "default":
         return QWEN_PLATFORM_TRANSFORMERS
     raw_model_id = str(model_id or "").strip()
+    if raw_model_id in AGENT_TRANSFORMERS_MODEL_IDS:
+        return QWEN_PLATFORM_TRANSFORMERS
+    if is_agent_mlx_model_id(raw_model_id):
+        return QWEN_PLATFORM_MLX
     if raw_model_id in QWEN_TRANSFORMERS_MODEL_IDS and not raw_model_id.startswith("Qwen/Qwen3-VL-"):
         return QWEN_PLATFORM_TRANSFORMERS
     return select_qwen_platform(
@@ -5568,6 +5680,12 @@ def _qwen_mlx_dependency_error() -> Optional[str]:
 
 
 def _qwen_mlx_incompatible_model_detail(model_id: str) -> Optional[str]:
+    known_detail = qwen_known_incompatible_mlx_detail(str(model_id or ""))
+    if known_detail:
+        return known_detail
+    agent_detail = agent_model_block_detail(str(model_id or ""))
+    if agent_detail:
+        return agent_detail
     metadata = qwen_mlx_metadata_for_model(str(model_id or ""))
     if (
         metadata.get("vision_inference_supported") is False
@@ -5709,6 +5827,164 @@ def _qwen_mlx_remote_checkpoint_incompatibility_detail(model_id: str) -> Optiona
     )
 
 
+def _qwen_mlx_catalog_incompatibility_detail(model_id: str) -> Optional[str]:
+    agent_detail = agent_model_block_detail(str(model_id))
+    if agent_detail:
+        return agent_detail
+    metadata = qwen_mlx_metadata_for_model(str(model_id))
+    if (
+        metadata.get("vision_inference_supported") is False
+        or metadata.get("inference_supported") is False
+    ):
+        return str(
+            metadata.get("compatibility_note")
+            or metadata.get("training_note")
+            or f"{model_id}: this MLX checkpoint is not enabled for vision inference."
+        )
+    return None
+
+
+_QWEN_MLX_QWEN35_MOE_SPLIT_SANITIZER_PATCHED = False
+_QWEN_MLX_PT_PROCESSOR_FALLBACK_PATCHED = False
+
+
+def _patch_qwen35_moe_mlx_split_weight_sanitizer() -> None:
+    """Support Qwen3.5/3.6 MoE MLX checkpoints stored with pre-split experts."""
+
+    global _QWEN_MLX_QWEN35_MOE_SPLIT_SANITIZER_PATCHED
+    if _QWEN_MLX_QWEN35_MOE_SPLIT_SANITIZER_PATCHED:
+        return
+    try:
+        import mlx.core as mx_local
+        from mlx_vlm.models.qwen3_5.qwen3_5 import sanitize_key
+        from mlx_vlm.models.qwen3_5_moe.qwen3_5_moe import Model as Qwen35MoeModel
+    except Exception:
+        return
+
+    current = getattr(Qwen35MoeModel, "sanitize", None)
+    if getattr(current, "_tator_split_weight_compatible", False):
+        _QWEN_MLX_QWEN35_MOE_SPLIT_SANITIZER_PATCHED = True
+        return
+
+    def sanitize_split_compatible(self: Any, weights: Dict[str, Any]) -> Dict[str, Any]:
+        weights = {key: value for key, value in weights.items() if "mtp." not in key}
+
+        if self.config.text_config.tie_word_embeddings:
+            weights.pop("lm_head.weight", None)
+            weights.pop("language_model.lm_head.weight", None)
+
+        for layer_idx in range(self.config.text_config.num_hidden_layers):
+            legacy_prefix = f"model.language_model.layers.{layer_idx}.mlp"
+            sanitized_prefix = f"language_model.model.layers.{layer_idx}.mlp"
+            combined_gate_up_key = f"{legacy_prefix}.experts.gate_up_proj"
+            combined_down_key = f"{legacy_prefix}.experts.down_proj"
+            split_gate_key = f"{legacy_prefix}.switch_mlp.gate_proj.weight"
+            sanitized_split_gate_key = f"{sanitized_prefix}.switch_mlp.gate_proj.weight"
+
+            if combined_gate_up_key in weights and combined_down_key in weights:
+                gate_up_weight = weights.pop(combined_gate_up_key)
+                gate_weight, up_weight = mx_local.split(gate_up_weight, 2, axis=-2)
+                weights[split_gate_key] = gate_weight
+                weights[f"{legacy_prefix}.switch_mlp.up_proj.weight"] = up_weight
+                weights[f"{legacy_prefix}.switch_mlp.down_proj.weight"] = weights.pop(combined_down_key)
+            elif split_gate_key in weights or sanitized_split_gate_key in weights:
+                continue
+            else:
+                raise KeyError(combined_gate_up_key)
+
+        norm_keys = (
+            ".input_layernorm.weight",
+            ".post_attention_layernorm.weight",
+            "model.norm.weight",
+            ".q_norm.weight",
+            ".k_norm.weight",
+        )
+        sanitized_weights: Dict[str, Any] = {}
+        for key, value in weights.items():
+            key = sanitize_key(key)
+
+            if "conv1d.weight" in key and getattr(value, "shape", (None, None, None))[-1] != 1:
+                value = value.moveaxis(2, 1)
+            if any(key.endswith(sfx) for sfx in norm_keys) and getattr(value, "ndim", 0) == 1:
+                value += 1.0
+
+            sanitized_weights[key] = value
+
+        return sanitized_weights
+
+    sanitize_split_compatible._tator_split_weight_compatible = True  # type: ignore[attr-defined]
+    Qwen35MoeModel.sanitize = sanitize_split_compatible
+    _QWEN_MLX_QWEN35_MOE_SPLIT_SANITIZER_PATCHED = True
+
+
+def _patch_mlx_vlm_pt_processor_fallback() -> None:
+    """Retry Qwen3.5/3.6 image preprocessing through PyTorch tensors when needed."""
+
+    global _QWEN_MLX_PT_PROCESSOR_FALLBACK_PATCHED
+    if _QWEN_MLX_PT_PROCESSOR_FALLBACK_PATCHED:
+        return
+    try:
+        import mlx_vlm.utils as mlx_vlm_utils
+    except Exception:
+        return
+
+    current = getattr(mlx_vlm_utils, "process_inputs_with_fallback", None)
+    process_inputs = getattr(mlx_vlm_utils, "process_inputs", None)
+    if current is None or process_inputs is None:
+        return
+    if getattr(current, "_tator_pt_tensor_retry", False):
+        _QWEN_MLX_PT_PROCESSOR_FALLBACK_PATCHED = True
+        return
+
+    def to_numpy_compatible(value: Any) -> Any:
+        if hasattr(value, "detach") and hasattr(value, "cpu") and hasattr(value, "numpy"):
+            return value.detach().cpu().numpy()
+        if isinstance(value, Mapping):
+            return {key: to_numpy_compatible(item) for key, item in value.items()}
+        if isinstance(value, tuple):
+            return tuple(to_numpy_compatible(item) for item in value)
+        if isinstance(value, list):
+            return [to_numpy_compatible(item) for item in value]
+        return value
+
+    def process_inputs_with_pt_retry(
+        processor: Any,
+        prompts: Any,
+        images: Any,
+        audio: Any,
+        add_special_tokens: bool = False,
+        return_tensors: str = "mlx",
+        **kwargs: Any,
+    ) -> Any:
+        try:
+            return current(
+                processor,
+                prompts=prompts,
+                images=images,
+                audio=audio,
+                add_special_tokens=add_special_tokens,
+                return_tensors=return_tensors,
+                **kwargs,
+            )
+        except Exception as exc:
+            if "Only returning PyTorch tensors is currently supported" not in str(exc):
+                raise
+            retried = process_inputs(
+                processor,
+                prompts=prompts,
+                images=images,
+                audio=audio,
+                add_special_tokens=add_special_tokens,
+                return_tensors="pt",
+                **kwargs,
+            )
+            return to_numpy_compatible(retried)
+
+    process_inputs_with_pt_retry._tator_pt_tensor_retry = True  # type: ignore[attr-defined]
+    mlx_vlm_utils.process_inputs_with_fallback = process_inputs_with_pt_retry
+    _QWEN_MLX_PT_PROCESSOR_FALLBACK_PATCHED = True
+
+
 def _effective_qwen_mlx_settings_model_id() -> str:
     if _qwen_mlx_incompatible_model_detail(QWEN_MLX_MODEL_NAME):
         return QWEN_MLX_DEFAULT_MODEL
@@ -5738,7 +6014,7 @@ def _qwen_mlx_entry_with_runtime_state(entry: Mapping[str, Any]) -> Dict[str, An
 
 def _qwen_mlx_runtime_model_options() -> List[Dict[str, Any]]:
     entries: List[Dict[str, Any]] = []
-    for entry in QWEN_MLX_MODEL_OPTIONS:
+    for entry in [*QWEN_MLX_MODEL_OPTIONS, *AGENT_MLX_MODEL_OPTIONS]:
         enriched = _qwen_mlx_entry_with_runtime_state(entry)
         if (
             enriched.get("vision_inference_supported") is False
@@ -5776,6 +6052,11 @@ def _load_qwen_mlx_runtime(model_id: str, adapter_path: Optional[Path] = None) -
         detail = _qwen_mlx_dependency_error() or "mlx_vlm_unavailable"
         raise HTTPException(status_code=HTTP_503_SERVICE_UNAVAILABLE, detail=f"qwen_mlx_missing:{detail}")
     resolved_model_id = _effective_qwen_model_id_for_platform(model_id, QWEN_PLATFORM_MLX)
+    catalog_incompatible_detail = _qwen_mlx_catalog_incompatibility_detail(str(resolved_model_id))
+    if catalog_incompatible_detail:
+        detail = f"qwen_mlx_incompatible_checkpoint:{catalog_incompatible_detail}"
+        _qwen_progress_error(f"MLX Qwen model is not image-compatible: {catalog_incompatible_detail}")
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=detail)
     incompatible_detail = _qwen_mlx_incompatible_model_detail(str(resolved_model_id))
     if incompatible_detail:
         detail = f"qwen_mlx_incompatible_checkpoint:{incompatible_detail}"
@@ -5827,6 +6108,8 @@ def _load_qwen_mlx_runtime(model_id: str, adapter_path: Optional[Path] = None) -
             max_progress=0.34 if availability.get("needs_download") else 0.36,
         )
         try:
+            _patch_qwen35_moe_mlx_split_weight_sanitizer()
+            _patch_mlx_vlm_pt_processor_fallback()
             model_local, processor_local = MLX_VLM_LOAD(str(resolved_model_id), **load_kwargs)
         finally:
             stop_monitor.set()
@@ -7521,16 +7804,19 @@ def _run_qwen_chat(
     else:
         runtime = _ensure_qwen_ready()
     if isinstance(runtime, QwenRuntime) and runtime.platform == QWEN_PLATFORM_MLX:
-        output_text = _run_qwen_chat_mlx(
-            runtime,
-            messages,
-            max_new_tokens=max_new_tokens,
-            decode_override=decode_override,
-            tools=tools,
-            chat_template_kwargs=chat_template_kwargs,
-            add_generation_prompt=add_generation_prompt,
-            assistant_prefix=assistant_prefix,
-        )
+        try:
+            output_text = _run_qwen_chat_mlx(
+                runtime,
+                messages,
+                max_new_tokens=max_new_tokens,
+                decode_override=decode_override,
+                tools=tools,
+                chat_template_kwargs=chat_template_kwargs,
+                add_generation_prompt=add_generation_prompt,
+                assistant_prefix=assistant_prefix,
+            )
+        finally:
+            _qwen_mlx_post_generation_cleanup()
         _agent_full_trace_write(
             {
                 "type": "llm_output",
@@ -8001,6 +8287,28 @@ def _load_qwen_vl_model(
         return Qwen3VLForConditionalGeneration.from_pretrained(
             str(model_id), local_files_only=local_files_only, **load_kwargs
         )
+    generic_image_text_model_types = {
+        "qwen3_5",
+        "qwen3_5_moe",
+        "gemma4",
+        "gemma4_unified",
+    }
+
+    def _load_generic_image_text_model(*, trust_remote_code: bool) -> Any:
+        if AutoModelForImageTextToText is not None:
+            return AutoModelForImageTextToText.from_pretrained(
+                str(model_id),
+                trust_remote_code=trust_remote_code,
+                local_files_only=local_files_only,
+                **load_kwargs,
+            )
+        return AutoModelForCausalLM.from_pretrained(
+            str(model_id),
+            trust_remote_code=trust_remote_code,
+            local_files_only=local_files_only,
+            **load_kwargs,
+        )
+
     if not QWEN_TRUST_REMOTE_CODE:
         if _is_qwen_moe_model_id(str(model_id)) and Qwen3VLMoeForConditionalGeneration is not None:
             return Qwen3VLMoeForConditionalGeneration.from_pretrained(
@@ -8015,6 +8323,8 @@ def _load_qwen_vl_model(
                 return Qwen3VLMoeForConditionalGeneration.from_pretrained(
                     str(model_id), local_files_only=local_files_only, **load_kwargs
                 )
+            if model_type in generic_image_text_model_types:
+                return _load_generic_image_text_model(trust_remote_code=False)
             if model_type not in (None, "qwen3_vl", "qwen3_vl_moe"):
                 logging.warning(
                     "Qwen model_type=%s may require trust_remote_code; set QWEN_TRUST_REMOTE_CODE=1 to enable.",
@@ -8040,6 +8350,8 @@ def _load_qwen_vl_model(
             return Qwen3VLMoeForConditionalGeneration.from_pretrained(
                 str(model_id), local_files_only=local_files_only, **load_kwargs
             )
+        if model_type in generic_image_text_model_types:
+            return _load_generic_image_text_model(trust_remote_code=True)
         if model_type not in (None, "qwen3_vl", "qwen3_vl_moe"):
             return AutoModelForCausalLM.from_pretrained(
                 str(model_id),
@@ -13090,6 +13402,8 @@ _agent_readable_write = lambda line: _agent_readable_write_impl(  # noqa: E731
     caption_window_hook=_CAPTION_WINDOW_HOOK,
     http_exception_cls=HTTPException,
     http_503_code=HTTP_503_SERVICE_UNAVAILABLE,
+    progress_update_fn=_qwen_progress_update,
+    cancel_check_fn=_raise_if_qwen_cancelled,
 )
 
 
@@ -13834,6 +14148,7 @@ YOLO_KEEP_FILES = {
     "head_graft_audit.jsonl",
     YOLO_RUN_META_NAME,
 }
+YOLO_DOWNLOAD_REQUIRED_FILES = {"best.pt", "labelmap.txt", YOLO_RUN_META_NAME}
 
 RFDETR_JOB_ROOT = Path(os.environ.get("RFDETR_TRAINING_ROOT", "./uploads/rfdetr_runs"))
 _init_storage_root(RFDETR_JOB_ROOT)
@@ -13866,6 +14181,7 @@ RFDETR_KEEP_FILES = {
     "labelmap.txt",
     RFDETR_RUN_META_NAME,
 }
+RFDETR_DOWNLOAD_REQUIRED_FILES = {"labelmap.txt", RFDETR_RUN_META_NAME}
 
 YOLO_INFER_LOCK = threading.RLock()
 yolo_infer_model: Any = None
@@ -14322,6 +14638,28 @@ class ClassAnalysisClusterJob:
 
 
 @dataclass
+class ClassAnalysisQwenReviewJob:
+    review_id: str
+    parent_job_id: str
+    point_id: str
+    status: str = "queued"
+    progress: float = 0.0
+    message: str = "Queued"
+    request: Dict[str, Any] = field(default_factory=dict)
+    logs: List[Dict[str, Any]] = field(default_factory=list)
+    evidence: List[Dict[str, Any]] = field(default_factory=list)
+    result: Optional[Dict[str, Any]] = None
+    error: Optional[str] = None
+    created_at: float = field(default_factory=time.time)
+    updated_at: float = field(default_factory=time.time)
+    cancel_event: threading.Event = field(default_factory=threading.Event)
+
+    @property
+    def job_id(self) -> str:
+        return self.review_id
+
+
+@dataclass
 class ClassAnalysisMobileReviewSession:
     session_id: str
     job_id: str
@@ -14380,6 +14718,62 @@ CLASS_ANALYSIS_JOBS: Dict[str, ClassAnalysisJob] = {}
 CLASS_ANALYSIS_JOBS_LOCK = threading.Lock()
 CLASS_ANALYSIS_CLUSTER_JOBS: Dict[str, ClassAnalysisClusterJob] = {}
 CLASS_ANALYSIS_CLUSTER_JOBS_LOCK = threading.Lock()
+CLASS_ANALYSIS_QWEN_REVIEW_JOBS: Dict[str, ClassAnalysisQwenReviewJob] = {}
+CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK = threading.Lock()
+CLASS_ANALYSIS_QWEN_REVIEW_TTL_SECONDS = max(
+    60,
+    _env_int("CLASS_ANALYSIS_QWEN_REVIEW_TTL_SECONDS", 12 * 3600),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_MAX_JOBS = max(
+    1,
+    _env_int("CLASS_ANALYSIS_QWEN_REVIEW_MAX_JOBS", 128),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_MAX_TURNS = max(
+    2,
+    min(16, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_MAX_TURNS", 10)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION = "class_visual_concept_brief_v3"
+CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION = "class_pair_contrast_brief_v2"
+CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION = "qwen_specificity_probe_v3_region_contrast"
+CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_MAX_CLASSES = max(
+    1,
+    min(4, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_MAX_CLASSES", 3)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE = max(
+    320,
+    min(1280, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE", 768)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE = max(
+    320,
+    min(
+        CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE,
+        _env_int("CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE", 384),
+    ),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_FINAL_MAX_IMAGES = max(
+    1,
+    min(4, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_FINAL_MAX_IMAGES", 4)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MAX_IMAGES = max(
+    1,
+    min(4, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MAX_IMAGES", 3)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_MAX_IMAGES = max(
+    1,
+    min(4, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_MAX_IMAGES", 3)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_EVERY = max(
+    0,
+    min(1000, _env_int("CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_EVERY", 8)),
+)
+CLASS_ANALYSIS_QWEN_REVIEW_ENABLE_MLX_FINAL = _env_bool(
+    "CLASS_ANALYSIS_QWEN_REVIEW_ENABLE_MLX_FINAL",
+    True,
+)
+CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_STATE = {"completed_calls": 0}
+CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_LOCK = threading.Lock()
+CLASS_ANALYSIS_QWEN_REVIEW_EMBEDDING_CACHE: Dict[str, Dict[str, Any]] = {}
+CLASS_ANALYSIS_QWEN_REVIEW_EMBEDDING_CACHE_LOCK = threading.Lock()
 CLASS_ANALYSIS_MOBILE_REVIEW_SESSIONS: Dict[str, ClassAnalysisMobileReviewSession] = {}
 CLASS_ANALYSIS_MOBILE_REVIEW_LOCK = threading.Lock()
 CLASS_ANALYSIS_MOBILE_REVIEW_TTL_SECONDS = max(
@@ -14533,7 +14927,16 @@ def _agent_mining_cache_child_dir(cache_root: Path, child_name: str, *, create: 
 def _write_auto_label_result_json(job_id: str, payload: Dict[str, Any]) -> None:
     job_id_text = str(job_id or "").strip()
     job_id_path = Path(job_id_text)
-    if not job_id_text or job_id_path.is_absolute() or ".." in job_id_path.parts:
+    job_id_win_path = PureWindowsPath(job_id_text)
+    if (
+        not job_id_text
+        or "/" in job_id_text
+        or "\\" in job_id_text
+        or job_id_path.is_absolute()
+        or job_id_win_path.is_absolute()
+        or job_id_win_path.drive
+        or ".." in job_id_path.parts
+    ):
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="auto_label_job_path_invalid")
     if _storage_path_has_symlink_component(AUTO_LABEL_ROOT):
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="auto_label_job_path_invalid")
@@ -14629,24 +15032,43 @@ def _enforce_agent_mining_cache_limits(cache_root: Path, allow_when_running: boo
             continue
 
 
-def _purge_directory(root: Path) -> int:
-    """Delete all entries under a directory and return count removed."""
+def _purge_directory(root: Path, *, fail_detail: Optional[str] = None) -> int:
+    """Delete all entries under a directory and return count removed.
+
+    By default this remains best-effort for internal cleanup callers. User-facing
+    purge endpoints pass ``fail_detail`` so a failed removal is reported instead
+    of being counted as deleted.
+    """
     removed = 0
     try:
+        if root.is_symlink():
+            return 0
         if not root.exists():
             return 0
         for entry in root.iterdir():
             try:
                 if entry.is_symlink():
-                    entry.unlink(missing_ok=True)
+                    entry.unlink()
                 elif entry.is_dir():
-                    shutil.rmtree(entry, ignore_errors=True)
+                    shutil.rmtree(entry)
                 else:
-                    entry.unlink(missing_ok=True)
+                    entry.unlink()
                 removed += 1
-            except Exception:
+            except Exception as exc:  # noqa: BLE001
+                if fail_detail:
+                    raise HTTPException(
+                        status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                        detail=f"{fail_detail}:{exc}",
+                    ) from exc
                 continue
-    except Exception:
+    except HTTPException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        if fail_detail:
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"{fail_detail}:{exc}",
+            ) from exc
         return removed
     return removed
 
@@ -15171,7 +15593,7 @@ def _qwen_dataset_upload_job_dir(
 ) -> Path:
     safe_job_id = _sanitize_yolo_run_id_impl(str(job_id or "")) or uuid.uuid4().hex
     try:
-        root = _qwen_dataset_upload_storage_root(create=True, detail=detail)
+        root = _qwen_dataset_upload_storage_root(create=create, detail=detail)
         candidate = root / f"qwen_upload_{safe_job_id}"
         if _storage_path_has_symlink_component(candidate):
             raise ValueError("qwen dataset upload job dir is a symlink")
@@ -16459,7 +16881,13 @@ def _delete_dataset_tree_or_link(path: Path, allowed_roots: Sequence[Path]) -> N
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="dataset_root_missing")
     if not any(_path_is_within_root_impl(resolved, root.resolve()) for root in allowed_roots):
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="dataset_delete_forbidden")
-    shutil.rmtree(resolved, ignore_errors=True)
+    try:
+        shutil.rmtree(resolved)
+    except OSError as exc:
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"dataset_delete_failed:{exc}",
+        ) from exc
 
 
 def _managed_dataset_roots() -> List[Path]:
@@ -17221,13 +17649,44 @@ def list_dataset_upload_sessions() -> List[Dict[str, Any]]:
 
 def get_dataset_upload_session(session_id: str) -> Dict[str, Any]:
     job = _load_dataset_upload_session_job(session_id, required=True)
-    assert job is not None
+    if job is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail="dataset_upload_session_not_found",
+        )
     return _dataset_upload_session_status(job, source="memory")
 
 
 def init_dataset_upload_session(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(payload, dict):
-        payload = {}
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="dataset_upload_session_payload_invalid",
+        )
+    run_name = str(payload.get("dataset_id") or payload.get("run_name") or "").strip()
+    if not run_name:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="dataset_upload_session_dataset_id_required",
+        )
+    dataset_type = str(payload.get("dataset_type") or "bbox").strip().lower()
+    if dataset_type not in {"bbox", "seg"}:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="dataset_upload_session_dataset_type_invalid",
+        )
+    try:
+        total_images = int(payload.get("total_images") or 0)
+    except (TypeError, ValueError) as exc:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="dataset_upload_session_total_images_invalid",
+        ) from exc
+    if total_images <= 0:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail="dataset_upload_session_total_images_required",
+        )
     job_id = uuid.uuid4().hex
     root_dir = _dataset_upload_session_job_dir(job_id, create=True)
     for rel in ("train/images", "train/labels", "val/images", "val/labels"):
@@ -17236,21 +17695,14 @@ def init_dataset_upload_session(payload: Dict[str, Any]) -> Dict[str, Any]:
     if not isinstance(raw_classes, list):
         raw_classes = []
     classes = [str(name).strip() for name in raw_classes if str(name).strip()]
-    dataset_type = str(payload.get("dataset_type") or "bbox").strip().lower()
-    if dataset_type not in {"bbox", "seg"}:
-        dataset_type = "bbox"
-    try:
-        total_images = max(0, int(payload.get("total_images") or 0))
-    except (TypeError, ValueError):
-        total_images = 0
     job = DatasetUploadSessionJob(
         job_id=job_id,
         root_dir=root_dir,
-        run_name=str(payload.get("dataset_id") or payload.get("run_name") or "").strip() or None,
+        run_name=run_name,
         dataset_type=dataset_type,
         context=str(payload.get("context") or ""),
         classes=classes,
-        total_images=total_images,
+        total_images=max(0, total_images),
     )
     _persist_dataset_upload_session(job)
     with DATASET_UPLOAD_SESSIONS_LOCK:
@@ -17295,7 +17747,11 @@ def upload_dataset_session_batch(
                 status_code=HTTP_400_BAD_REQUEST, detail="dataset_upload_batch_mismatch"
             )
         job = _load_dataset_upload_session_job(session_id, required=True)
-        assert job is not None
+        if job is None:
+            raise HTTPException(
+                status_code=HTTP_404_NOT_FOUND,
+                detail="dataset_upload_session_not_found",
+            )
         with job.lock:
             with DATASET_UPLOAD_SESSIONS_LOCK:
                 if DATASET_UPLOAD_SESSIONS.get(str(session_id or "")) is not job:
@@ -17432,7 +17888,11 @@ def upload_dataset_session_batch(
 
 def finalize_dataset_upload_session(session_id: str) -> Dict[str, Any]:
     job = _load_dataset_upload_session_job(session_id, required=True)
-    assert job is not None
+    if job is None:
+        raise HTTPException(
+            status_code=HTTP_404_NOT_FOUND,
+            detail="dataset_upload_session_not_found",
+        )
     with job.lock:
         with DATASET_UPLOAD_SESSIONS_LOCK:
             if DATASET_UPLOAD_SESSIONS.get(str(session_id or "")) is not job:
@@ -17474,7 +17934,6 @@ def finalize_dataset_upload_session(session_id: str) -> Dict[str, Any]:
                     status_code=HTTP_409_CONFLICT, detail="dataset_upload_target_exists"
                 )
             try:
-                _dataset_upload_session_meta_path(source_root).unlink(missing_ok=True)
                 if job.classes:
                     _write_text_within_root_atomic(
                         source_root / "labelmap.txt",
@@ -17502,6 +17961,25 @@ def finalize_dataset_upload_session(session_id: str) -> Dict[str, Any]:
                 }
                 _persist_dataset_meta(source_root, meta)
                 shutil.move(str(source_root), target_root)
+                try:
+                    target_session_meta_path = _dataset_upload_session_meta_path(target_root)
+                    if (
+                        target_session_meta_path.exists()
+                        and not target_session_meta_path.is_symlink()
+                        and _path_is_within_root_impl(
+                            target_session_meta_path.resolve(strict=False),
+                            target_root.resolve(strict=False),
+                        )
+                    ):
+                        target_session_meta_path.unlink(missing_ok=True)
+                    meta["signature"] = _compute_dir_signature_impl(target_root)
+                    _persist_dataset_meta(target_root, meta)
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "Dataset upload finalized but metadata cleanup failed for %s: %s",
+                        dataset_id_final,
+                        exc,
+                    )
             except HTTPException:
                 if target_root.exists():
                     shutil.rmtree(target_root, ignore_errors=True)
@@ -17519,45 +17997,62 @@ def finalize_dataset_upload_session(session_id: str) -> Dict[str, Any]:
         return meta
 
 
+def _remove_dataset_upload_session_root(
+    root_dir: Path,
+    *,
+    path_detail: str = "dataset_upload_session_path_invalid",
+    cleanup_detail: str = "dataset_upload_cancel_failed",
+) -> None:
+    try:
+        upload_root = _dataset_upload_session_storage_root(create=False)
+        raw_root = Path(root_dir)
+        if _storage_path_has_symlink_component(raw_root.parent):
+            raise ValueError("dataset upload session parent has a symlink component")
+        parent = raw_root.parent.resolve(strict=False)
+        if parent != upload_root or not _path_is_within_root_impl(parent, upload_root):
+            raise ValueError("dataset upload session root escapes staging root")
+        if raw_root.is_symlink():
+            raw_root.unlink()
+        else:
+            resolved = raw_root.resolve(strict=False)
+            if not _path_is_within_root_impl(resolved, upload_root) or resolved.parent != upload_root:
+                raise ValueError("dataset upload session root escapes staging root")
+            if not resolved.exists():
+                return
+            if not resolved.is_dir():
+                raise ValueError("dataset upload session root is not a directory")
+            shutil.rmtree(resolved)
+        if raw_root.exists() or raw_root.is_symlink():
+            raise OSError("dataset upload session root still exists after cleanup")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=path_detail) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{cleanup_detail}:{exc}",
+        ) from exc
+
+
 def cancel_dataset_upload_session(session_id: str) -> Dict[str, Any]:
     job = _load_dataset_upload_session_job(session_id, required=False)
     if not job:
         safe_session_id = _sanitize_yolo_run_id_impl(str(session_id or ""))
         if safe_session_id:
-            try:
-                upload_root = _dataset_upload_session_storage_root(create=False)
-                root_dir = _dataset_upload_session_job_dir(safe_session_id, create=False)
-                root_resolved = root_dir.resolve(strict=False)
-                if (
-                    root_resolved.exists()
-                    and root_resolved.is_dir()
-                    and not root_resolved.is_symlink()
-                    and _path_is_within_root_impl(root_resolved, upload_root)
-                    and root_resolved.parent == upload_root
-                ):
-                    shutil.rmtree(root_resolved, ignore_errors=True)
-                    return {"status": "cancelled", "session_id": safe_session_id, "orphan": True}
-            except Exception:
-                pass
+            root_dir = _dataset_upload_session_job_dir(safe_session_id, create=False)
+            if root_dir.exists() or root_dir.is_symlink():
+                _remove_dataset_upload_session_root(root_dir)
+                return {"status": "cancelled", "session_id": safe_session_id, "orphan": True}
         return {"status": "missing", "session_id": session_id}
     with job.lock:
         with DATASET_UPLOAD_SESSIONS_LOCK:
             if DATASET_UPLOAD_SESSIONS.get(str(session_id or "")) is not job:
                 return {"status": "missing", "session_id": session_id}
-            DATASET_UPLOAD_SESSIONS.pop(str(session_id or ""), None)
-        try:
-            upload_root = _dataset_upload_session_storage_root(create=False)
-            root_resolved = job.root_dir.resolve(strict=False)
-            if (
-                root_resolved.exists()
-                and root_resolved.is_dir()
-                and not root_resolved.is_symlink()
-                and _path_is_within_root_impl(root_resolved, upload_root)
-                and root_resolved.parent == upload_root
-            ):
-                shutil.rmtree(root_resolved, ignore_errors=True)
-        except Exception:
-            pass
+        _remove_dataset_upload_session_root(job.root_dir)
+        with DATASET_UPLOAD_SESSIONS_LOCK:
+            if DATASET_UPLOAD_SESSIONS.get(str(session_id or "")) is job:
+                DATASET_UPLOAD_SESSIONS.pop(str(session_id or ""), None)
         return {"status": "cancelled", "session_id": session_id}
 
 
@@ -17726,9 +18221,15 @@ def download_dataset_entry(dataset_id: str):
     dataset_root = _dataset_effective_root_from_entry(entry)
     override_entries = _annotation_overlay_archive_entries(entry)
     override_entries.update(_dataset_labelmap_archive_entries(entry, dataset_root))
+    override_storage_root = _dataset_guarded_meta_storage_root_from_entry(
+        entry,
+        ensure=False,
+        detail="dataset_export_override_path_forbidden",
+    ).resolve(strict=False)
     tmp_dir = Path(tempfile.mkdtemp(prefix="dataset_export_"))
     try:
         zip_path = tmp_dir / f"{dataset_id}.zip"
+        written_arcnames: Set[str] = set()
         with zipfile.ZipFile(zip_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
             override_relpaths = set(override_entries.keys())
             for path in dataset_root.rglob("*"):
@@ -17741,11 +18242,30 @@ def download_dataset_entry(dataset_id: str):
                     continue
                 if rel.as_posix() in override_relpaths:
                     continue
-                zf.write(path, arcname=str(Path(dataset_root.name) / rel))
+                arcname = str(Path(dataset_root.name) / rel)
+                written_arcnames.add(arcname)
+                zf.write(path, arcname=arcname)
             for rel_posix, override_path in sorted(override_entries.items()):
-                if not override_path.exists() or not override_path.is_file():
-                    continue
-                zf.write(override_path, arcname=str(Path(dataset_root.name) / Path(rel_posix)))
+                safe_override = _safe_existing_regular_file_within_root_impl(
+                    override_path,
+                    override_storage_root,
+                )
+                if safe_override is None:
+                    raise HTTPException(
+                        status_code=HTTP_412_PRECONDITION_FAILED,
+                        detail={
+                            "error": "dataset_export_override_unavailable",
+                            "path": rel_posix,
+                        },
+                    )
+                arcname = str(Path(dataset_root.name) / Path(rel_posix))
+                written_arcnames.add(arcname)
+                zf.write(safe_override, arcname=arcname)
+        _validate_created_zip(
+            zip_path,
+            required_names=written_arcnames,
+            detail_prefix="dataset_export",
+        )
         return FileResponse(
             path=str(zip_path),
             media_type="application/zip",
@@ -17753,6 +18273,9 @@ def download_dataset_entry(dataset_id: str):
             # Dataset export archives are transient and should not accumulate on disk.
             background=BackgroundTask(shutil.rmtree, tmp_dir, ignore_errors=True),
         )
+    except HTTPException:
+        shutil.rmtree(tmp_dir, ignore_errors=True)
+        raise
     except Exception as exc:  # noqa: BLE001
         shutil.rmtree(tmp_dir, ignore_errors=True)
         raise HTTPException(
@@ -20538,6 +21061,109 @@ def _class_analysis_bbox_corner_similarity(a: Sequence[float], b: Sequence[float
     return float(max(0.0, min(1.0, 1.0 - (mean_corner_delta / scale))))
 
 
+def _class_analysis_bbox_overlap_geometry(
+    target_bbox: Sequence[float],
+    other_bbox: Sequence[float],
+) -> Optional[Dict[str, float]]:
+    try:
+        ax1, ay1, ax2, ay2 = [float(v) for v in list(target_bbox)[:4]]
+        bx1, by1, bx2, by2 = [float(v) for v in list(other_bbox)[:4]]
+    except Exception:
+        return None
+    aw = max(0.0, ax2 - ax1)
+    ah = max(0.0, ay2 - ay1)
+    bw = max(0.0, bx2 - bx1)
+    bh = max(0.0, by2 - by1)
+    if aw <= 0.0 or ah <= 0.0 or bw <= 0.0 or bh <= 0.0:
+        return None
+    ix1 = max(ax1, bx1)
+    iy1 = max(ay1, by1)
+    ix2 = min(ax2, bx2)
+    iy2 = min(ay2, by2)
+    iw = max(0.0, ix2 - ix1)
+    ih = max(0.0, iy2 - iy1)
+    intersection = iw * ih
+    target_area = aw * ah
+    other_area = bw * bh
+    union = max(1.0, target_area + other_area - intersection)
+    iou = float(intersection / union)
+    target_cover = float(intersection / max(1.0, target_area))
+    other_cover = float(intersection / max(1.0, other_area))
+    relation = "none"
+    if iou >= 0.85 or (target_cover >= 0.85 and other_cover >= 0.85):
+        relation = "duplicate_like"
+    elif target_cover >= 0.75 and other_cover < 0.75:
+        relation = "other_contains_target"
+    elif other_cover >= 0.75 and target_cover < 0.75:
+        relation = "target_contains_other"
+    elif intersection > 0.0 and (iou >= 0.02 or target_cover >= 0.04 or other_cover >= 0.04):
+        relation = "partial_contamination"
+    return {
+        "iou": iou,
+        "target_area_covered": target_cover,
+        "other_area_covered": other_cover,
+        "relation": relation,
+    }
+
+
+def _class_analysis_dual_bbox_conflict(
+    target: Dict[str, Any],
+    other: Dict[str, Any],
+    *,
+    iou_threshold: float = 0.90,
+    corner_threshold: float = 0.90,
+) -> Optional[Dict[str, Any]]:
+    """Return a canonical near-identical cross-class bbox conflict record.
+
+    This is intentionally geometry-only and class-name agnostic. The VLM still
+    decides whether the duplicate-looking geometry represents one mislabeled box
+    or two legitimate overlapping objects.
+    """
+
+    current_class = str(target.get("class_name") or "").strip()
+    other_class = str(other.get("class_name") or "").strip()
+    if not current_class or not other_class or current_class == other_class:
+        return None
+    geometry = _class_analysis_bbox_overlap_geometry(
+        target.get("bbox_xyxy") or [],
+        other.get("bbox_xyxy") or [],
+    )
+    if geometry is None:
+        return None
+    corner_similarity = _class_analysis_bbox_corner_similarity(
+        target.get("bbox_xyxy") or [],
+        other.get("bbox_xyxy") or [],
+    )
+    iou = float(geometry.get("iou") or 0.0)
+    if iou < float(iou_threshold) or corner_similarity < float(corner_threshold):
+        return None
+    point_id = str(target.get("point_id") or "")
+    other_point_id = str(other.get("point_id") or "")
+    return {
+        "enabled": True,
+        "kind": "near_identical_cross_class_bbox",
+        "review_mode": "dual_bbox_class_resolution",
+        "point_id": point_id,
+        "current_class": current_class,
+        "other_point_id": other_point_id,
+        "other_class_name": other_class,
+        "class_name": other_class,
+        "classes": [current_class, other_class],
+        "image_relpath": target.get("image_relpath") or other.get("image_relpath") or "",
+        "split": target.get("split") or other.get("split") or "train",
+        "iou": iou,
+        "corner_similarity": float(corner_similarity),
+        "target_area_covered": float(geometry.get("target_area_covered") or 0.0),
+        "other_area_covered": float(geometry.get("other_area_covered") or 0.0),
+        "relation": str(geometry.get("relation") or "duplicate_like"),
+        "score": float(min(iou, corner_similarity)),
+        "question": (
+            f"Resolve near-identical boxes: should this target be {current_class}, "
+            f"{other_class}, both valid overlapping objects, or unresolved?"
+        ),
+    }
+
+
 def _class_analysis_close_overlap_candidates(
     records: Sequence[Dict[str, Any]],
     *,
@@ -20700,6 +21326,7 @@ def _class_analysis_build_result(
     points: List[Dict[str, Any]] = []
     wrong_class_candidates: List[Dict[str, Any]] = []
     close_overlap_matches_by_point, close_overlap_candidates = _class_analysis_close_overlap_candidates(records)
+    records_by_id = {str(record.get("point_id") or ""): record for record in records if str(record.get("point_id") or "")}
     for idx, record in enumerate(records):
         neighbor_indices = neighbor_ids_by_idx[idx]
         neighbor_classes = [str(records[n].get("class_name") or "") for n in neighbor_indices]
@@ -20719,11 +21346,29 @@ def _class_analysis_build_result(
         )
         point_id = str(record.get("point_id") or "")
         close_overlap_matches = close_overlap_matches_by_point.get(point_id, [])
+        dual_bbox_conflicts = []
+        for match in close_overlap_matches:
+            other_record = records_by_id.get(str(match.get("point_id") or ""))
+            if not isinstance(other_record, dict):
+                continue
+            conflict = _class_analysis_dual_bbox_conflict(record, other_record)
+            if conflict is not None:
+                dual_bbox_conflicts.append(conflict)
+        dual_bbox_conflicts.sort(
+            key=lambda item: (float(item.get("score") or 0.0), float(item.get("iou") or 0.0)),
+            reverse=True,
+        )
+        dual_bbox_conflict = dual_bbox_conflicts[0] if dual_bbox_conflicts else None
+        dual_conflict_score = float(dual_bbox_conflict.get("score") or 0.0) if dual_bbox_conflict else 0.0
+        review_priority_score = max(float(suspicion_score), dual_conflict_score)
+        is_review_candidate = bool(is_suspicious or dual_bbox_conflict)
         review_signals = []
         if is_suspicious:
             review_signals.append("wrong_class")
         if close_overlap_matches:
             review_signals.append("close_overlap")
+        if dual_bbox_conflict:
+            review_signals.append("dual_bbox_conflict")
         point = {
             **record,
             "projection": [float(coords[idx, 0]), float(coords[idx, 1])],
@@ -20735,23 +21380,35 @@ def _class_analysis_build_result(
             "same_class_neighbor_ratio": same_ratio,
             "top_other_neighbor_ratio": top_other_ratio,
             "suggested_neighbor_class": suggested_class,
-            "wrong_class_suspicion": suspicion_score,
-            "is_wrong_class_candidate": is_suspicious,
+            "embedding_wrong_class_suspicion": suspicion_score,
+            "wrong_class_suspicion": review_priority_score,
+            "wrong_class_review_reason": "embedding_outlier" if is_suspicious else "dual_bbox_conflict" if dual_bbox_conflict else "",
+            "is_wrong_class_candidate": is_review_candidate,
             "is_close_overlap_candidate": bool(close_overlap_matches),
             "close_overlap_matches": close_overlap_matches,
+            "is_dual_bbox_conflict": bool(dual_bbox_conflict),
+            "dual_bbox_conflict": dual_bbox_conflict,
+            "dual_bbox_conflicts": dual_bbox_conflicts,
             "review_signals": review_signals,
         }
         points.append(point)
-        if is_suspicious:
+        if is_review_candidate:
+            candidate_suggested_class = suggested_class
+            if dual_bbox_conflict and not candidate_suggested_class:
+                candidate_suggested_class = str(dual_bbox_conflict.get("other_class_name") or dual_bbox_conflict.get("class_name") or "")
             wrong_class_candidates.append(
                 {
                     "point_id": point["point_id"],
                     "class_name": current_class,
-                    "suggested_neighbor_class": suggested_class,
-                    "wrong_class_suspicion": suspicion_score,
+                    "suggested_neighbor_class": candidate_suggested_class,
+                    "embedding_wrong_class_suspicion": suspicion_score,
+                    "wrong_class_suspicion": review_priority_score,
+                    "wrong_class_review_reason": point["wrong_class_review_reason"],
                     "top_other_neighbor_ratio": top_other_ratio,
                     "same_class_neighbor_ratio": same_ratio,
                     "image_relpath": point["image_relpath"],
+                    "is_dual_bbox_conflict": bool(dual_bbox_conflict),
+                    "dual_bbox_conflict": dual_bbox_conflict,
                 }
             )
     clusters: List[Dict[str, Any]] = []
@@ -20799,6 +21456,7 @@ def _class_analysis_build_result(
         "wrong_class_candidate_count": len(wrong_class_candidates),
         "close_overlap_candidate_count": len(close_overlap_matches_by_point),
         "close_overlap_pair_count": len(close_overlap_candidates),
+        "dual_bbox_conflict_count": sum(1 for point in points if bool(point.get("is_dual_bbox_conflict"))),
         "warnings": warnings,
     }
     cluster_summary["clusters"] = clusters
@@ -22388,6 +23046,11893 @@ def get_class_analysis_mobile_review_context(session_id: str, point_id: str):
             pass
 
 
+def _class_analysis_qwen_review_update(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    status: Optional[str] = None,
+    progress: Optional[float] = None,
+    message: Optional[str] = None,
+    error: Optional[str] = None,
+    result: Optional[Dict[str, Any]] = None,
+) -> None:
+    if status is not None:
+        job.status = status
+    if progress is not None:
+        job.progress = clamp_progress(progress, fallback=job.progress)
+    if message is not None:
+        if str(message or "") != str(job.message or ""):
+            _class_analysis_log(job, str(message or ""))
+        else:
+            job.message = str(message or "")
+            job.updated_at = time.time()
+    if error is not None:
+        job.error = error
+    if result is not None:
+        job.result = result
+    job.updated_at = time.time()
+
+
+def _class_analysis_qwen_review_dir(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    create: bool = False,
+) -> Path:
+    parent_dir = _class_analysis_job_dir(
+        job.parent_job_id,
+        create=False,
+        detail="qwen_review_parent_not_found",
+    )
+    review_root = parent_dir / "qwen_reviews"
+    review_id = _class_analysis_safe_slug(job.review_id, "review")
+    candidate = review_root / review_id
+    try:
+        if _storage_path_has_symlink_component(review_root) or _storage_path_has_symlink_component(candidate):
+            raise ValueError("qwen review dir has a symlink component")
+        if create:
+            candidate.mkdir(parents=True, exist_ok=True)
+        if candidate.exists() and not candidate.is_dir():
+            raise ValueError("qwen review path is not a directory")
+        resolved = candidate.resolve(strict=False)
+        parent_resolved = parent_dir.resolve(strict=False)
+        if not _path_is_within_root_impl(resolved, parent_resolved):
+            raise ValueError("qwen review path escapes parent")
+        return resolved
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="qwen_review_path_invalid") from exc
+
+
+def _class_analysis_qwen_review_write_json(
+    job: ClassAnalysisQwenReviewJob,
+    filename: str,
+    payload: Dict[str, Any],
+) -> None:
+    review_dir = _class_analysis_qwen_review_dir(job, create=True)
+    path = review_dir / _class_analysis_safe_slug(filename, "payload.json")
+    root = review_dir.resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    if not _path_is_within_root_impl(resolved, root):
+        return
+    text = json.dumps(json_sanitize(payload), indent=2, sort_keys=True)
+    temp = path.with_name(f".{path.name}.{uuid.uuid4().hex[:8]}.tmp")
+    try:
+        _write_temp_text_no_follow(temp, text)
+        os.replace(temp, path)
+    finally:
+        try:
+            temp.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
+def _class_analysis_qwen_review_append_event(
+    job: ClassAnalysisQwenReviewJob,
+    payload: Dict[str, Any],
+) -> None:
+    review_dir = _class_analysis_qwen_review_dir(job, create=True)
+    path = review_dir / "events.jsonl"
+    event = {
+        "timestamp": time.time(),
+        **(payload or {}),
+    }
+    line = json.dumps(json_sanitize(event), sort_keys=True) + "\n"
+    try:
+        flags = os.O_WRONLY | os.O_CREAT | os.O_APPEND
+        if hasattr(os, "O_NOFOLLOW"):
+            flags |= os.O_NOFOLLOW
+        fd = os.open(path, flags, 0o644)
+        with os.fdopen(fd, "a", encoding="utf-8") as handle:
+            handle.write(line)
+    except Exception as exc:
+        logger.debug("Failed to append class analysis Qwen review event: %s", exc)
+
+
+def _serialize_class_analysis_qwen_review_job(job: ClassAnalysisQwenReviewJob) -> Dict[str, Any]:
+    return json_sanitize(
+        {
+            "review_id": job.review_id,
+            "job_id": job.review_id,
+            "parent_job_id": job.parent_job_id,
+            "point_id": job.point_id,
+            "status": job.status,
+            "progress": job.progress,
+            "message": job.message,
+            "request": job.request,
+            "logs": job.logs[-MAX_JOB_LOGS:],
+            "evidence": job.evidence,
+            "result": job.result,
+            "error": job.error,
+            "created_at": job.created_at,
+            "updated_at": job.updated_at,
+        }
+    )
+
+
+def _prune_class_analysis_qwen_review_jobs(now: Optional[float] = None) -> None:
+    cutoff = float(now if now is not None else time.time()) - float(CLASS_ANALYSIS_QWEN_REVIEW_TTL_SECONDS)
+    terminal = {"completed", "failed", "cancelled"}
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        for review_id, job in list(CLASS_ANALYSIS_QWEN_REVIEW_JOBS.items()):
+            status = str(job.status or "").strip().lower()
+            if status not in terminal:
+                continue
+            try:
+                if float(job.updated_at or job.created_at or 0.0) < cutoff:
+                    CLASS_ANALYSIS_QWEN_REVIEW_JOBS.pop(review_id, None)
+            except Exception:
+                CLASS_ANALYSIS_QWEN_REVIEW_JOBS.pop(review_id, None)
+        excess = len(CLASS_ANALYSIS_QWEN_REVIEW_JOBS) - int(CLASS_ANALYSIS_QWEN_REVIEW_MAX_JOBS)
+        if excess > 0:
+            oldest = sorted(
+                CLASS_ANALYSIS_QWEN_REVIEW_JOBS.items(),
+                key=lambda item: float(item[1].updated_at or item[1].created_at or 0.0),
+            )
+            for review_id, job in oldest:
+                if excess <= 0:
+                    break
+                if str(job.status or "").strip().lower() not in terminal:
+                    continue
+                CLASS_ANALYSIS_QWEN_REVIEW_JOBS.pop(review_id, None)
+                excess -= 1
+
+
+def _get_class_analysis_qwen_review_job(review_id: str) -> ClassAnalysisQwenReviewJob:
+    _prune_class_analysis_qwen_review_jobs()
+    safe_id = _class_analysis_safe_slug(str(review_id or ""), "")
+    if not safe_id:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="qwen_review_not_found")
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        job = CLASS_ANALYSIS_QWEN_REVIEW_JOBS.get(safe_id)
+    if job is None:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="qwen_review_not_found")
+    return job
+
+
+def _class_analysis_qwen_points_by_id(result: Dict[str, Any]) -> Dict[str, Dict[str, Any]]:
+    return _class_analysis_mobile_points_by_id(result)
+
+
+def _class_analysis_qwen_review_parent_result(job: ClassAnalysisQwenReviewJob) -> Dict[str, Any]:
+    return get_class_analysis_result(job.parent_job_id)
+
+
+def _class_analysis_qwen_review_session(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+) -> ClassAnalysisMobileReviewSession:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    return ClassAnalysisMobileReviewSession(
+        session_id=f"qwen_{job.review_id}",
+        job_id=job.parent_job_id,
+        source_mode=str(summary.get("source_mode") or "").strip().lower(),
+        source_id=str(summary.get("source_id") or "").strip(),
+        target_mode="desktop_workspace",
+        label=str(summary.get("dataset_label") or ""),
+    )
+
+
+def _class_analysis_qwen_review_point_image_path(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> Path:
+    return _class_analysis_mobile_point_image_path(
+        _class_analysis_qwen_review_session(job, result),
+        point,
+    )
+
+
+def _class_analysis_qwen_review_bbox(point: Dict[str, Any]) -> List[float]:
+    try:
+        values = [float(v) for v in (point.get("bbox_xyxy") or [])[:4]]
+    except Exception:
+        values = []
+    if len(values) < 4 or values[2] <= values[0] or values[3] <= values[1]:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="qwen_review_bbox_not_found")
+    return values
+
+
+def _class_analysis_qwen_review_quality_tier(metrics: Dict[str, Any]) -> Tuple[str, List[str]]:
+    min_dim = float(metrics.get("bbox_min_dim") or 0.0)
+    area = float(metrics.get("bbox_area") or 0.0)
+    contrast = float(metrics.get("crop_contrast") or 0.0)
+    dynamic_range = float(metrics.get("crop_dynamic_range") or 0.0)
+    edge_clipped = bool(metrics.get("edge_clipped"))
+    reasons: List[str] = []
+    tier = "clear"
+    if min_dim < 16.0:
+        tier = "poor"
+        reasons.append(f"bbox min dimension is {min_dim:.0f}px")
+    elif min_dim < 28.0:
+        tier = "limited"
+        reasons.append(f"bbox min dimension is only {min_dim:.0f}px")
+    if area < 450.0:
+        tier = "poor"
+        reasons.append(f"bbox area is {area:.0f}px^2")
+    elif area < 1500.0 and tier != "poor":
+        tier = "limited"
+        reasons.append(f"bbox area is only {area:.0f}px^2")
+    if contrast < 12.0 or dynamic_range < 30.0:
+        tier = "poor"
+        reasons.append("target crop has very low contrast/detail")
+    elif (contrast < 26.0 or dynamic_range < 70.0) and tier != "poor":
+        tier = "limited"
+        reasons.append("target crop has limited contrast/detail")
+    if edge_clipped and tier == "clear":
+        tier = "limited"
+        reasons.append("bbox touches the source image edge")
+    if not reasons:
+        reasons.append("bbox size, contrast, and source-edge checks look usable")
+    return tier, reasons
+
+
+def _class_analysis_qwen_review_visual_quality(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> Dict[str, Any]:
+    bbox = _class_analysis_qwen_review_bbox(point)
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    metrics: Dict[str, Any] = {
+        "source_path": str(image_path),
+        "point_id": point.get("point_id"),
+    }
+    try:
+        with Image.open(image_path) as loaded:
+            image = loaded.convert("L")
+            image_width, image_height = image.size
+            left, top, right, bottom = bbox
+            bbox_width = max(0.0, right - left)
+            bbox_height = max(0.0, bottom - top)
+            crop_left = max(0, int(math.floor(left)))
+            crop_top = max(0, int(math.floor(top)))
+            crop_right = min(image_width, int(math.ceil(right)))
+            crop_bottom = min(image_height, int(math.ceil(bottom)))
+            if crop_right > crop_left and crop_bottom > crop_top:
+                crop = image.crop((crop_left, crop_top, crop_right, crop_bottom))
+                arr = np.asarray(crop, dtype=np.float32)
+            else:
+                arr = np.zeros((1, 1), dtype=np.float32)
+            if arr.size > 4:
+                grad_x = np.diff(arr, axis=1) if arr.shape[1] > 1 else np.zeros_like(arr)
+                grad_y = np.diff(arr, axis=0) if arr.shape[0] > 1 else np.zeros_like(arr)
+                sharpness = (float(np.mean(np.abs(grad_x))) + float(np.mean(np.abs(grad_y)))) / 2.0
+                contrast = float(np.std(arr))
+                dynamic_range = float(np.percentile(arr, 95) - np.percentile(arr, 5))
+            else:
+                sharpness = 0.0
+                contrast = 0.0
+                dynamic_range = 0.0
+            metrics.update(
+                {
+                    "image_width": int(image_width),
+                    "image_height": int(image_height),
+                    "bbox_width": float(bbox_width),
+                    "bbox_height": float(bbox_height),
+                    "bbox_min_dim": float(min(bbox_width, bbox_height)),
+                    "bbox_area": float(bbox_width * bbox_height),
+                    "bbox_relative_area": float((bbox_width * bbox_height) / max(1.0, float(image_width * image_height))),
+                    "edge_clipped": bool(left <= 1.0 or top <= 1.0 or right >= image_width - 1.0 or bottom >= image_height - 1.0),
+                    "crop_sharpness": sharpness,
+                    "crop_contrast": contrast,
+                    "crop_dynamic_range": dynamic_range,
+                }
+            )
+    except Exception as exc:  # noqa: BLE001
+        metrics.update(
+            {
+                "image_width": 0,
+                "image_height": 0,
+                "bbox_width": 0.0,
+                "bbox_height": 0.0,
+                "bbox_min_dim": 0.0,
+                "bbox_area": 0.0,
+                "bbox_relative_area": 0.0,
+                "edge_clipped": True,
+                "crop_sharpness": 0.0,
+                "crop_contrast": 0.0,
+                "crop_dynamic_range": 0.0,
+                "error": str(exc),
+            }
+        )
+    tier, reasons = _class_analysis_qwen_review_quality_tier(metrics)
+    metrics["tier"] = tier
+    metrics["reasons"] = reasons
+    metrics["policy"] = (
+        "Only clear target evidence may receive a class decision. Limited or poor "
+        "target evidence must stay skip_uncertain for human review."
+    )
+    return json_sanitize(metrics)
+
+
+def _class_analysis_qwen_review_quality_summary(visual_quality: Dict[str, Any]) -> str:
+    reasons = visual_quality.get("reasons") if isinstance(visual_quality.get("reasons"), list) else []
+    reason_text = "; ".join(str(item) for item in reasons if str(item or "").strip())
+    return (
+        f"Backend visual-quality tier: {visual_quality.get('tier') or 'unknown'}; "
+        f"bbox {float(visual_quality.get('bbox_width') or 0.0):.0f}x{float(visual_quality.get('bbox_height') or 0.0):.0f}px "
+        f"on {int(visual_quality.get('image_width') or 0)}x{int(visual_quality.get('image_height') or 0)}; "
+        f"contrast {float(visual_quality.get('crop_contrast') or 0.0):.1f}; "
+        f"range {float(visual_quality.get('crop_dynamic_range') or 0.0):.1f}; "
+        f"sharpness {float(visual_quality.get('crop_sharpness') or 0.0):.1f}; "
+        f"edge clipped {bool(visual_quality.get('edge_clipped'))}. "
+        f"Reasons: {reason_text or 'none'}."
+    )
+
+
+def _class_analysis_qwen_review_context_image(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    max_dim: int = 900,
+    min_long_side: int = 0,
+    upscale_resample: Image.Resampling = Image.Resampling.LANCZOS,
+    draw_bbox: bool = True,
+) -> Image.Image:
+    bbox = _class_analysis_qwen_review_bbox(point)
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    with Image.open(image_path) as loaded:
+        image = loaded.convert("RGB")
+    try:
+        image_width, image_height = image.size
+        box_left, box_top, box_right, box_bottom = bbox
+        box_width = max(1.0, box_right - box_left)
+        box_height = max(1.0, box_bottom - box_top)
+        pad_x = min(box_width * 0.5, 50.0)
+        pad_y = min(box_height * 0.5, 50.0)
+        crop_left = box_left - pad_x
+        crop_top = box_top - pad_y
+        crop_width = max(1, int(round(box_width + pad_x * 2.0)))
+        crop_height = max(1, int(round(box_height + pad_y * 2.0)))
+        output = Image.new("RGB", (crop_width, crop_height), (0, 0, 0))
+        src_left = max(0, int(math.floor(crop_left)))
+        src_top = max(0, int(math.floor(crop_top)))
+        src_right = min(image_width, int(math.ceil(crop_left + crop_width)))
+        src_bottom = min(image_height, int(math.ceil(crop_top + crop_height)))
+        if src_right > src_left and src_bottom > src_top:
+            output.paste(
+                image.crop((src_left, src_top, src_right, src_bottom)),
+                (int(round(src_left - crop_left)), int(round(src_top - crop_top))),
+            )
+        if draw_bbox:
+            draw = ImageDraw.Draw(output)
+            line_width = max(2, min(8, int(round(min(crop_width, crop_height) * 0.018))))
+            draw.rectangle(
+                [
+                    int(round(pad_x)),
+                    int(round(pad_y)),
+                    int(round(pad_x + box_width)),
+                    int(round(pad_y + box_height)),
+                ],
+                outline=(249, 115, 22),
+                width=line_width,
+            )
+        output.thumbnail((max_dim, max_dim))
+        min_side = max(0, min(int(min_long_side or 0), int(max_dim or 0) or int(min_long_side or 0)))
+        if min_side > 0:
+            long_side = max(output.size)
+            if 0 < long_side < min_side:
+                scale = float(min_side) / float(long_side)
+                output = output.resize(
+                    (
+                        max(1, int(round(output.width * scale))),
+                        max(1, int(round(output.height * scale))),
+                    ),
+                    upscale_resample,
+                )
+        return output
+    finally:
+        try:
+            image.close()
+        except Exception:
+            pass
+
+
+def _class_analysis_qwen_review_clean_source_image(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    max_side: int = 1400,
+) -> Image.Image:
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    with Image.open(image_path) as loaded:
+        image = loaded.convert("RGB")
+    try:
+        source_width, source_height = image.size
+        scale = min(1.0, float(max_side) / max(1.0, float(max(source_width, source_height))))
+        if scale < 1.0:
+            return image.resize(
+                (
+                    max(1, int(round(source_width * scale))),
+                    max(1, int(round(source_height * scale))),
+                ),
+                Image.Resampling.LANCZOS,
+            )
+        return image.copy()
+    finally:
+        try:
+            image.close()
+        except Exception:
+            pass
+
+
+def _class_analysis_qwen_review_save_evidence(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    kind: str,
+    title: str,
+    image: Image.Image,
+    summary: str,
+    metadata: Optional[Dict[str, Any]] = None,
+) -> Tuple[Dict[str, Any], Path]:
+    evidence_id = _class_analysis_safe_slug(f"{kind}_{len(job.evidence) + 1}", "evidence")
+    review_dir = _class_analysis_qwen_review_dir(job, create=True)
+    evidence_dir = review_dir / "evidence"
+    evidence_dir.mkdir(parents=True, exist_ok=True)
+    path = evidence_dir / f"{evidence_id}.jpg"
+    if _storage_path_has_symlink_component(evidence_dir) or _storage_path_has_symlink_component(path):
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="qwen_review_evidence_path_invalid")
+    root = review_dir.resolve(strict=False)
+    resolved = path.resolve(strict=False)
+    if not _path_is_within_root_impl(resolved, root):
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="qwen_review_evidence_path_invalid")
+    rgb = image.convert("RGB")
+    _write_temp_binary_no_follow(
+        path,
+        lambda handle: rgb.save(handle, format="JPEG", quality=90),
+    )
+    public = {
+        "evidence_id": evidence_id,
+        "kind": str(kind or ""),
+        "title": str(title or ""),
+        "summary": str(summary or ""),
+        "filename": path.name,
+        "artifact_url": f"/class_analysis/qwen_review/{job.review_id}/evidence/{evidence_id}",
+        "metadata": metadata or {},
+    }
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        if not any(str(item.get("evidence_id") or "") == evidence_id for item in job.evidence):
+            job.evidence.append(public)
+            job.updated_at = time.time()
+    _class_analysis_qwen_review_append_event(
+        job,
+        {"type": "evidence", "evidence": public},
+    )
+    return public, path
+
+
+def _class_analysis_qwen_review_draw_bbox(
+    draw: ImageDraw.ImageDraw,
+    bbox: Sequence[Any],
+    scale: float,
+    *,
+    outline: Tuple[int, int, int],
+    width: int = 3,
+    label: str = "",
+) -> None:
+    try:
+        x1, y1, x2, y2 = [float(v) * float(scale) for v in bbox[:4]]
+    except Exception:
+        return
+    draw.rectangle([x1, y1, x2, y2], outline=outline, width=max(1, int(width)))
+    if label:
+        label_text = str(label or "")[:64]
+        draw.rectangle([x1, max(0, y1 - 16), x1 + min(420, 8 * len(label_text) + 8), y1], fill=(0, 0, 0))
+        draw.text((x1 + 4, max(0, y1 - 14)), label_text, fill=outline)
+
+
+def _class_analysis_qwen_review_source_overlay(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> Image.Image:
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    with Image.open(image_path) as loaded:
+        image = loaded.convert("RGB")
+    try:
+        source_width, source_height = image.size
+        max_side = max(source_width, source_height)
+        scale = min(1.0, 1400.0 / max(1.0, float(max_side)))
+        if scale < 1.0:
+            resized = image.resize(
+                (max(1, int(round(source_width * scale))), max(1, int(round(source_height * scale)))),
+                Image.Resampling.LANCZOS,
+            )
+        else:
+            resized = image.copy()
+        draw = ImageDraw.Draw(resized)
+        split = _annotation_normalise_split(point.get("split"))
+        rel = str(point.get("image_relpath") or "")
+        current_class = str(point.get("class_name") or "")
+        suggested_class = str(point.get("suggested_neighbor_class") or "")
+        target_id = str(point.get("point_id") or "")
+        overlap_ids = _class_analysis_qwen_review_material_overlap_ids(result, point) | {
+            str(match.get("point_id") or "")
+            for match in (point.get("close_overlap_matches") or [])
+            if isinstance(match, dict)
+        }
+        same_image_points = [
+            candidate
+            for candidate in (result.get("points") or [])
+            if isinstance(candidate, dict)
+            and _annotation_normalise_split(candidate.get("split")) == split
+            and str(candidate.get("image_relpath") or "") == rel
+        ]
+        for candidate in same_image_points[:500]:
+            candidate_id = str(candidate.get("point_id") or "")
+            if candidate_id == target_id:
+                continue
+            class_name = str(candidate.get("class_name") or "")
+            if candidate_id in overlap_ids:
+                color = (239, 68, 68)
+            elif suggested_class and class_name == suggested_class:
+                color = (236, 72, 153)
+            elif class_name == current_class:
+                color = (59, 130, 246)
+            else:
+                color = (120, 120, 120)
+            _class_analysis_qwen_review_draw_bbox(
+                draw,
+                candidate.get("bbox_xyxy") or [],
+                scale,
+                outline=color,
+                width=2,
+                label=class_name,
+            )
+        _class_analysis_qwen_review_draw_bbox(
+            draw,
+            point.get("bbox_xyxy") or [],
+            scale,
+            outline=(249, 115, 22),
+            width=5,
+            label=f"TARGET {current_class}",
+        )
+        return resized
+    finally:
+        try:
+            image.close()
+        except Exception:
+            pass
+
+
+def _class_analysis_qwen_review_contact_sheet(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    points: Sequence[Dict[str, Any]],
+    *,
+    title: str,
+    draw_bboxes: bool = True,
+) -> Image.Image:
+    cell_w = 330
+    cell_h = 390
+    cols = 3
+    rows = max(1, int(math.ceil(max(1, len(points)) / cols)))
+    sheet = Image.new("RGB", (cell_w * cols, cell_h * rows + 42), (8, 20, 10))
+    draw = ImageDraw.Draw(sheet)
+    draw.text((12, 12), str(title or "")[:180], fill=(142, 255, 102))
+    if not points:
+        draw.text((20, 70), "No evidence points available.", fill=(142, 255, 102))
+        return sheet
+    for idx, candidate in enumerate(points[: cols * rows]):
+        x = (idx % cols) * cell_w
+        y = 42 + (idx // cols) * cell_h
+        try:
+            crop = _class_analysis_qwen_review_context_image(
+                job,
+                result,
+                candidate,
+                max_dim=300,
+                min_long_side=210,
+                upscale_resample=Image.Resampling.NEAREST,
+                draw_bbox=draw_bboxes,
+            )
+            paste_x = x + max(0, (cell_w - crop.width) // 2)
+            sheet.paste(crop, (paste_x, y + 8))
+        except Exception:
+            draw.rectangle([x + 8, y + 8, x + cell_w - 8, y + 308], outline=(70, 120, 70), width=2)
+            draw.text((x + 18, y + 140), "crop unavailable", fill=(142, 255, 102))
+        text_y = y + 314
+        class_name = str(candidate.get("class_name") or "")
+        suggested = str(candidate.get("suggested_neighbor_class") or "")
+        dist = ""
+        try:
+            dist_value = float(candidate.get("_neighbor_distance"))
+            if math.isfinite(dist_value):
+                dist = f" dist {dist_value:.3f}"
+        except Exception:
+            dist = ""
+        lines = [
+            f"{class_name}{' -> ' + suggested if suggested else ''}{dist}",
+            str(candidate.get("image_relpath") or "")[-56:],
+        ]
+        for line in lines:
+            draw.text((x + 10, text_y), line[:72], fill=(142, 255, 102))
+            text_y += 18
+    return sheet
+
+
+def _class_analysis_qwen_review_selected_neighbors(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    limit: int = 9,
+    classes: Optional[Set[str]] = None,
+) -> List[Dict[str, Any]]:
+    points_by_id = _class_analysis_qwen_points_by_id(result)
+    distances = point.get("neighbor_distances") if isinstance(point.get("neighbor_distances"), list) else []
+    selected: List[Dict[str, Any]] = []
+    for index, neighbor_id in enumerate(point.get("neighbor_ids") or []):
+        neighbor = points_by_id.get(str(neighbor_id or ""))
+        if not isinstance(neighbor, dict):
+            continue
+        if classes and str(neighbor.get("class_name") or "") not in classes:
+            continue
+        item = dict(neighbor)
+        try:
+            item["_neighbor_distance"] = float(distances[index])
+        except Exception:
+            pass
+        selected.append(item)
+        if len(selected) >= limit:
+            break
+    return selected
+
+
+def _class_analysis_qwen_review_bbox_overlap_stats(
+    target: Dict[str, Any],
+    other: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    geometry = _class_analysis_bbox_overlap_geometry(
+        target.get("bbox_xyxy") or [],
+        other.get("bbox_xyxy") or [],
+    )
+    if geometry is None:
+        return None
+    return {
+        "point_id": str(other.get("point_id") or ""),
+        "class_name": str(other.get("class_name") or ""),
+        "iou": float(geometry.get("iou") or 0.0),
+        "target_area_covered": float(geometry.get("target_area_covered") or 0.0),
+        "other_area_covered": float(geometry.get("other_area_covered") or 0.0),
+        "relation": str(geometry.get("relation") or "none"),
+    }
+
+
+def _class_analysis_qwen_review_same_image_points(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> List[Dict[str, Any]]:
+    split = _annotation_normalise_split(point.get("split"))
+    rel = str(point.get("image_relpath") or "")
+    return [
+        candidate
+        for candidate in (result.get("points") or [])
+        if isinstance(candidate, dict)
+        and _annotation_normalise_split(candidate.get("split")) == split
+        and str(candidate.get("image_relpath") or "") == rel
+    ]
+
+
+def _class_analysis_qwen_review_point_bbox(candidate: Dict[str, Any]) -> Optional[List[float]]:
+    try:
+        values = [float(v) for v in (candidate.get("bbox_xyxy") or [])[:4]]
+    except Exception:
+        return None
+    if len(values) < 4 or values[2] <= values[0] or values[3] <= values[1]:
+        return None
+    return values
+
+
+def _class_analysis_qwen_review_bbox_center(bbox: Sequence[float]) -> Tuple[float, float]:
+    return ((float(bbox[0]) + float(bbox[2])) / 2.0, (float(bbox[1]) + float(bbox[3])) / 2.0)
+
+
+def _class_analysis_qwen_review_crop_with_padding(
+    source: Image.Image,
+    crop_box: Sequence[float],
+) -> Image.Image:
+    source_width, source_height = source.size
+    left, top, right, bottom = [float(v) for v in crop_box[:4]]
+    crop_width = max(1, int(round(right - left)))
+    crop_height = max(1, int(round(bottom - top)))
+    output = Image.new("RGB", (crop_width, crop_height), (0, 0, 0))
+    src_left = max(0, int(math.floor(left)))
+    src_top = max(0, int(math.floor(top)))
+    src_right = min(source_width, int(math.ceil(right)))
+    src_bottom = min(source_height, int(math.ceil(bottom)))
+    if src_right > src_left and src_bottom > src_top:
+        output.paste(
+            source.crop((src_left, src_top, src_right, src_bottom)),
+            (int(round(src_left - left)), int(round(src_top - top))),
+        )
+    return output
+
+
+def _class_analysis_qwen_review_local_consensus_context(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> Tuple[Image.Image, Image.Image, Dict[str, Any]]:
+    target_bbox = _class_analysis_qwen_review_bbox(point)
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    target_id = str(point.get("point_id") or "")
+    target_center = _class_analysis_qwen_review_bbox_center(target_bbox)
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    with Image.open(image_path) as loaded:
+        source = loaded.convert("RGB")
+    try:
+        source_width, source_height = source.size
+        target_width = max(1.0, target_bbox[2] - target_bbox[0])
+        target_height = max(1.0, target_bbox[3] - target_bbox[1])
+        base_pad = max(160.0, min(420.0, max(target_width, target_height) * 1.25))
+        left = target_bbox[0] - base_pad
+        top = target_bbox[1] - base_pad
+        right = target_bbox[2] + base_pad
+        bottom = target_bbox[3] + base_pad
+        min_side = 360.0
+        if (right - left) < min_side:
+            expand = (min_side - (right - left)) / 2.0
+            left -= expand
+            right += expand
+        if (bottom - top) < min_side:
+            expand = (min_side - (bottom - top)) / 2.0
+            top -= expand
+            bottom += expand
+        max_context_side = 1100.0
+        classes = {name for name in (current_class, suggested_class) if name}
+        consensus_points: List[Dict[str, Any]] = []
+        for candidate in _class_analysis_qwen_review_same_image_points(result, point):
+            candidate_id = str(candidate.get("point_id") or "")
+            if not candidate_id or candidate_id == target_id:
+                continue
+            class_name = str(candidate.get("class_name") or "").strip()
+            if class_name not in classes:
+                continue
+            bbox = _class_analysis_qwen_review_point_bbox(candidate)
+            if bbox is None:
+                continue
+            center = _class_analysis_qwen_review_bbox_center(bbox)
+            distance = math.hypot(center[0] - target_center[0], center[1] - target_center[1])
+            consensus_points.append(
+                {
+                    "point_id": candidate_id,
+                    "class_name": class_name,
+                    "bbox": bbox,
+                    "center": center,
+                    "distance_px": float(distance),
+                }
+            )
+        consensus_points.sort(key=lambda item: float(item.get("distance_px") or 0.0))
+        per_class_counts = Counter(str(item.get("class_name") or "") for item in consensus_points)
+        nearest_by_class: Dict[str, float] = {}
+        for item in consensus_points:
+            class_name = str(item.get("class_name") or "")
+            if class_name and class_name not in nearest_by_class:
+                nearest_by_class[class_name] = float(item.get("distance_px") or 0.0)
+        for item in consensus_points:
+            bbox = item.get("bbox") if isinstance(item.get("bbox"), list) else []
+            if len(bbox) < 4:
+                continue
+            proposed = [
+                min(left, float(bbox[0]) - 12.0),
+                min(top, float(bbox[1]) - 12.0),
+                max(right, float(bbox[2]) + 12.0),
+                max(bottom, float(bbox[3]) + 12.0),
+            ]
+            if proposed[2] - proposed[0] <= max_context_side and proposed[3] - proposed[1] <= max_context_side:
+                left, top, right, bottom = proposed
+        crop_box = [left, top, right, bottom]
+        clean = _class_analysis_qwen_review_crop_with_padding(source, crop_box)
+        drawn_points: List[Dict[str, Any]] = []
+        for item in consensus_points:
+            center = item.get("center")
+            if not isinstance(center, tuple) or len(center) < 2:
+                continue
+            cx, cy = float(center[0]), float(center[1])
+            if left <= cx <= right and top <= cy <= bottom:
+                drawn_points.append(item)
+        drawn_points = drawn_points[:80]
+        dots = clean.copy()
+        draw = ImageDraw.Draw(dots)
+        color_current = (59, 130, 246)
+        color_suggested = (236, 72, 153)
+        color_target = (249, 115, 22)
+        radius = max(5, min(11, int(round(min(dots.width, dots.height) * 0.012))))
+
+        def _draw_dot(x: float, y: float, fill: Tuple[int, int, int], *, target: bool = False) -> None:
+            px = float(x) - left
+            py = float(y) - top
+            if target:
+                ring = radius + 5
+                draw.ellipse([px - ring, py - ring, px + ring, py + ring], outline=fill, width=max(2, radius // 2))
+                draw.line([px - ring, py, px + ring, py], fill=fill, width=max(2, radius // 3))
+                draw.line([px, py - ring, px, py + ring], fill=fill, width=max(2, radius // 3))
+            else:
+                draw.ellipse([px - radius - 2, py - radius - 2, px + radius + 2, py + radius + 2], outline=(0, 0, 0), width=2)
+                draw.ellipse([px - radius, py - radius, px + radius, py + radius], fill=fill)
+
+        for item in drawn_points:
+            center = item["center"]
+            class_name = str(item.get("class_name") or "")
+            color = color_suggested if suggested_class and class_name == suggested_class else color_current
+            _draw_dot(float(center[0]), float(center[1]), color)
+        _draw_dot(target_center[0], target_center[1], color_target, target=True)
+        header_h = 58
+        dot_panel = Image.new("RGB", (dots.width, dots.height + header_h), (8, 20, 10))
+        header = ImageDraw.Draw(dot_panel)
+        header.text((12, 10), "Local label consensus dots. Dots show annotation centers, not object boxes.", fill=(142, 255, 102))
+        legend_y = 36
+        legend_x = 14
+        for label, color in (
+            ("target", color_target),
+            (f"current {current_class or '?'}", color_current),
+            (f"suggested {suggested_class or '(none)'}", color_suggested),
+        ):
+            header.ellipse([legend_x, legend_y - 5, legend_x + 10, legend_y + 5], fill=color)
+            header.text((legend_x + 16, legend_y - 8), label[:42], fill=(210, 255, 190))
+            legend_x += 165
+        dot_panel.paste(dots, (0, header_h))
+        clean.thumbnail((1100, 1100), Image.Resampling.LANCZOS)
+        dot_panel.thumbnail((1100, 1160), Image.Resampling.LANCZOS)
+        drawn_counts = Counter(str(item.get("class_name") or "") for item in drawn_points)
+        metadata = {
+            "point_id": target_id,
+            "current_class": current_class,
+            "suggested_class": suggested_class,
+            "image_relpath": point.get("image_relpath"),
+            "crop_bounds_xyxy": [float(v) for v in crop_box],
+            "target_center_xy": [float(target_center[0]), float(target_center[1])],
+            "same_image_current_count": int(per_class_counts.get(current_class, 0)),
+            "same_image_suggested_count": int(per_class_counts.get(suggested_class, 0)) if suggested_class else 0,
+            "included_current_count": int(drawn_counts.get(current_class, 0)),
+            "included_suggested_count": int(drawn_counts.get(suggested_class, 0)) if suggested_class else 0,
+            "nearest_current_distance_px": nearest_by_class.get(current_class),
+            "nearest_suggested_distance_px": nearest_by_class.get(suggested_class) if suggested_class else None,
+            "local_consensus_available": bool(consensus_points),
+            "included_points": [
+                {
+                    "point_id": item.get("point_id"),
+                    "class_name": item.get("class_name"),
+                    "distance_px": float(item.get("distance_px") or 0.0),
+                }
+                for item in drawn_points[:80]
+            ],
+            "dot_map_policy": (
+                "The clean panel is visual evidence. The dot map is local annotation-consensus "
+                "evidence only and must not override visible target pixels."
+            ),
+        }
+        return clean, dot_panel, json_sanitize(metadata)
+    finally:
+        try:
+            source.close()
+        except Exception:
+            pass
+
+
+def _class_analysis_qwen_review_overlap_decomposition(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    include_non_material: bool = False,
+) -> List[Dict[str, Any]]:
+    target_id = str(point.get("point_id") or "")
+    overlaps: List[Dict[str, Any]] = []
+    for candidate in _class_analysis_qwen_review_same_image_points(result, point):
+        candidate_id = str(candidate.get("point_id") or "")
+        if not candidate_id or candidate_id == target_id:
+            continue
+        stats = _class_analysis_qwen_review_bbox_overlap_stats(point, candidate)
+        if not stats:
+            continue
+        if not include_non_material and stats.get("relation") == "none":
+            continue
+        stats["image_relpath"] = candidate.get("image_relpath") or ""
+        stats["split"] = candidate.get("split") or "train"
+        overlaps.append(stats)
+    return sorted(
+        overlaps,
+        key=lambda item: (
+            float(item.get("target_area_covered") or 0.0),
+            float(item.get("other_area_covered") or 0.0),
+            float(item.get("iou") or 0.0),
+        ),
+        reverse=True,
+    )
+
+
+def _class_analysis_qwen_review_material_overlap_ids(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> Set[str]:
+    return {
+        str(item.get("point_id") or "")
+        for item in _class_analysis_qwen_review_overlap_decomposition(result, point)
+        if str(item.get("point_id") or "")
+    }
+
+
+def _class_analysis_qwen_review_anchor_score(
+    candidate: Dict[str, Any],
+    *,
+    exclude_suspicious: bool = True,
+) -> float:
+    if exclude_suspicious and bool(candidate.get("is_wrong_class_candidate")):
+        return -999.0
+    same_ratio = float(candidate.get("same_class_neighbor_ratio") or 0.0)
+    other_ratio = float(candidate.get("top_other_neighbor_ratio") or 0.0)
+    outlier = float(candidate.get("outlier_score") or 0.0)
+    try:
+        x1, y1, x2, y2 = [float(v) for v in (candidate.get("bbox_xyxy") or [])[:4]]
+        min_dim = max(0.0, min(x2 - x1, y2 - y1))
+        area = max(0.0, (x2 - x1) * (y2 - y1))
+    except Exception:
+        min_dim = 0.0
+        area = 0.0
+    size_score = min(1.0, min_dim / 60.0) + min(1.0, area / 4000.0) * 0.35
+    overlap_penalty = 0.35 if bool(candidate.get("is_close_overlap_candidate")) else 0.0
+    return (same_ratio * 1.8) + ((1.0 - other_ratio) * 0.75) + ((1.0 - outlier) * 0.45) + size_score - overlap_penalty
+
+
+def _class_analysis_qwen_review_select_anchors(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    class_name: str,
+    *,
+    same_image: bool,
+    limit: int = 4,
+) -> List[Dict[str, Any]]:
+    class_name = str(class_name or "").strip()
+    if not class_name:
+        return []
+    target_id = str(point.get("point_id") or "")
+    target_split = _annotation_normalise_split(point.get("split"))
+    target_rel = str(point.get("image_relpath") or "")
+    candidates: List[Tuple[float, Dict[str, Any]]] = []
+    for candidate in result.get("points") or []:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("point_id") or "") == target_id:
+            continue
+        if str(candidate.get("class_name") or "") != class_name:
+            continue
+        is_same_image = (
+            _annotation_normalise_split(candidate.get("split")) == target_split
+            and str(candidate.get("image_relpath") or "") == target_rel
+        )
+        if same_image != is_same_image:
+            continue
+        score = _class_analysis_qwen_review_anchor_score(candidate)
+        if score <= -100:
+            continue
+        item = dict(candidate)
+        item["_anchor_score"] = float(score)
+        candidates.append((score, item))
+    candidates.sort(key=lambda pair: pair[0], reverse=True)
+    return [item for _score, item in candidates[: max(0, int(limit or 0))]]
+
+
+def _class_analysis_qwen_review_bbox_measurements(point: Dict[str, Any]) -> Optional[Dict[str, float]]:
+    bbox = _class_analysis_qwen_review_point_bbox(point)
+    if bbox is None:
+        return None
+    width = max(0.0, float(bbox[2]) - float(bbox[0]))
+    height = max(0.0, float(bbox[3]) - float(bbox[1]))
+    if width <= 0.0 or height <= 0.0:
+        return None
+    center = _class_analysis_qwen_review_bbox_center(bbox)
+    return {
+        "width_px": width,
+        "height_px": height,
+        "area_px2": width * height,
+        "long_side_px": max(width, height),
+        "short_side_px": min(width, height),
+        "aspect_ratio": max(width, height) / max(1.0, min(width, height)),
+        "center_x": float(center[0]),
+        "center_y": float(center[1]),
+    }
+
+
+def _class_analysis_qwen_review_quantiles(values: Sequence[float]) -> Dict[str, float]:
+    clean = sorted(float(value) for value in values if math.isfinite(float(value)))
+    if not clean:
+        return {"min": 0.0, "q25": 0.0, "median": 0.0, "q75": 0.0, "max": 0.0}
+    arr = np.asarray(clean, dtype=np.float64)
+    return {
+        "min": float(np.min(arr)),
+        "q25": float(np.percentile(arr, 25)),
+        "median": float(np.percentile(arr, 50)),
+        "q75": float(np.percentile(arr, 75)),
+        "max": float(np.max(arr)),
+    }
+
+
+def _class_analysis_qwen_review_ratio(value: float, reference: float) -> Optional[float]:
+    try:
+        numerator = float(value)
+        denominator = float(reference)
+    except Exception:
+        return None
+    if not math.isfinite(numerator) or not math.isfinite(denominator) or denominator <= 0.0:
+        return None
+    return float(numerator / denominator)
+
+
+def _class_analysis_qwen_review_same_image_scale_report(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    limit: int = 24,
+) -> Dict[str, Any]:
+    current_class = str(point.get("class_name") or "").strip()
+    target_metrics = _class_analysis_qwen_review_bbox_measurements(point)
+    anchors = _class_analysis_qwen_review_select_anchors(
+        result,
+        point,
+        current_class,
+        same_image=True,
+        limit=limit,
+    )
+    anchor_metrics = [
+        {
+            "point_id": str(anchor.get("point_id") or ""),
+            "anchor_score": float(anchor.get("_anchor_score") or 0.0),
+            **(metrics or {}),
+        }
+        for anchor in anchors
+        for metrics in [_class_analysis_qwen_review_bbox_measurements(anchor)]
+        if metrics is not None
+    ]
+    metadata: Dict[str, Any] = {
+        "point_id": point.get("point_id"),
+        "current_class": current_class,
+        "image_relpath": point.get("image_relpath"),
+        "same_image_anchor_count": len(anchor_metrics),
+        "target": target_metrics or {},
+        "anchors": anchor_metrics[:limit],
+        "policy": (
+            "Scale evidence is deterministic geometry context only. It can ask whether "
+            "the current label is plausible under source-image perspective, but it cannot "
+            "override clean target pixels or glossary guidance."
+        ),
+    }
+    if target_metrics is None:
+        metadata.update({"signal": "insufficient", "reason": "target bbox measurements unavailable"})
+        return json_sanitize(metadata)
+    if len(anchor_metrics) < 2:
+        metadata.update(
+            {
+                "signal": "insufficient",
+                "reason": "fewer than two trusted same-image current-class anchors",
+            }
+        )
+        return json_sanitize(metadata)
+
+    summaries = {
+        key: _class_analysis_qwen_review_quantiles([float(row[key]) for row in anchor_metrics])
+        for key in ("area_px2", "long_side_px", "short_side_px", "aspect_ratio")
+    }
+    ratios = {
+        key: _class_analysis_qwen_review_ratio(float(target_metrics[key]), float(summaries[key]["median"]))
+        for key in ("area_px2", "long_side_px", "short_side_px", "aspect_ratio")
+    }
+    target_center = (float(target_metrics["center_x"]), float(target_metrics["center_y"]))
+    anchor_distances = [
+        math.hypot(float(row["center_x"]) - target_center[0], float(row["center_y"]) - target_center[1])
+        for row in anchor_metrics
+    ]
+    distance_summary = _class_analysis_qwen_review_quantiles(anchor_distances)
+    area_ratio = ratios.get("area_px2")
+    long_ratio = ratios.get("long_side_px")
+    short_ratio = ratios.get("short_side_px")
+    aspect_ratio = ratios.get("aspect_ratio")
+    strong_scale_outlier = bool(
+        (area_ratio is not None and (area_ratio >= 4.0 or area_ratio <= 0.25))
+        or (long_ratio is not None and (long_ratio >= 2.5 or long_ratio <= 0.40))
+        or (short_ratio is not None and (short_ratio >= 2.5 or short_ratio <= 0.40))
+        or (aspect_ratio is not None and (aspect_ratio >= 2.75 or aspect_ratio <= 0.36))
+    )
+    close_scale_match = bool(
+        area_ratio is not None
+        and long_ratio is not None
+        and short_ratio is not None
+        and 0.50 <= area_ratio <= 2.00
+        and 0.65 <= long_ratio <= 1.65
+        and 0.65 <= short_ratio <= 1.65
+        and (aspect_ratio is None or aspect_ratio <= 1.80)
+    )
+    if strong_scale_outlier:
+        signal = "questions_current"
+        reason = "candidate scale is a strong outlier relative to trusted same-image current-class anchors"
+    elif close_scale_match:
+        signal = "supports_current"
+        reason = "candidate scale is close to trusted same-image current-class anchors"
+    else:
+        signal = "neutral"
+        reason = "candidate scale is neither a clear match nor a strong outlier"
+    metadata.update(
+        {
+            "signal": signal,
+            "reason": reason,
+            "anchor_summaries": summaries,
+            "target_to_anchor_median_ratios": ratios,
+            "target_center_to_anchor_center_distance_px": distance_summary,
+        }
+    )
+    return json_sanitize(metadata)
+
+
+def _class_analysis_qwen_review_load_embedding_cache(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+) -> Tuple[Optional[np.ndarray], Dict[str, int], Dict[str, Any]]:
+    parent_dir = _class_analysis_job_dir(
+        job.parent_job_id,
+        create=False,
+        detail="qwen_review_parent_not_found",
+    )
+    path = parent_dir / "embeddings.npz"
+    if not path.is_file():
+        return None, {}, {"available": False, "reason": "embeddings.npz not found"}
+    try:
+        stat = path.stat()
+    except Exception as exc:
+        return None, {}, {"available": False, "reason": f"embedding stat failed: {exc}"}
+    points = [point for point in (result.get("points") or []) if isinstance(point, dict)]
+    cache_key = f"{job.parent_job_id}:{stat.st_mtime_ns}:{stat.st_size}:{len(points)}"
+    with CLASS_ANALYSIS_QWEN_REVIEW_EMBEDDING_CACHE_LOCK:
+        cached = CLASS_ANALYSIS_QWEN_REVIEW_EMBEDDING_CACHE.get(cache_key)
+        if isinstance(cached, dict):
+            matrix = cached.get("matrix")
+            id_to_index = cached.get("id_to_index")
+            if isinstance(matrix, np.ndarray) and isinstance(id_to_index, dict):
+                return matrix, dict(id_to_index), {"available": True, "cache_hit": True, "path": str(path)}
+        try:
+            with np.load(path, allow_pickle=False) as loaded:
+                matrix = loaded["embeddings"]
+        except Exception as exc:
+            return None, {}, {"available": False, "reason": f"embedding load failed: {exc}", "path": str(path)}
+        if matrix.ndim != 2 or matrix.shape[0] != len(points):
+            return (
+                None,
+                {},
+                {
+                    "available": False,
+                    "reason": f"embedding row count {getattr(matrix, 'shape', ['?'])[0]} does not match {len(points)} points",
+                    "path": str(path),
+                },
+            )
+        id_to_index = {
+            str(point.get("point_id") or ""): idx
+            for idx, point in enumerate(points)
+            if str(point.get("point_id") or "").strip()
+        }
+        CLASS_ANALYSIS_QWEN_REVIEW_EMBEDDING_CACHE.clear()
+        CLASS_ANALYSIS_QWEN_REVIEW_EMBEDDING_CACHE[cache_key] = {
+            "matrix": matrix,
+            "id_to_index": id_to_index,
+            "path": str(path),
+        }
+        return matrix, dict(id_to_index), {"available": True, "cache_hit": False, "path": str(path)}
+
+
+def _class_analysis_qwen_review_cosine_distances(
+    target_vector: np.ndarray,
+    reference_vectors: np.ndarray,
+) -> np.ndarray:
+    target = np.asarray(target_vector, dtype=np.float32).reshape(1, -1)
+    refs = np.asarray(reference_vectors, dtype=np.float32)
+    target_norm = np.linalg.norm(target, axis=1, keepdims=True)
+    ref_norm = np.linalg.norm(refs, axis=1, keepdims=True)
+    target = target / np.maximum(target_norm, 1e-8)
+    refs = refs / np.maximum(ref_norm, 1e-8)
+    similarities = np.clip(refs @ target.reshape(-1), -1.0, 1.0)
+    return (1.0 - similarities).astype(np.float32)
+
+
+def _class_analysis_qwen_review_same_image_embedding_report(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    limit: int = 24,
+) -> Dict[str, Any]:
+    current_class = str(point.get("class_name") or "").strip()
+    anchors = _class_analysis_qwen_review_select_anchors(
+        result,
+        point,
+        current_class,
+        same_image=True,
+        limit=limit,
+    )
+    metadata: Dict[str, Any] = {
+        "point_id": point.get("point_id"),
+        "current_class": current_class,
+        "image_relpath": point.get("image_relpath"),
+        "same_image_anchor_count": len(anchors),
+        "policy": (
+            "Embedding evidence is deterministic analysis-space context only. It can "
+            "show whether the candidate is near trusted same-image current-class anchors, "
+            "but it cannot override clean target pixels, overlap decomposition, or the glossary."
+        ),
+    }
+    if len(anchors) < 2:
+        metadata.update(
+            {
+                "signal": "insufficient",
+                "reason": "fewer than two trusted same-image current-class anchors",
+            }
+        )
+        return json_sanitize(metadata)
+    matrix, id_to_index, load_meta = _class_analysis_qwen_review_load_embedding_cache(job, result)
+    metadata["embedding_source"] = load_meta
+    if matrix is None:
+        metadata.update(
+            {
+                "signal": "insufficient",
+                "reason": str(load_meta.get("reason") or "analysis embeddings unavailable"),
+            }
+        )
+        return json_sanitize(metadata)
+    target_id = str(point.get("point_id") or "")
+    target_idx = id_to_index.get(target_id)
+    anchor_rows: List[Tuple[Dict[str, Any], int]] = []
+    for anchor in anchors:
+        anchor_idx = id_to_index.get(str(anchor.get("point_id") or ""))
+        if anchor_idx is None:
+            continue
+        anchor_rows.append((anchor, int(anchor_idx)))
+    if target_idx is None or len(anchor_rows) < 2:
+        metadata.update(
+            {
+                "signal": "insufficient",
+                "same_image_anchor_count": len(anchor_rows),
+                "reason": "target or trusted same-image anchors have no embedding row",
+            }
+        )
+        return json_sanitize(metadata)
+    metadata["same_image_anchor_count"] = len(anchor_rows)
+    target_vector = matrix[int(target_idx)]
+    ref_indices = [idx for _anchor, idx in anchor_rows]
+    ref_vectors = matrix[ref_indices]
+    target_distances = _class_analysis_qwen_review_cosine_distances(target_vector, ref_vectors)
+    pair_distances: List[float] = []
+    if len(ref_vectors) >= 2:
+        normalized = np.asarray(ref_vectors, dtype=np.float32)
+        normalized = normalized / np.maximum(np.linalg.norm(normalized, axis=1, keepdims=True), 1e-8)
+        sim = np.clip(normalized @ normalized.T, -1.0, 1.0)
+        dist = 1.0 - sim
+        rows, cols = np.triu_indices(dist.shape[0], k=1)
+        pair_distances = [float(value) for value in dist[rows, cols] if math.isfinite(float(value))]
+    target_summary = _class_analysis_qwen_review_quantiles([float(value) for value in target_distances])
+    reference_summary = _class_analysis_qwen_review_quantiles(pair_distances)
+    median_target = float(target_summary["median"])
+    nearest_target = float(target_summary["min"])
+    ref_q75 = float(reference_summary["q75"])
+    ref_median = float(reference_summary["median"])
+    percentile = 100.0
+    if pair_distances:
+        percentile = 100.0 * sum(1 for value in pair_distances if value <= median_target) / max(1, len(pair_distances))
+    if not pair_distances:
+        signal = "insufficient"
+        reason = "trusted same-image anchors could not form a reference distance distribution"
+    elif percentile >= 90.0 and nearest_target > max(ref_q75, ref_median + 0.03):
+        signal = "questions_current"
+        reason = "candidate embedding is a high-distance outlier relative to trusted same-image current-class anchors"
+    elif median_target <= ref_q75 or percentile <= 60.0:
+        signal = "supports_current"
+        reason = "candidate embedding lies within the trusted same-image current-class anchor distance range"
+    else:
+        signal = "neutral"
+        reason = "candidate embedding is not close enough to strongly support current class and not far enough to be a clear outlier"
+    metadata.update(
+        {
+            "signal": signal,
+            "reason": reason,
+            "target_to_current_anchor_cosine_distance": target_summary,
+            "current_anchor_pairwise_cosine_distance": reference_summary,
+            "target_median_distance_percentile_vs_anchor_pairs": percentile,
+            "anchors": [
+                {
+                    "point_id": str(anchor.get("point_id") or ""),
+                    "anchor_score": float(anchor.get("_anchor_score") or 0.0),
+                    "target_cosine_distance": float(target_distances[idx]),
+                }
+                for idx, (anchor, _row_idx) in enumerate(anchor_rows[: len(target_distances)])
+            ],
+        }
+    )
+    return json_sanitize(metadata)
+
+
+def _class_analysis_qwen_review_text_report_image(title: str, lines: Sequence[str]) -> Image.Image:
+    width = 1200
+    line_h = 22
+    margin = 18
+    wrapped: List[str] = []
+    for raw_line in lines:
+        line = str(raw_line or "")
+        if not line:
+            wrapped.append("")
+            continue
+        while len(line) > 112:
+            split_at = max(line.rfind(" ", 0, 112), 72)
+            wrapped.append(line[:split_at].rstrip())
+            line = line[split_at:].lstrip()
+        wrapped.append(line)
+    height = max(260, margin * 2 + 38 + line_h * max(1, len(wrapped)))
+    image = Image.new("RGB", (width, height), (8, 20, 10))
+    draw = ImageDraw.Draw(image)
+    draw.rectangle([0, 0, width - 1, height - 1], outline=(70, 160, 70), width=2)
+    draw.text((margin, margin), str(title or "")[:160], fill=(142, 255, 102))
+    y = margin + 38
+    for line in wrapped:
+        draw.text((margin, y), line, fill=(210, 255, 190))
+        y += line_h
+    return image
+
+
+def _class_analysis_qwen_review_class_context_sections(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> List[Tuple[str, List[Dict[str, Any]]]]:
+    current_class = str(point.get("class_name") or "")
+    suggested_class = str(point.get("suggested_neighbor_class") or "")
+    sections: List[Tuple[str, List[Dict[str, Any]]]] = [
+        ("Target object", [point]),
+        (
+            f"Same-image trusted current-class anchors: {current_class or '?'}",
+            _class_analysis_qwen_review_select_anchors(result, point, current_class, same_image=True, limit=3),
+        ),
+        (
+            f"Global trusted current-class anchors: {current_class or '?'}",
+            _class_analysis_qwen_review_select_anchors(result, point, current_class, same_image=False, limit=4),
+        ),
+    ]
+    if suggested_class:
+        sections.extend(
+            [
+                (
+                    f"Same-image trusted suggested-class anchors: {suggested_class}",
+                    _class_analysis_qwen_review_select_anchors(result, point, suggested_class, same_image=True, limit=3),
+                ),
+                (
+                    f"Global trusted suggested-class anchors: {suggested_class}",
+                    _class_analysis_qwen_review_select_anchors(result, point, suggested_class, same_image=False, limit=4),
+                ),
+            ]
+        )
+    neighbor_counts = point.get("neighbor_class_counts") if isinstance(point.get("neighbor_class_counts"), dict) else {}
+    third_classes = [
+        str(cls)
+        for cls, _count in sorted(neighbor_counts.items(), key=lambda item: int(item[1] or 0), reverse=True)
+        if str(cls) not in {current_class, suggested_class}
+    ][:2]
+    for third_class in third_classes:
+        sections.append(
+            (
+                f"Third-class suspect anchors: {third_class}",
+                _class_analysis_qwen_review_select_anchors(result, point, third_class, same_image=False, limit=3),
+            )
+        )
+    return sections
+
+
+def _class_analysis_qwen_review_sectioned_contact_sheet(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    sections: Sequence[Tuple[str, Sequence[Dict[str, Any]]]],
+    *,
+    title: str,
+    draw_bboxes: bool = False,
+) -> Image.Image:
+    cell_w = 300
+    cell_h = 355
+    cols = 4
+    title_h = 42
+    section_h = 28
+    rows_total = 0
+    normalized_sections: List[Tuple[str, List[Dict[str, Any]]]] = []
+    target_point_id = ""
+    for section_title, points in sections:
+        rows = list(points or [])
+        if not target_point_id and rows:
+            target_point_id = str(rows[0].get("point_id") or "")
+        normalized_sections.append((str(section_title or ""), rows))
+        rows_total += max(1, int(math.ceil(max(1, len(rows)) / cols)))
+    sheet_h = title_h + rows_total * cell_h + len(normalized_sections) * section_h
+    sheet = Image.new("RGB", (cell_w * cols, max(420, sheet_h)), (8, 20, 10))
+    draw = ImageDraw.Draw(sheet)
+    draw.text((12, 12), str(title or "")[:180], fill=(142, 255, 102))
+    y = title_h
+    for section_title, points in normalized_sections:
+        draw.rectangle([0, y, sheet.width, y + section_h], fill=(13, 40, 18))
+        draw.text((12, y + 7), section_title[:160], fill=(142, 255, 102))
+        y += section_h
+        if not points:
+            draw.rectangle([8, y + 8, cell_w - 8, y + 308], outline=(70, 120, 70), width=2)
+            draw.text((18, y + 140), "No trusted anchors available.", fill=(142, 255, 102))
+            y += cell_h
+            continue
+        rows = int(math.ceil(len(points) / cols))
+        for idx, candidate in enumerate(points[: rows * cols]):
+            x = (idx % cols) * cell_w
+            cy = y + (idx // cols) * cell_h
+            try:
+                crop = _class_analysis_qwen_review_context_image(
+                    job,
+                    result,
+                    candidate,
+                    max_dim=270,
+                    min_long_side=190,
+                    upscale_resample=Image.Resampling.NEAREST,
+                    draw_bbox=draw_bboxes,
+                )
+                sheet.paste(crop, (x + max(0, (cell_w - crop.width) // 2), cy + 8))
+            except Exception:
+                draw.rectangle([x + 8, cy + 8, x + cell_w - 8, cy + 288], outline=(70, 120, 70), width=2)
+                draw.text((x + 18, cy + 135), "crop unavailable", fill=(142, 255, 102))
+            text_y = cy + 292
+            class_name = str(candidate.get("class_name") or "")
+            score = candidate.get("_anchor_score")
+            score_text = f" anchor {float(score):.2f}" if isinstance(score, (int, float)) else ""
+            ratios = ""
+            if str(candidate.get("point_id") or "") != target_point_id:
+                ratios = (
+                    f" same {float(candidate.get('same_class_neighbor_ratio') or 0.0):.2f}"
+                    f" other {float(candidate.get('top_other_neighbor_ratio') or 0.0):.2f}"
+                )
+            lines = [
+                f"{class_name}{score_text}{ratios}",
+                str(candidate.get("image_relpath") or "")[-52:],
+            ]
+            for line in lines:
+                draw.text((x + 10, text_y), line[:68], fill=(142, 255, 102))
+                text_y += 18
+        y += rows * cell_h
+    return sheet
+
+
+def _class_analysis_qwen_review_tool_target_context(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    visual_quality = _class_analysis_qwen_review_visual_quality(job, result, point)
+    image = _class_analysis_qwen_review_context_image(
+        job,
+        result,
+        point,
+        max_dim=900,
+        min_long_side=420,
+        upscale_resample=Image.Resampling.NEAREST,
+    )
+    quality_summary = _class_analysis_qwen_review_quality_summary(visual_quality)
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="target_context",
+        title="Target object with 2x context",
+        image=image,
+        summary=(
+            "Orange rectangle marks the candidate object; crop includes up to 50px context on each side. "
+            "Small crops are zoomed with nearest-neighbor pixels so true source resolution remains visible. "
+            f"{quality_summary}"
+        ),
+        metadata={
+            "point_id": point.get("point_id"),
+            "class_name": point.get("class_name"),
+            "visual_quality": visual_quality,
+        },
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": []}
+
+
+def _class_analysis_qwen_review_tool_target_detail(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    visual_quality = _class_analysis_qwen_review_visual_quality(job, result, point)
+    image = _class_analysis_qwen_review_context_image(
+        job,
+        result,
+        point,
+        max_dim=768,
+        min_long_side=560,
+        upscale_resample=Image.Resampling.LANCZOS,
+        draw_bbox=False,
+    )
+    quality_summary = _class_analysis_qwen_review_quality_summary(visual_quality)
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="target_detail",
+        title="Clean target detail crop",
+        image=image,
+        summary=(
+            "Clean target-centered crop with no bbox overlay. The target is centered with the same 2x context window "
+            "as target_context. Small crops are deterministically enlarged with Lanczos interpolation; no generated "
+            f"detail is added. Use this for visible target cues. {quality_summary}"
+        ),
+        metadata={
+            "point_id": point.get("point_id"),
+            "class_name": point.get("class_name"),
+            "visual_quality": visual_quality,
+            "clean_target_detail": True,
+            "deterministic_upscale": True,
+            "bbox_overlay": False,
+        },
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_tool_source_overlay(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    clean_image = _class_analysis_qwen_review_clean_source_image(job, result, point)
+    clean_evidence, clean_path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="source_clean",
+        title="Clean source image",
+        image=clean_image,
+        summary="Clean source image with no bbox overlays. Use this to understand scene layout and wider visual context without annotation graphics.",
+        metadata={"point_id": point.get("point_id"), "image_relpath": point.get("image_relpath")},
+    )
+    overlay_image = _class_analysis_qwen_review_source_overlay(job, result, point)
+    overlay_evidence, overlay_path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="source_overlay",
+        title="Source image overlay",
+        image=overlay_image,
+        summary="Orange is the target, blue is same current class, magenta is suggested class, red is material bbox-overlap evidence.",
+        metadata={"point_id": point.get("point_id"), "image_relpath": point.get("image_relpath")},
+    )
+    return {
+        "summary": (
+            f"{clean_evidence['summary']} Overlay reference saved as evidence but not attached in the first required model turn: "
+            f"{overlay_evidence['summary']}"
+        ),
+        "evidence": [clean_evidence, overlay_evidence],
+        "image_paths": [str(clean_path)],
+    }
+
+
+def _class_analysis_qwen_review_tool_local_consensus_context(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    clean_image, dot_image, metadata = _class_analysis_qwen_review_local_consensus_context(
+        job,
+        result,
+        point,
+    )
+    current_count = int(metadata.get("same_image_current_count") or 0)
+    suggested_count = int(metadata.get("same_image_suggested_count") or 0)
+    included_current = int(metadata.get("included_current_count") or 0)
+    included_suggested = int(metadata.get("included_suggested_count") or 0)
+    current_class = str(metadata.get("current_class") or "")
+    suggested_class = str(metadata.get("suggested_class") or "")
+    gutter = 16
+    label_h = 34
+    panel_w = max(clean_image.width, dot_image.width)
+    clean_panel_h = clean_image.height + label_h
+    dot_panel_h = dot_image.height + label_h
+    composite = Image.new(
+        "RGB",
+        (panel_w * 2 + gutter, max(clean_panel_h, dot_panel_h)),
+        (8, 20, 10),
+    )
+    draw = ImageDraw.Draw(composite)
+    draw.text((10, 10), "Clean local crop: visual evidence, no dots or boxes", fill=(142, 255, 102))
+    draw.text((panel_w + gutter + 10, 10), "Dot map: local annotation consensus only", fill=(142, 255, 102))
+    composite.paste(clean_image, ((panel_w - clean_image.width) // 2, label_h))
+    composite.paste(dot_image, (panel_w + gutter + (panel_w - dot_image.width) // 2, label_h))
+    composite.thumbnail((1200, 900), Image.Resampling.LANCZOS)
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="local_consensus_context",
+        title="Local consensus context",
+        image=composite,
+        summary=(
+            "Side-by-side local context. Left panel is a clean source crop for visual object evidence. "
+            "Right panel is the same context with annotation-center dots: orange crosshair is the target center; "
+            f"blue dots are current class {current_class or '?'}; magenta dots are suggested class {suggested_class or '(none)'}. "
+            "Dots mark annotation centers, not boxes. Treat this as local dataset-consensus evidence only, never as ground truth."
+        ),
+        metadata=metadata,
+    )
+    summary = (
+        f"Local consensus context: same image has {current_count} current-class and "
+        f"{suggested_count} suggested-class non-target boxes; the local crop draws "
+        f"{included_current} current and {included_suggested} suggested centers. "
+        "Use the clean panel for visual recognition and the dot map only to understand local label consensus. "
+        "A local consensus can support or question a class hypothesis, but it cannot override unclear target pixels."
+    )
+    return {
+        "summary": summary,
+        "evidence": [evidence],
+        "image_paths": [str(path)],
+    }
+
+
+def _class_analysis_qwen_review_tool_neighbors(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    limit = max(3, min(18, _coerce_int(args.get("limit"), 9)))
+    neighbors = _class_analysis_qwen_review_selected_neighbors(result, point, limit=limit)
+    image = _class_analysis_qwen_review_contact_sheet(
+        job,
+        result,
+        neighbors,
+        title=f"Nearest embedding neighbors for {point.get('class_name')}",
+        draw_bboxes=False,
+    )
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="neighbors",
+        title="Nearest embedding neighbors",
+        image=image,
+        summary=(
+            f"Clean crop contact sheet of {len(neighbors)} nearest embedding neighbors sorted by cosine distance. "
+            "Crops do not draw bbox overlays; labels and distances are outside the crop pixels."
+        ),
+        metadata={"neighbor_count": len(neighbors), "bbox_overlays": False},
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": []}
+
+
+def _class_analysis_qwen_review_tool_compare_classes(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    current_class = str(point.get("class_name") or "")
+    suggested_class = str(args.get("target_class") or point.get("suggested_neighbor_class") or "").strip()
+    classes = {name for name in (current_class, suggested_class) if name}
+    neighbors = _class_analysis_qwen_review_selected_neighbors(result, point, limit=15, classes=classes)
+    if len(neighbors) < 6:
+        for candidate in result.get("points") or []:
+            if not isinstance(candidate, dict):
+                continue
+            if str(candidate.get("point_id") or "") == str(point.get("point_id") or ""):
+                continue
+            if classes and str(candidate.get("class_name") or "") not in classes:
+                continue
+            if any(str(row.get("point_id") or "") == str(candidate.get("point_id") or "") for row in neighbors):
+                continue
+            neighbors.append(candidate)
+            if len(neighbors) >= 15:
+                break
+    image = _class_analysis_qwen_review_contact_sheet(
+        job,
+        result,
+        neighbors,
+        title=f"Class comparison: current {current_class or '?'} vs candidate {suggested_class or '?'}",
+        draw_bboxes=False,
+    )
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="class_comparison",
+        title="Current and candidate class comparison",
+        image=image,
+        summary=(
+            "Clean nearest examples and sampled class examples for deciding whether the suggested class is visually plausible. "
+            "Crops do not draw bbox overlays; labels are outside the crop pixels."
+        ),
+        metadata={
+            "current_class": current_class,
+            "candidate_class": suggested_class,
+            "example_count": len(neighbors),
+            "bbox_overlays": False,
+        },
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_tool_class_context_pack(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    current_class = str(point.get("class_name") or "")
+    suggested_class = str(point.get("suggested_neighbor_class") or "")
+    sections = _class_analysis_qwen_review_class_context_sections(result, point)
+    image = _class_analysis_qwen_review_sectioned_contact_sheet(
+        job,
+        result,
+        sections,
+        title=f"Class context pack: current {current_class or '?'} vs suggested {suggested_class or '?'}",
+        draw_bboxes=False,
+    )
+    section_counts = {title: len(points or []) for title, points in sections}
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="class_context_pack",
+        title="Trusted class context pack",
+        image=image,
+        summary=(
+            "Structured target, local same-image anchors, global class anchors, and third-class suspect anchors. "
+            "Trusted anchors are statistical reference examples selected from class-neighborhood purity, crop geometry, "
+            "outlier score, and overlap risk; they are not ground-truth certification. "
+            "Context-pack crops are clean and do not draw bbox overlays; labels and scores sit outside crop pixels."
+        ),
+        metadata={
+            "current_class": current_class,
+            "candidate_class": suggested_class,
+            "section_counts": section_counts,
+            "bbox_overlays": False,
+        },
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_relative_rect(
+    bbox: Sequence[float],
+    *,
+    crop_left: float,
+    crop_top: float,
+    width: int,
+    height: int,
+) -> Optional[Tuple[int, int, int, int]]:
+    try:
+        left, top, right, bottom = [float(v) for v in bbox[:4]]
+    except Exception:
+        return None
+    rect = (
+        max(0, min(width, int(round(left - crop_left)))),
+        max(0, min(height, int(round(top - crop_top)))),
+        max(0, min(width, int(round(right - crop_left)))),
+        max(0, min(height, int(round(bottom - crop_top)))),
+    )
+    if rect[2] <= rect[0] or rect[3] <= rect[1]:
+        return None
+    return rect
+
+
+def _class_analysis_qwen_review_specificity_region_contrast_image(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+) -> Tuple[Image.Image, Dict[str, Any]]:
+    """Render SDDF-shaped visual evidence without adding class-specific rules.
+
+    The panels are deterministic transformations of source pixels. They give
+    Qwen the region-contrast structure SDDF uses conceptually: clean context,
+    target-only pixels, context with the target removed, and the strongest
+    material-overlap region when one exists.
+    """
+
+    bbox = _class_analysis_qwen_review_bbox(point)
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    overlaps = _class_analysis_qwen_review_overlap_decomposition(result, point)
+    points_by_id = _class_analysis_qwen_points_by_id(result)
+    top_overlap = overlaps[0] if overlaps else None
+    top_overlap_point = (
+        points_by_id.get(str(top_overlap.get("point_id") or ""))
+        if isinstance(top_overlap, dict)
+        else None
+    )
+    with Image.open(image_path) as loaded:
+        source = loaded.convert("RGB")
+    try:
+        source_width, source_height = source.size
+        left, top, right, bottom = bbox
+        target_width = max(1.0, right - left)
+        target_height = max(1.0, bottom - top)
+        extra = max(96.0, min(420.0, max(target_width, target_height) * 1.4))
+        crop_left = left - extra
+        crop_top = top - extra
+        crop_right = right + extra
+        crop_bottom = bottom + extra
+        min_side = 420.0
+        if crop_right - crop_left < min_side:
+            expand = (min_side - (crop_right - crop_left)) / 2.0
+            crop_left -= expand
+            crop_right += expand
+        if crop_bottom - crop_top < min_side:
+            expand = (min_side - (crop_bottom - crop_top)) / 2.0
+            crop_top -= expand
+            crop_bottom += expand
+        crop_box = [crop_left, crop_top, crop_right, crop_bottom]
+        clean_context = _class_analysis_qwen_review_crop_with_padding(source, crop_box)
+        width, height = clean_context.size
+        target_rect = _class_analysis_qwen_review_relative_rect(
+            bbox,
+            crop_left=crop_left,
+            crop_top=crop_top,
+            width=width,
+            height=height,
+        )
+
+        target_only = Image.new("RGB", clean_context.size, (0, 0, 0))
+        context_without_target = clean_context.copy()
+        if target_rect is not None:
+            target_only.paste(clean_context.crop(target_rect), target_rect)
+            ImageDraw.Draw(context_without_target).rectangle(target_rect, fill=(0, 0, 0))
+
+        overlap_only = Image.new("RGB", clean_context.size, (0, 0, 0))
+        overlap_rect: Optional[Tuple[int, int, int, int]] = None
+        if isinstance(top_overlap_point, dict):
+            overlap_bbox = _class_analysis_qwen_review_point_bbox(top_overlap_point)
+            if overlap_bbox is not None:
+                overlap_rect = _class_analysis_qwen_review_relative_rect(
+                    overlap_bbox,
+                    crop_left=crop_left,
+                    crop_top=crop_top,
+                    width=width,
+                    height=height,
+                )
+                if overlap_rect is not None:
+                    overlap_only.paste(clean_context.crop(overlap_rect), overlap_rect)
+
+        panels: List[Tuple[str, Image.Image]] = [
+            ("A clean context", clean_context),
+            ("B target pixels only", target_only),
+            ("C context with target removed", context_without_target),
+            ("D strongest overlap region only" if overlap_rect else "D no material overlap region", overlap_only),
+        ]
+        panel_w = 430
+        panel_h = 430
+        label_h = 36
+        gutter = 14
+        composite = Image.new("RGB", (panel_w * 2 + gutter, (panel_h + label_h) * 2 + gutter), (8, 20, 10))
+        draw = ImageDraw.Draw(composite)
+
+        def _fit_panel(image: Image.Image) -> Image.Image:
+            fitted = image.copy()
+            fitted.thumbnail((panel_w, panel_h), Image.Resampling.LANCZOS)
+            canvas = Image.new("RGB", (panel_w, panel_h), (0, 0, 0))
+            canvas.paste(fitted, ((panel_w - fitted.width) // 2, (panel_h - fitted.height) // 2))
+            return canvas
+
+        for idx, (label, image) in enumerate(panels):
+            col = idx % 2
+            row = idx // 2
+            x = col * (panel_w + gutter)
+            y = row * (panel_h + label_h + gutter)
+            draw.rectangle([x, y, x + panel_w, y + label_h], fill=(13, 40, 18))
+            draw.text((x + 10, y + 10), label[:70], fill=(142, 255, 102))
+            composite.paste(_fit_panel(image), (x, y + label_h))
+        composite.thumbnail((1180, 1180), Image.Resampling.LANCZOS)
+        metadata = {
+            "point_id": point.get("point_id"),
+            "current_class": point.get("class_name"),
+            "suggested_neighbor_class": point.get("suggested_neighbor_class") or "",
+            "image_relpath": point.get("image_relpath"),
+            "crop_bounds_xyxy": [float(v) for v in crop_box],
+            "target_bbox_xyxy": [float(v) for v in bbox],
+            "target_rect_within_crop_xyxy": list(target_rect) if target_rect else [],
+            "top_overlap": copy.deepcopy(top_overlap) if isinstance(top_overlap, dict) else None,
+            "top_overlap_rect_within_crop_xyxy": list(overlap_rect) if overlap_rect else [],
+            "panel_policy": (
+                "Panel A is clean context; panel B isolates the reviewed target bbox pixels; "
+                "panel C removes the reviewed target so background/context support can be checked; "
+                "panel D isolates the strongest material-overlap bbox when present. Labels are panel names only."
+            ),
+            "bbox_overlay": False,
+            "deterministic_region_masks": True,
+        }
+        return composite, json_sanitize(metadata)
+    finally:
+        try:
+            source.close()
+        except Exception:
+            pass
+
+
+def _class_analysis_qwen_review_tool_specificity_region_contrast(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    image, metadata = _class_analysis_qwen_review_specificity_region_contrast_image(job, result, point)
+    overlap = metadata.get("top_overlap") if isinstance(metadata.get("top_overlap"), dict) else None
+    overlap_summary = (
+        (
+            f"Strongest material overlap: {overlap.get('class_name') or '?'} "
+            f"target_cover={float(overlap.get('target_area_covered') or 0.0):.2f} "
+            f"other_cover={float(overlap.get('other_area_covered') or 0.0):.2f} "
+            f"IoU={float(overlap.get('iou') or 0.0):.2f}."
+        )
+        if overlap
+        else "No material overlap region was available."
+    )
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="specificity_region_contrast",
+        title="Target/background region contrast",
+        image=image,
+        summary=(
+            "SDDF-style region contrast: A clean context, B target pixels only, "
+            "C context with the target removed, D strongest material-overlap region only when present. "
+            "Use it to test whether class sub-descriptions are supported by target pixels or by background/overlap/context. "
+            f"{overlap_summary}"
+        ),
+        metadata=metadata,
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_tool_same_image_scale_report(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    report = _class_analysis_qwen_review_same_image_scale_report(result, point)
+    signal = str(report.get("signal") or "insufficient")
+    reason = str(report.get("reason") or "")
+    ratios = report.get("target_to_anchor_median_ratios") if isinstance(report.get("target_to_anchor_median_ratios"), dict) else {}
+    target = report.get("target") if isinstance(report.get("target"), dict) else {}
+    anchor_count = int(report.get("same_image_anchor_count") or 0)
+    ratio_bits = []
+    for label, key in (
+        ("area", "area_px2"),
+        ("long-side", "long_side_px"),
+        ("short-side", "short_side_px"),
+        ("aspect", "aspect_ratio"),
+    ):
+        value = ratios.get(key)
+        if isinstance(value, (int, float)) and math.isfinite(float(value)):
+            ratio_bits.append(f"{label} ratio {float(value):.2f}")
+    summary = (
+        f"Same-image scale report signal={signal}; anchors={anchor_count}; "
+        f"target bbox {float(target.get('width_px') or 0.0):.0f}x{float(target.get('height_px') or 0.0):.0f}px. "
+        f"{'; '.join(ratio_bits) if ratio_bits else 'No robust ratio available'}. {reason}. "
+        "Use this as perspective/scale plausibility context only, not as direct class evidence."
+    )
+    image = _class_analysis_qwen_review_text_report_image(
+        "Same-image scale report",
+        [
+            summary,
+            "Evidence policy: deterministic geometry context; clean pixels and glossary remain decisive.",
+            f"Current class: {report.get('current_class') or '?'}",
+            f"Image: {report.get('image_relpath') or '?'}",
+            f"Reference anchors: {anchor_count}",
+            f"Signal: {signal}",
+            f"Reason: {reason or '(none)'}",
+            f"Ratios to anchor median: {json.dumps(ratios, sort_keys=True)}",
+        ],
+    )
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="same_image_scale_report",
+        title="Same-image scale report",
+        image=image,
+        summary=summary,
+        metadata=report,
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_tool_same_image_embedding_report(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    report = _class_analysis_qwen_review_same_image_embedding_report(job, result, point)
+    signal = str(report.get("signal") or "insufficient")
+    reason = str(report.get("reason") or "")
+    anchor_count = int(report.get("same_image_anchor_count") or 0)
+    target_dist = report.get("target_to_current_anchor_cosine_distance") if isinstance(report.get("target_to_current_anchor_cosine_distance"), dict) else {}
+    ref_dist = report.get("current_anchor_pairwise_cosine_distance") if isinstance(report.get("current_anchor_pairwise_cosine_distance"), dict) else {}
+    percentile = report.get("target_median_distance_percentile_vs_anchor_pairs")
+    percentile_text = f"{float(percentile):.0f}" if isinstance(percentile, (int, float)) and math.isfinite(float(percentile)) else "n/a"
+    summary = (
+        f"Same-image embedding report signal={signal}; anchors={anchor_count}; "
+        f"target-to-current-anchor cosine distance median {float(target_dist.get('median') or 0.0):.3f}, "
+        f"nearest {float(target_dist.get('min') or 0.0):.3f}; anchor-pair median {float(ref_dist.get('median') or 0.0):.3f}; "
+        f"target median percentile vs anchor pairs {percentile_text}. {reason}. "
+        "Use this as analysis-space consistency context only, not as direct class evidence."
+    )
+    image = _class_analysis_qwen_review_text_report_image(
+        "Same-image embedding report",
+        [
+            summary,
+            "Evidence policy: deterministic embedding context; clean pixels, overlap, and glossary remain decisive.",
+            f"Current class: {report.get('current_class') or '?'}",
+            f"Image: {report.get('image_relpath') or '?'}",
+            f"Reference anchors: {anchor_count}",
+            f"Signal: {signal}",
+            f"Reason: {reason or '(none)'}",
+            f"Target distances: {json.dumps(target_dist, sort_keys=True)}",
+            f"Reference pair distances: {json.dumps(ref_dist, sort_keys=True)}",
+        ],
+    )
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="same_image_embedding_report",
+        title="Same-image embedding report",
+        image=image,
+        summary=summary,
+        metadata=report,
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_concept_cache_dir(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    create: bool = False,
+) -> Path:
+    parent_dir = _class_analysis_job_dir(
+        job.parent_job_id,
+        create=False,
+        detail="qwen_review_parent_not_found",
+    )
+    candidate = parent_dir / "qwen_reviews" / "class_concept_briefs"
+    try:
+        if _storage_path_has_symlink_component(candidate):
+            raise ValueError("concept brief cache has a symlink component")
+        if create:
+            candidate.mkdir(parents=True, exist_ok=True)
+        if candidate.exists() and not candidate.is_dir():
+            raise ValueError("concept brief cache path is not a directory")
+        resolved = candidate.resolve(strict=False)
+        if not _path_is_within_root_impl(resolved, parent_dir.resolve(strict=False)):
+            raise ValueError("concept brief cache escapes parent job")
+        return resolved
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="qwen_review_concept_cache_invalid") from exc
+
+
+def _class_analysis_qwen_review_pair_contrast_cache_dir(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    create: bool = False,
+) -> Path:
+    parent_dir = _class_analysis_job_dir(
+        job.parent_job_id,
+        create=False,
+        detail="qwen_review_parent_not_found",
+    )
+    candidate = parent_dir / "qwen_reviews" / "class_pair_contrast_briefs"
+    try:
+        if _storage_path_has_symlink_component(candidate):
+            raise ValueError("pair contrast cache has a symlink component")
+        if create:
+            candidate.mkdir(parents=True, exist_ok=True)
+        if candidate.exists() and not candidate.is_dir():
+            raise ValueError("pair contrast cache path is not a directory")
+        resolved = candidate.resolve(strict=False)
+        if not _path_is_within_root_impl(resolved, parent_dir.resolve(strict=False)):
+            raise ValueError("pair contrast cache escapes parent job")
+        return resolved
+    except HTTPException:
+        raise
+    except Exception as exc:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="qwen_review_pair_contrast_cache_invalid") from exc
+
+
+def _class_analysis_qwen_review_relevant_classes_for_concepts(
+    point: Dict[str, Any],
+    *,
+    limit: Optional[int] = None,
+) -> List[str]:
+    max_classes = max(1, min(CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_MAX_CLASSES, int(limit or CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_MAX_CLASSES)))
+    ordered: List[str] = []
+
+    def _add(value: Any) -> None:
+        name = str(value or "").strip()
+        if name and name not in ordered and len(ordered) < max_classes:
+            ordered.append(name)
+
+    _add(point.get("class_name"))
+    _add(point.get("suggested_neighbor_class"))
+    neighbor_counts = point.get("neighbor_class_counts") if isinstance(point.get("neighbor_class_counts"), dict) else {}
+    for class_name, _count in sorted(
+        neighbor_counts.items(),
+        key=lambda item: float(item[1] or 0.0) if isinstance(item[1], (int, float)) else 0.0,
+        reverse=True,
+    ):
+        _add(class_name)
+        if len(ordered) >= max_classes:
+            break
+    return ordered
+
+
+def _class_analysis_qwen_review_glossary_entry_for_class(labelmap_glossary: str, class_name: str) -> str:
+    class_name = str(class_name or "").strip()
+    if not class_name:
+        return ""
+    try:
+        decoded = json.loads(_normalize_labelmap_glossary(labelmap_glossary) or "{}")
+    except Exception:
+        decoded = {}
+    if isinstance(decoded, dict) and class_name in decoded:
+        value = decoded.get(class_name)
+        if isinstance(value, (list, tuple)):
+            return "; ".join(str(item) for item in value if str(item or "").strip())[:1200]
+        if isinstance(value, dict):
+            try:
+                return json.dumps(value, ensure_ascii=False, sort_keys=True)[:1200]
+            except Exception:
+                return str(value)[:1200]
+        return str(value or "").strip()[:1200]
+    return ""
+
+
+def _class_analysis_qwen_review_projection_xy(candidate: Dict[str, Any]) -> Optional[Tuple[float, float]]:
+    raw = candidate.get("projection")
+    if isinstance(raw, (list, tuple)) and len(raw) >= 2:
+        try:
+            x = float(raw[0])
+            y = float(raw[1])
+            if math.isfinite(x) and math.isfinite(y):
+                return (x, y)
+        except Exception:
+            return None
+    return None
+
+
+def _class_analysis_qwen_review_select_class_concept_examples(
+    result: Dict[str, Any],
+    class_name: str,
+    *,
+    limit: int = 8,
+) -> List[Dict[str, Any]]:
+    class_name = str(class_name or "").strip()
+    if not class_name:
+        return []
+    scored: List[Tuple[float, Dict[str, Any]]] = []
+    for candidate in result.get("points") or []:
+        if not isinstance(candidate, dict):
+            continue
+        if str(candidate.get("class_name") or "") != class_name:
+            continue
+        score = _class_analysis_qwen_review_anchor_score(candidate)
+        if score <= -100:
+            continue
+        item = dict(candidate)
+        item["_anchor_score"] = float(score)
+        scored.append((score, item))
+    scored.sort(key=lambda pair: pair[0], reverse=True)
+    target_count = max(1, int(limit))
+    if len(scored) <= target_count:
+        return [item for _score, item in scored[:target_count]]
+
+    top_score = float(scored[0][0])
+    trusted_pool = [
+        (score, item)
+        for score, item in scored
+        if score >= (top_score - 0.65)
+        or float(item.get("same_class_neighbor_ratio") or 0.0) >= 0.90
+    ]
+    if len(trusted_pool) < target_count:
+        trusted_pool = scored[: max(target_count, min(len(scored), target_count * 8))]
+    else:
+        trusted_pool = trusted_pool[: max(target_count, min(len(trusted_pool), target_count * 25))]
+
+    coords = [_class_analysis_qwen_review_projection_xy(item) for _score, item in trusted_pool]
+    finite_coords = [coord for coord in coords if coord is not None]
+    if len(finite_coords) < 2:
+        selected: List[Dict[str, Any]] = []
+        used_images: Set[str] = set()
+        for _score, candidate in trusted_pool:
+            image_key = f"{_annotation_normalise_split(candidate.get('split'))}:{candidate.get('image_relpath') or ''}"
+            if image_key in used_images and len(selected) < max(2, target_count // 2):
+                continue
+            selected.append(candidate)
+            used_images.add(image_key)
+            if len(selected) >= target_count:
+                return selected
+        for _score, candidate in trusted_pool:
+            point_id = str(candidate.get("point_id") or "")
+            if any(str(row.get("point_id") or "") == point_id for row in selected):
+                continue
+            selected.append(candidate)
+            if len(selected) >= target_count:
+                break
+        return selected
+
+    min_x = min(coord[0] for coord in finite_coords)
+    max_x = max(coord[0] for coord in finite_coords)
+    min_y = min(coord[1] for coord in finite_coords)
+    max_y = max(coord[1] for coord in finite_coords)
+    coord_scale = max(1e-6, math.hypot(max_x - min_x, max_y - min_y))
+
+    def _image_key(candidate: Dict[str, Any]) -> str:
+        return f"{_annotation_normalise_split(candidate.get('split'))}:{candidate.get('image_relpath') or ''}"
+
+    def _distance_to_selected(candidate: Dict[str, Any], selected_rows: Sequence[Dict[str, Any]]) -> float:
+        coord = _class_analysis_qwen_review_projection_xy(candidate)
+        if coord is None or not selected_rows:
+            return 0.0
+        distances: List[float] = []
+        for row in selected_rows:
+            other = _class_analysis_qwen_review_projection_xy(row)
+            if other is None:
+                continue
+            distances.append(math.hypot(coord[0] - other[0], coord[1] - other[1]) / coord_scale)
+        return min(distances) if distances else 0.0
+
+    selected = [dict(trusted_pool[0][1])]
+    used_images = {_image_key(selected[0])}
+    while len(selected) < target_count:
+        best_idx: Optional[int] = None
+        best_value = -1e9
+        for idx, (score, candidate) in enumerate(trusted_pool):
+            point_id = str(candidate.get("point_id") or "")
+            if any(str(row.get("point_id") or "") == point_id for row in selected):
+                continue
+            score_norm = 0.0 if top_score <= 0 else max(0.0, min(1.0, float(score) / max(top_score, 1e-6)))
+            diversity = max(0.0, min(1.0, _distance_to_selected(candidate, selected)))
+            new_image_bonus = 0.15 if _image_key(candidate) not in used_images else 0.0
+            value = (0.48 * score_norm) + (0.42 * diversity) + new_image_bonus
+            if value > best_value:
+                best_value = value
+                best_idx = idx
+        if best_idx is None:
+            break
+        chosen = dict(trusted_pool[best_idx][1])
+        selected.append(chosen)
+        used_images.add(_image_key(chosen))
+    if len(selected) >= target_count:
+        return selected[:target_count]
+
+    for _score, candidate in trusted_pool:
+        image_key = f"{_annotation_normalise_split(candidate.get('split'))}:{candidate.get('image_relpath') or ''}"
+        point_id = str(candidate.get("point_id") or "")
+        if any(str(row.get("point_id") or "") == point_id for row in selected):
+            continue
+        if image_key in used_images and len(selected) < max(2, int(limit) // 2):
+            continue
+        selected.append(candidate)
+        used_images.add(image_key)
+        if len(selected) >= target_count:
+            return selected
+    for _score, candidate in trusted_pool:
+        point_id = str(candidate.get("point_id") or "")
+        if any(str(row.get("point_id") or "") == point_id for row in selected):
+            continue
+        selected.append(candidate)
+        if len(selected) >= target_count:
+            break
+    return selected
+
+
+def _class_analysis_qwen_review_concept_brief_cache_key(
+    *,
+    model_id: Optional[str],
+    class_name: str,
+    glossary_entry: str,
+    review_guidance: str,
+    examples: Sequence[Dict[str, Any]],
+) -> str:
+    payload = {
+        "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+        "model_id": str(model_id or (active_qwen_metadata or {}).get("model_id") or active_qwen_model_id or "default"),
+        "class_name": str(class_name or ""),
+        "glossary_entry": str(glossary_entry or ""),
+        "review_guidance": str(review_guidance or "")[:3000],
+        "example_point_ids": [str(item.get("point_id") or "") for item in examples],
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+
+
+def _class_analysis_qwen_review_pair_contrast_cache_key(
+    *,
+    model_id: Optional[str],
+    class_a: str,
+    class_b: str,
+    glossary_a: str,
+    glossary_b: str,
+    review_guidance: str,
+    examples_a: Sequence[Dict[str, Any]],
+    examples_b: Sequence[Dict[str, Any]],
+) -> str:
+    payload = {
+        "version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+        "model_id": str(model_id or (active_qwen_metadata or {}).get("model_id") or active_qwen_model_id or "default"),
+        "class_a": str(class_a or ""),
+        "class_b": str(class_b or ""),
+        "glossary_a": str(glossary_a or ""),
+        "glossary_b": str(glossary_b or ""),
+        "review_guidance": str(review_guidance or "")[:3000],
+        "example_point_ids_a": [str(item.get("point_id") or "") for item in examples_a],
+        "example_point_ids_b": [str(item.get("point_id") or "") for item in examples_b],
+    }
+    return hashlib.sha256(json.dumps(payload, ensure_ascii=False, sort_keys=True).encode("utf-8")).hexdigest()[:24]
+
+
+def _class_analysis_qwen_review_concept_brief_fallback(
+    *,
+    class_name: str,
+    glossary_entry: str,
+    review_guidance: str,
+    examples: Sequence[Dict[str, Any]],
+    reason: str,
+) -> Dict[str, Any]:
+    return {
+        "class_name": str(class_name or ""),
+        "summary": (
+            f"Use the dataset glossary and {len(examples)} trusted exemplar crops as advisory context. "
+            "Fresh target pixels remain decisive."
+        ),
+        "visual_traits": [],
+        "valid_variations": [],
+        "exclude_when": ["target pixels do not visibly match this class"],
+        "common_confusions": [],
+        "uncertainty_triggers": ["small, blurry, clipped, overlapping, or context-only evidence"],
+        "glossary_entry": str(glossary_entry or "")[:1200],
+        "review_guidance_excerpt": str(review_guidance or "")[:1200],
+        "generated_by_model": False,
+        "fallback_reason": str(reason or "concept brief generation fallback")[:300],
+    }
+
+
+def _class_analysis_qwen_review_pair_contrast_fallback(
+    *,
+    class_a: str,
+    class_b: str,
+    glossary_a: str,
+    glossary_b: str,
+    review_guidance: str,
+    examples_a: Sequence[Dict[str, Any]],
+    examples_b: Sequence[Dict[str, Any]],
+    reason: str,
+) -> Dict[str, Any]:
+    return {
+        "class_a": str(class_a or ""),
+        "class_b": str(class_b or ""),
+        "summary": (
+            f"Compare visible target pixels against trusted {class_a} and {class_b} exemplars. "
+            "Use this pair brief only as advisory distinction memory."
+        ),
+        "choose_class_a_when": [],
+        "choose_class_b_when": [],
+        "shared_or_ambiguous_cues": ["both classes can share context or overlap artifacts"],
+        "hard_negative_cues": ["do not switch classes from overlapping-object pixels alone"],
+        "must_skip_when": ["target is small, clipped, blurry, or the pair distinction is not visible"],
+        "glossary_a": str(glossary_a or "")[:1200],
+        "glossary_b": str(glossary_b or "")[:1200],
+        "review_guidance_excerpt": str(review_guidance or "")[:1200],
+        "generated_by_model": False,
+        "fallback_reason": str(reason or "pair contrast generation fallback")[:300],
+        "example_count_a": len(examples_a),
+        "example_count_b": len(examples_b),
+    }
+
+
+def _class_analysis_qwen_review_concept_list(value: Any, *, limit: int = 5) -> List[str]:
+    if isinstance(value, str):
+        raw_items = re.split(r"[\n;]+", value)
+    elif isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    else:
+        raw_items = []
+    items: List[str] = []
+    for raw in raw_items:
+        text = re.sub(r"\s+", " ", str(raw or "")).strip()
+        if not text:
+            continue
+        items.append(text[:180])
+        if len(items) >= limit:
+            break
+    return items
+
+
+def _class_analysis_qwen_review_pair_list(value: Any, *, limit: int = 4) -> List[str]:
+    return _class_analysis_qwen_review_concept_list(value, limit=limit)
+
+
+def _class_analysis_qwen_review_pair_must_skip_list(
+    value: Any,
+    *,
+    class_a: str,
+    class_b: str,
+    limit: int = 4,
+) -> List[str]:
+    items = _class_analysis_qwen_review_pair_list(value, limit=limit + 2)
+    ambiguous_terms = (
+        "ambiguous",
+        "unclear",
+        "obscured",
+        "occluded",
+        "partial",
+        "overlap",
+        "contaminated",
+        "clipped",
+        "hidden",
+        "low resolution",
+        "blur",
+        "shadow",
+    )
+    filtered: List[str] = []
+    for item in items:
+        lower = item.lower()
+        names_visible = any(name and name.lower() in lower for name in (class_a, class_b))
+        obvious_word = "clearly" in lower or "obvious" in lower
+        looks_like_obvious_class = obvious_word and (
+            names_visible
+            or lower.startswith("object is clearly")
+            or lower.startswith("target is clearly")
+            or lower.startswith("clearly ")
+            or lower.startswith("obvious ")
+        )
+        if looks_like_obvious_class and not any(term in lower for term in ambiguous_terms):
+            continue
+        filtered.append(item)
+        if len(filtered) >= limit:
+            break
+    return filtered
+
+
+def _class_analysis_qwen_review_normalize_concept_brief(
+    payload: Dict[str, Any],
+    *,
+    class_name: str,
+    glossary_entry: str,
+    review_guidance: str,
+    examples: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    args = dict(payload or {})
+    if isinstance(args.get("arguments"), dict):
+        args = dict(args.get("arguments") or {})
+    if isinstance(args.get("class_concept_brief"), dict):
+        args = dict(args.get("class_concept_brief") or {})
+    summary = re.sub(r"\s+", " ", str(args.get("summary") or args.get("concept_summary") or "")).strip()
+    if not summary:
+        summary = f"Advisory visual memory for {class_name} built from trusted examples; verify against fresh target pixels."
+    return {
+        "class_name": str(args.get("class_name") or class_name),
+        "summary": summary[:360],
+        "visual_traits": _class_analysis_qwen_review_concept_list(args.get("visual_traits") or args.get("traits")),
+        "valid_variations": _class_analysis_qwen_review_concept_list(args.get("valid_variations") or args.get("variations")),
+        "exclude_when": _class_analysis_qwen_review_concept_list(args.get("exclude_when") or args.get("exclusion_cues") or args.get("not_class")),
+        "common_confusions": _class_analysis_qwen_review_concept_list(args.get("common_confusions") or args.get("confusions")),
+        "uncertainty_triggers": _class_analysis_qwen_review_concept_list(args.get("uncertainty_triggers") or args.get("uncertain_when")),
+        "glossary_entry": str(glossary_entry or "")[:1200],
+        "review_guidance_excerpt": str(review_guidance or "")[:1200],
+        "generated_by_model": True,
+        "fallback_reason": "",
+        "example_count": len(examples),
+    }
+
+
+def _class_analysis_qwen_review_normalize_pair_contrast(
+    payload: Dict[str, Any],
+    *,
+    class_a: str,
+    class_b: str,
+    glossary_a: str,
+    glossary_b: str,
+    review_guidance: str,
+    examples_a: Sequence[Dict[str, Any]],
+    examples_b: Sequence[Dict[str, Any]],
+) -> Dict[str, Any]:
+    args = dict(payload or {})
+    if isinstance(args.get("arguments"), dict):
+        args = dict(args.get("arguments") or {})
+    if isinstance(args.get("class_pair_contrast_brief"), dict):
+        args = dict(args.get("class_pair_contrast_brief") or {})
+    summary = re.sub(r"\s+", " ", str(args.get("summary") or args.get("contrast_summary") or "")).strip()
+    if not summary:
+        summary = f"Advisory distinction memory for {class_a} versus {class_b}; verify against fresh target pixels."
+    return {
+        "class_a": str(args.get("class_a") or class_a),
+        "class_b": str(args.get("class_b") or class_b),
+        "summary": summary[:420],
+        "choose_class_a_when": _class_analysis_qwen_review_pair_list(args.get("choose_class_a_when") or args.get("class_a_cues")),
+        "choose_class_b_when": _class_analysis_qwen_review_pair_list(args.get("choose_class_b_when") or args.get("class_b_cues")),
+        "shared_or_ambiguous_cues": _class_analysis_qwen_review_pair_list(args.get("shared_or_ambiguous_cues") or args.get("shared_cues")),
+        "hard_negative_cues": _class_analysis_qwen_review_pair_list(args.get("hard_negative_cues") or args.get("do_not_use")),
+        "must_skip_when": _class_analysis_qwen_review_pair_must_skip_list(
+            args.get("must_skip_when") or args.get("uncertainty_triggers"),
+            class_a=class_a,
+            class_b=class_b,
+        ),
+        "glossary_a": str(glossary_a or "")[:1200],
+        "glossary_b": str(glossary_b or "")[:1200],
+        "review_guidance_excerpt": str(review_guidance or "")[:1200],
+        "generated_by_model": True,
+        "fallback_reason": "",
+        "example_count_a": len(examples_a),
+        "example_count_b": len(examples_b),
+    }
+
+
+def _class_analysis_qwen_review_parse_concept_payload(raw_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    text = str(raw_text or "").strip()
+    if not text:
+        return None, "empty_concept_brief"
+    candidates: List[str] = []
+    stripped = re.sub(r"^```(?:json)?\s*", "", text, flags=re.IGNORECASE).strip()
+    stripped = re.sub(r"\s*```$", "", stripped).strip()
+    for candidate in (text, stripped):
+        if candidate and candidate not in candidates:
+            candidates.append(candidate)
+        fence = re.search(r"```(?:json)?\s*(\{.*\})\s*```", candidate, flags=re.IGNORECASE | re.DOTALL)
+        if fence and fence.group(1) not in candidates:
+            candidates.append(fence.group(1))
+        first = candidate.find("{")
+        last = candidate.rfind("}")
+        if first >= 0 and last > first:
+            inner = candidate[first : last + 1]
+            if inner not in candidates:
+                candidates.append(inner)
+    for candidate in candidates:
+        repaired = re.sub(r",\s*([}\]])", r"\1", candidate.strip())
+        for attempt in (candidate.strip(), repaired):
+            try:
+                decoded = json.loads(attempt)
+            except Exception:
+                continue
+            if isinstance(decoded, dict):
+                return decoded, None
+    payload, error = _class_analysis_qwen_review_parse_payload(text)
+    if isinstance(payload, dict):
+        return payload, None
+    return None, error or "concept_brief_parse_error"
+
+
+def _class_analysis_qwen_review_build_class_concept_brief(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    *,
+    class_name: str,
+    labelmap_glossary: str,
+    review_guidance: str,
+    model_id: Optional[str],
+    progress: float,
+) -> Dict[str, Any]:
+    examples = _class_analysis_qwen_review_select_class_concept_examples(result, class_name, limit=8)
+    glossary_entry = _class_analysis_qwen_review_glossary_entry_for_class(labelmap_glossary, class_name)
+    cache_key = _class_analysis_qwen_review_concept_brief_cache_key(
+        model_id=model_id,
+        class_name=class_name,
+        glossary_entry=glossary_entry,
+        review_guidance=review_guidance,
+        examples=examples,
+    )
+    cache_dir = _class_analysis_qwen_review_concept_cache_dir(job, create=True)
+    cache_path = cache_dir / f"{cache_key}.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                cached["cache_hit"] = True
+                return cached
+        except Exception:
+            pass
+    image_path: Optional[Path] = None
+    try:
+        sheet = _class_analysis_qwen_review_contact_sheet(
+            job,
+            result,
+            examples,
+            title=f"Trusted visual exemplars for {class_name}",
+            draw_bboxes=False,
+        )
+        image_path = cache_dir / f"{cache_key}_examples.jpg"
+        _class_analysis_write_binary(
+            image_path,
+            cache_dir,
+            lambda handle: sheet.save(handle, format="JPEG", quality=90),
+        )
+    except Exception as exc:
+        logger.debug("Failed to render class concept examples for %s: %s", class_name, exc)
+    example_meta = [
+        {
+            "point_id": item.get("point_id"),
+            "image_relpath": item.get("image_relpath"),
+            "split": item.get("split"),
+            "anchor_score": float(item.get("_anchor_score") or 0.0),
+            "same_class_neighbor_ratio": float(item.get("same_class_neighbor_ratio") or 0.0),
+            "top_other_neighbor_ratio": float(item.get("top_other_neighbor_ratio") or 0.0),
+        }
+        for item in examples
+    ]
+    brief: Dict[str, Any]
+    raw_text = ""
+    if image_path is not None and examples:
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You write compact visual concept briefs for one dataset class. "
+                            "Use only the attached trusted exemplar crops, class glossary, and review guidance. "
+                            "Do not decide any target label. Do not claim features not visible in exemplars. "
+                            "The exemplars are intentionally selected to be trusted but visually diverse; do not collapse "
+                            "the class to only the largest or most obvious-looking examples. "
+                            "Return one minified JSON object only. No markdown, no code fence, no prose."
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "\n".join(
+                            [
+                                f"Dataset class: {class_name}",
+                                f"Glossary entry: {glossary_entry or '(none supplied)'}",
+                                f"Session guidance excerpt: {str(review_guidance or '').strip()[:1500] or '(none supplied)'}",
+                                f"Trusted exemplar count: {len(examples)}",
+                                "The exemplar image has clean, trusted-but-diverse crops with labels/scores outside crop pixels.",
+                                "Expected JSON keys: class_name, summary, visual_traits, valid_variations, exclude_when, common_confusions, uncertainty_triggers.",
+                                "Use at most three short strings per list. Each string must be under 12 words.",
+                                "The summary must be under 24 words.",
+                                "Valid_variations must preserve the visible range of exemplars instead of narrowing the class.",
+                                "Mention uncertainty triggers for this class when examples are diverse or ambiguous.",
+                                "This brief will be used as advisory memory only; fresh target evidence and backend guardrails override it.",
+                            ]
+                        ),
+                    },
+                    {"type": "image", "image": _class_analysis_qwen_review_model_image_path(str(image_path))},
+                ],
+            },
+        ]
+        try:
+            raw_text = _class_analysis_qwen_review_model_call(
+                job,
+                messages,
+                phase=f"concept_brief_{_class_analysis_safe_slug(class_name, 'class')}",
+                model_id=model_id,
+                tool_specs=[],
+                max_new_tokens=280,
+                progress=progress,
+                event_extra={
+                    "class_name": class_name,
+                    "concept_brief_cache_key": cache_key,
+                    "example_point_ids": [str(item.get("point_id") or "") for item in examples],
+                    "provenance": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+                },
+                assistant_prefix=None,
+            )
+            payload, parse_error = _class_analysis_qwen_review_parse_concept_payload(raw_text)
+            if not isinstance(payload, dict):
+                raise ValueError(parse_error or "concept_brief_parse_error")
+            brief = _class_analysis_qwen_review_normalize_concept_brief(
+                payload,
+                class_name=class_name,
+                glossary_entry=glossary_entry,
+                review_guidance=review_guidance,
+                examples=examples,
+            )
+        except Exception as exc:
+            brief = _class_analysis_qwen_review_concept_brief_fallback(
+                class_name=class_name,
+                glossary_entry=glossary_entry,
+                review_guidance=review_guidance,
+                examples=examples,
+                reason=str(exc),
+            )
+    else:
+        brief = _class_analysis_qwen_review_concept_brief_fallback(
+            class_name=class_name,
+            glossary_entry=glossary_entry,
+            review_guidance=review_guidance,
+            examples=examples,
+            reason="no trusted exemplar image available",
+        )
+    artifact = {
+        "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+        "cache_key": cache_key,
+        "cache_hit": False,
+        "model_id": str(model_id or (active_qwen_metadata or {}).get("model_id") or active_qwen_model_id or "default"),
+        "class_name": class_name,
+        "brief": brief,
+        "examples": example_meta,
+        "example_selection": "trusted_diverse_projection_v1",
+        "example_image": str(image_path) if image_path is not None else "",
+        "raw_model_text": raw_text[:4000],
+        "created_at": time.time(),
+    }
+    _class_analysis_write_json(cache_path, cache_dir, artifact)
+    return artifact
+
+
+def _class_analysis_qwen_review_build_pair_contrast_brief(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    *,
+    class_a: str,
+    class_b: str,
+    labelmap_glossary: str,
+    review_guidance: str,
+    model_id: Optional[str],
+    progress: float,
+) -> Dict[str, Any]:
+    class_a = str(class_a or "").strip()
+    class_b = str(class_b or "").strip()
+    examples_a = _class_analysis_qwen_review_select_class_concept_examples(result, class_a, limit=6)
+    examples_b = _class_analysis_qwen_review_select_class_concept_examples(result, class_b, limit=6)
+    glossary_a = _class_analysis_qwen_review_glossary_entry_for_class(labelmap_glossary, class_a)
+    glossary_b = _class_analysis_qwen_review_glossary_entry_for_class(labelmap_glossary, class_b)
+    cache_key = _class_analysis_qwen_review_pair_contrast_cache_key(
+        model_id=model_id,
+        class_a=class_a,
+        class_b=class_b,
+        glossary_a=glossary_a,
+        glossary_b=glossary_b,
+        review_guidance=review_guidance,
+        examples_a=examples_a,
+        examples_b=examples_b,
+    )
+    cache_dir = _class_analysis_qwen_review_pair_contrast_cache_dir(job, create=True)
+    cache_path = cache_dir / f"{cache_key}.json"
+    if cache_path.exists():
+        try:
+            cached = json.loads(cache_path.read_text(encoding="utf-8"))
+            if isinstance(cached, dict):
+                cached["cache_hit"] = True
+                return cached
+        except Exception:
+            pass
+
+    image_path: Optional[Path] = None
+    try:
+        sheet = _class_analysis_qwen_review_sectioned_contact_sheet(
+            job,
+            result,
+            [(f"Trusted {class_a} exemplars", examples_a), (f"Trusted {class_b} exemplars", examples_b)],
+            title=f"Trusted pair contrast exemplars: {class_a} vs {class_b}",
+            draw_bboxes=False,
+        )
+        image_path = cache_dir / f"{cache_key}_examples.jpg"
+        _class_analysis_write_binary(
+            image_path,
+            cache_dir,
+            lambda handle: sheet.save(handle, format="JPEG", quality=90),
+        )
+    except Exception as exc:
+        logger.debug("Failed to render pair contrast examples for %s vs %s: %s", class_a, class_b, exc)
+
+    def _example_meta(items: Sequence[Dict[str, Any]]) -> List[Dict[str, Any]]:
+        return [
+            {
+                "point_id": item.get("point_id"),
+                "image_relpath": item.get("image_relpath"),
+                "split": item.get("split"),
+                "anchor_score": float(item.get("_anchor_score") or 0.0),
+                "same_class_neighbor_ratio": float(item.get("same_class_neighbor_ratio") or 0.0),
+                "top_other_neighbor_ratio": float(item.get("top_other_neighbor_ratio") or 0.0),
+            }
+            for item in items
+        ]
+
+    brief: Dict[str, Any]
+    raw_text = ""
+    if image_path is not None and examples_a and examples_b:
+        messages = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": (
+                            "You write compact contrast briefs for two dataset classes. "
+                            "Use only the attached trusted exemplar crops, class glossary entries, and review guidance. "
+                            "Do not decide any target label. Do not infer hidden dataset policy beyond the guidance. "
+                            "The exemplars are intentionally selected to be trusted but visually diverse for each class. "
+                            "Return one minified JSON object only. No markdown, no code fence, no prose."
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": "\n".join(
+                            [
+                                f"Class A: {class_a}",
+                                f"Class A glossary: {glossary_a or '(none supplied)'}",
+                                f"Class B: {class_b}",
+                                f"Class B glossary: {glossary_b or '(none supplied)'}",
+                                f"Session guidance excerpt: {str(review_guidance or '').strip()[:1500] or '(none supplied)'}",
+                                f"Trusted exemplar counts: {class_a}={len(examples_a)}, {class_b}={len(examples_b)}",
+                                "The exemplar image has clean, trusted-but-diverse crops with labels/scores outside crop pixels.",
+                                "Expected JSON keys: class_a, class_b, summary, choose_class_a_when, choose_class_b_when, shared_or_ambiguous_cues, hard_negative_cues, must_skip_when.",
+                                "Use at most four short strings per list. Each string must be under 12 words.",
+                                "The summary must be under 30 words.",
+                                "Focus on visible target-pixel distinctions, not neighbor counts.",
+                                "Name overlap/context traps that should force skip rather than class switching.",
+                                "must_skip_when is only for ambiguous/hidden/contaminated evidence, never for clearly visible class examples.",
+                                "This brief will be used as advisory memory only; fresh target evidence and backend guardrails override it.",
+                            ]
+                        ),
+                    },
+                    {"type": "image", "image": _class_analysis_qwen_review_model_image_path(str(image_path))},
+                ],
+            },
+        ]
+        try:
+            raw_text = _class_analysis_qwen_review_model_call(
+                job,
+                messages,
+                phase=(
+                    f"concept_pair_"
+                    f"{_class_analysis_safe_slug(class_a, 'class')}_vs_{_class_analysis_safe_slug(class_b, 'class')}"
+                ),
+                model_id=model_id,
+                tool_specs=[],
+                max_new_tokens=320,
+                progress=progress,
+                event_extra={
+                    "class_a": class_a,
+                    "class_b": class_b,
+                    "pair_contrast_cache_key": cache_key,
+                    "example_point_ids_a": [str(item.get("point_id") or "") for item in examples_a],
+                    "example_point_ids_b": [str(item.get("point_id") or "") for item in examples_b],
+                    "provenance": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+                },
+                assistant_prefix=None,
+            )
+            payload, parse_error = _class_analysis_qwen_review_parse_concept_payload(raw_text)
+            if not isinstance(payload, dict):
+                raise ValueError(parse_error or "pair_contrast_parse_error")
+            brief = _class_analysis_qwen_review_normalize_pair_contrast(
+                payload,
+                class_a=class_a,
+                class_b=class_b,
+                glossary_a=glossary_a,
+                glossary_b=glossary_b,
+                review_guidance=review_guidance,
+                examples_a=examples_a,
+                examples_b=examples_b,
+            )
+        except Exception as exc:
+            brief = _class_analysis_qwen_review_pair_contrast_fallback(
+                class_a=class_a,
+                class_b=class_b,
+                glossary_a=glossary_a,
+                glossary_b=glossary_b,
+                review_guidance=review_guidance,
+                examples_a=examples_a,
+                examples_b=examples_b,
+                reason=str(exc),
+            )
+    else:
+        brief = _class_analysis_qwen_review_pair_contrast_fallback(
+            class_a=class_a,
+            class_b=class_b,
+            glossary_a=glossary_a,
+            glossary_b=glossary_b,
+            review_guidance=review_guidance,
+            examples_a=examples_a,
+            examples_b=examples_b,
+            reason="missing trusted exemplar image for one or both classes",
+        )
+
+    artifact = {
+        "version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+        "cache_key": cache_key,
+        "cache_hit": False,
+        "model_id": str(model_id or (active_qwen_metadata or {}).get("model_id") or active_qwen_model_id or "default"),
+        "class_a": class_a,
+        "class_b": class_b,
+        "brief": brief,
+        "examples_a": _example_meta(examples_a),
+        "examples_b": _example_meta(examples_b),
+        "example_selection": "trusted_diverse_projection_v1",
+        "example_image": str(image_path) if image_path is not None else "",
+        "raw_model_text": raw_text[:4000],
+        "created_at": time.time(),
+    }
+    _class_analysis_write_json(cache_path, cache_dir, artifact)
+    return artifact
+
+
+def _class_analysis_qwen_review_format_concept_briefs(artifacts: Sequence[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        brief = artifact.get("brief") if isinstance(artifact.get("brief"), dict) else {}
+        class_name = str(brief.get("class_name") or artifact.get("class_name") or "").strip()
+        if not class_name:
+            continue
+        lines.append(f"- {class_name}: {str(brief.get('summary') or '').strip()[:360]}")
+        for label, key in (
+            ("Visible traits", "visual_traits"),
+            ("Valid variation", "valid_variations"),
+            ("Exclude when", "exclude_when"),
+            ("Common confusions", "common_confusions"),
+            ("Uncertainty triggers", "uncertainty_triggers"),
+        ):
+            values = [str(item).strip() for item in (brief.get(key) or []) if str(item or "").strip()]
+            if values:
+                lines.append(f"  {label}: {'; '.join(values[:5])}")
+        glossary_entry = str(brief.get("glossary_entry") or "").strip()
+        if glossary_entry:
+            lines.append(f"  Glossary: {glossary_entry[:420]}")
+    return "\n".join(lines)[:5000]
+
+
+def _class_analysis_qwen_review_format_pair_contrasts(artifacts: Sequence[Dict[str, Any]]) -> str:
+    lines: List[str] = []
+    for artifact in artifacts:
+        if not isinstance(artifact, dict):
+            continue
+        brief = artifact.get("brief") if isinstance(artifact.get("brief"), dict) else {}
+        class_a = str(brief.get("class_a") or artifact.get("class_a") or "").strip()
+        class_b = str(brief.get("class_b") or artifact.get("class_b") or "").strip()
+        if not class_a or not class_b:
+            continue
+        lines.append(f"- Pair {class_a} vs {class_b}: {str(brief.get('summary') or '').strip()[:420]}")
+        for label, key in (
+            (f"Choose {class_a} when", "choose_class_a_when"),
+            (f"Choose {class_b} when", "choose_class_b_when"),
+            ("Shared/ambiguous cues", "shared_or_ambiguous_cues"),
+            ("Switch blockers / hard negatives", "hard_negative_cues"),
+            ("Must skip when", "must_skip_when"),
+        ):
+            values = [str(item).strip() for item in (brief.get(key) or []) if str(item or "").strip()]
+            if values:
+                lines.append(f"  {label}: {'; '.join(values[:4])}")
+    return "\n".join(lines)[:3500]
+
+
+def _class_analysis_qwen_review_combined_concept_prompt(
+    class_artifacts: Sequence[Dict[str, Any]],
+    pair_artifacts: Sequence[Dict[str, Any]],
+) -> str:
+    sections: List[str] = []
+    class_text = _class_analysis_qwen_review_format_concept_briefs(class_artifacts)
+    if class_text:
+        sections.append("Class visual concept briefs:\n" + class_text)
+    pair_text = _class_analysis_qwen_review_format_pair_contrasts(pair_artifacts)
+    if pair_text:
+        sections.append("Pairwise contrast briefs:\n" + pair_text)
+    return "\n\n".join(sections)[:7000]
+
+
+def _class_analysis_qwen_review_build_concept_briefs(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    *,
+    labelmap_glossary: str,
+    review_guidance: str,
+    model_id: Optional[str] = None,
+) -> Dict[str, Any]:
+    classes = _class_analysis_qwen_review_relevant_classes_for_concepts(point)
+    artifacts: List[Dict[str, Any]] = []
+    total = max(1, len(classes))
+    for idx, class_name in enumerate(classes, start=1):
+        if job.cancel_event.is_set():
+            raise RuntimeError("cancelled")
+        with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+            _class_analysis_qwen_review_update(
+                job,
+                progress=0.22 + (0.08 * ((idx - 1) / total)),
+                message=f"Building class concept brief {idx}/{total} ...",
+            )
+        artifact = _class_analysis_qwen_review_build_class_concept_brief(
+            job,
+            result,
+            class_name=class_name,
+            labelmap_glossary=labelmap_glossary,
+            review_guidance=review_guidance,
+            model_id=model_id,
+            progress=0.23 + (0.08 * ((idx - 1) / total)),
+        )
+        artifacts.append(artifact)
+    pair_artifacts: List[Dict[str, Any]] = []
+    class_a = str(point.get("class_name") or "").strip()
+    class_b = str(point.get("suggested_neighbor_class") or "").strip()
+    if class_a and class_b and class_a != class_b:
+        with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+            _class_analysis_qwen_review_update(
+                job,
+                progress=0.30,
+                message=f"Building pair contrast brief: {class_a} vs {class_b} ...",
+            )
+        pair_artifacts.append(
+            _class_analysis_qwen_review_build_pair_contrast_brief(
+                job,
+                result,
+                class_a=class_a,
+                class_b=class_b,
+                labelmap_glossary=labelmap_glossary,
+                review_guidance=review_guidance,
+                model_id=model_id,
+                progress=0.30,
+            )
+        )
+    packet = {
+        "enabled": True,
+        "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+        "pair_contrast_version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+        "classes": classes,
+        "artifacts": artifacts,
+        "pair_contrasts": pair_artifacts,
+        "prompt_text": _class_analysis_qwen_review_combined_concept_prompt(artifacts, pair_artifacts),
+    }
+    _class_analysis_qwen_review_write_json(job, "concept_briefs.json", packet)
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "concept_briefs_ready",
+            "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+            "pair_contrast_version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+            "classes": classes,
+            "cache_keys": [str(item.get("cache_key") or "") for item in artifacts if isinstance(item, dict)],
+            "cache_hits": [bool(item.get("cache_hit")) for item in artifacts if isinstance(item, dict)],
+            "pair_cache_keys": [str(item.get("cache_key") or "") for item in pair_artifacts if isinstance(item, dict)],
+            "pair_cache_hits": [bool(item.get("cache_hit")) for item in pair_artifacts if isinstance(item, dict)],
+        },
+    )
+    return packet
+
+
+def _class_analysis_qwen_review_tool_overlap_decomposition(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    _args: Dict[str, Any],
+) -> Dict[str, Any]:
+    points_by_id = _class_analysis_qwen_points_by_id(result)
+    overlaps = _class_analysis_qwen_review_overlap_decomposition(result, point)
+    overlap_points = [points_by_id.get(str(item.get("point_id") or "")) for item in overlaps]
+    overlap_points = [candidate for candidate in overlap_points if isinstance(candidate, dict)]
+    image = _class_analysis_qwen_review_contact_sheet(
+        job,
+        result,
+        [point, *overlap_points],
+        title="Material bbox-overlap decomposition",
+        draw_bboxes=True,
+    )
+    relation_counts = dict(Counter(str(item.get("relation") or "none") for item in overlaps))
+    summary_bits = [
+        f"{item.get('class_name') or '?'}:{item.get('relation')} "
+        f"target_cover={float(item.get('target_area_covered') or 0.0):.2f} "
+        f"other_cover={float(item.get('other_area_covered') or 0.0):.2f} "
+        f"IoU={float(item.get('iou') or 0.0):.2f}"
+        for item in overlaps[:8]
+    ]
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="overlap_decomposition",
+        title="BBox overlap decomposition",
+        image=image,
+        summary=(
+            "Target crop followed by materially overlapping same-image boxes. "
+            + ("No material bbox overlap was found." if not overlaps else "Overlap details: " + "; ".join(summary_bits))
+        ),
+        metadata={"overlap_count": len(overlap_points), "overlaps": overlaps, "relation_counts": relation_counts},
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+def _class_analysis_qwen_review_tool_overlap(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    return _class_analysis_qwen_review_tool_overlap_decomposition(job, result, point, args)
+
+
+def _class_analysis_qwen_review_bool_arg(args: Dict[str, Any], key: str, default: bool) -> bool:
+    raw = args.get(key, default) if isinstance(args, dict) else default
+    if isinstance(raw, bool):
+        return raw
+    return str(raw).strip().lower() not in {"0", "false", "no", "off"}
+
+
+def _class_analysis_qwen_review_satisfied_tool_keys(tool_name: str, args: Dict[str, Any]) -> Set[str]:
+    keys = {str(tool_name or "").strip()}
+    if tool_name == "inspect_overlap_evidence":
+        keys.add("inspect_overlap_decomposition")
+    if tool_name == "zoom_source_region" and not _class_analysis_qwen_review_bool_arg(args, "draw_bbox", False):
+        keys.add("zoom_source_region_clean")
+    return {key for key in keys if key}
+
+
+def _class_analysis_qwen_review_required_tool_label(tool_key: str) -> str:
+    if tool_key == "zoom_source_region_clean":
+        return "zoom_source_region(draw_bbox=false)"
+    return str(tool_key or "").strip()
+
+
+def _class_analysis_qwen_review_tool_zoom_region(
+    job: ClassAnalysisQwenReviewJob,
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    args: Dict[str, Any],
+) -> Dict[str, Any]:
+    bbox = _class_analysis_qwen_review_bbox(point)
+    extra = max(0.0, min(500.0, _coerce_float(args.get("extra_px"), 160.0, minimum=0.0, maximum=500.0)))
+    draw_bbox = _class_analysis_qwen_review_bool_arg(args, "draw_bbox", False)
+    image_path = _class_analysis_qwen_review_point_image_path(job, result, point)
+    with Image.open(image_path) as loaded:
+        source = loaded.convert("RGB")
+    try:
+        source_width, source_height = source.size
+        left, top, right, bottom = bbox
+        crop_left = left - extra
+        crop_top = top - extra
+        crop_width = max(1, int(round((right - left) + extra * 2.0)))
+        crop_height = max(1, int(round((bottom - top) + extra * 2.0)))
+        image = Image.new("RGB", (crop_width, crop_height), (0, 0, 0))
+        src_left = max(0, int(math.floor(crop_left)))
+        src_top = max(0, int(math.floor(crop_top)))
+        src_right = min(source_width, int(math.ceil(crop_left + crop_width)))
+        src_bottom = min(source_height, int(math.ceil(crop_top + crop_height)))
+        if src_right > src_left and src_bottom > src_top:
+            image.paste(
+                source.crop((src_left, src_top, src_right, src_bottom)),
+                (int(round(src_left - crop_left)), int(round(src_top - crop_top))),
+            )
+        if draw_bbox:
+            draw = ImageDraw.Draw(image)
+            line_width = max(2, min(8, int(round(min(crop_width, crop_height) * 0.012))))
+            draw.rectangle(
+                [
+                    int(round(left - crop_left)),
+                    int(round(top - crop_top)),
+                    int(round(right - crop_left)),
+                    int(round(bottom - crop_top)),
+                ],
+                outline=(249, 115, 22),
+                width=line_width,
+            )
+        image.thumbnail((1100, 1100))
+    finally:
+        try:
+            source.close()
+        except Exception:
+            pass
+    evidence, path = _class_analysis_qwen_review_save_evidence(
+        job,
+        kind="zoom_region",
+        title="Zoomed source region" if draw_bbox else "Clean zoomed source region",
+        image=image,
+        summary=(
+            f"Expanded source crop with approximately {extra:.0f}px additional requested context. "
+            + ("Target bbox is drawn." if draw_bbox else "No bbox overlay is drawn.")
+        ),
+        metadata={"extra_px": extra, "bbox_overlay": draw_bbox},
+    )
+    return {"summary": evidence["summary"], "evidence": [evidence], "image_paths": [str(path)]}
+
+
+CLASS_ANALYSIS_QWEN_REVIEW_TOOLS: Dict[str, Callable[[ClassAnalysisQwenReviewJob, Dict[str, Any], Dict[str, Any], Dict[str, Any]], Dict[str, Any]]] = {
+    "inspect_target_context": _class_analysis_qwen_review_tool_target_context,
+    "inspect_target_detail": _class_analysis_qwen_review_tool_target_detail,
+    "inspect_source_overlay": _class_analysis_qwen_review_tool_source_overlay,
+    "inspect_local_consensus_context": _class_analysis_qwen_review_tool_local_consensus_context,
+    "inspect_neighbors": _class_analysis_qwen_review_tool_neighbors,
+    "compare_classes": _class_analysis_qwen_review_tool_compare_classes,
+    "inspect_class_context_pack": _class_analysis_qwen_review_tool_class_context_pack,
+    "inspect_specificity_region_contrast": _class_analysis_qwen_review_tool_specificity_region_contrast,
+    "inspect_same_image_scale_report": _class_analysis_qwen_review_tool_same_image_scale_report,
+    "inspect_same_image_embedding_report": _class_analysis_qwen_review_tool_same_image_embedding_report,
+    "inspect_overlap_decomposition": _class_analysis_qwen_review_tool_overlap_decomposition,
+    "inspect_overlap_evidence": _class_analysis_qwen_review_tool_overlap,
+    "zoom_source_region": _class_analysis_qwen_review_tool_zoom_region,
+}
+
+CLASS_ANALYSIS_QWEN_REVIEW_REQUIRED_TOOL_SEQUENCE: List[Tuple[str, Dict[str, Any]]] = [
+    ("inspect_target_context", {}),
+    ("inspect_target_detail", {}),
+    ("inspect_source_overlay", {}),
+    ("inspect_overlap_decomposition", {}),
+    ("inspect_class_context_pack", {}),
+    ("inspect_specificity_region_contrast", {}),
+    ("inspect_same_image_scale_report", {}),
+    ("inspect_same_image_embedding_report", {}),
+    ("zoom_source_region", {"extra_px": 160, "draw_bbox": False}),
+]
+
+CLASS_ANALYSIS_QWEN_REVIEW_OPTIONAL_PREFINAL_TOOLS: Set[str] = {
+    "inspect_local_consensus_context",
+}
+
+CLASS_ANALYSIS_QWEN_REVIEW_ROUTER_ACTIONS: Tuple[str, ...] = (
+    "finalize_now",
+    "inspect_local_consensus_context",
+)
+
+CLASS_ANALYSIS_QWEN_REVIEW_ROUTER_REASON_CODES: Tuple[str, ...] = (
+    "evidence_complete",
+    "needs_same_image_consensus",
+    "target_quality_not_clear",
+    "target_quality_not_reviewable",
+    "no_suggested_class",
+    "local_consensus_disabled",
+    "policy_blocked",
+)
+
+CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_REQUIRED_FIELDS: Tuple[str, ...] = (
+    "verified",
+    "target_class",
+    "cue_confidence",
+    "positive_visible_target_cues",
+    "current_class_plausibility_basis",
+    "current_class_plausible",
+    "current_class_plausibility_reason",
+    "whole_target_extent_supported",
+    "whole_target_extent_reason",
+    "overlap_rebutted",
+    "overlap_risk",
+    "anchor_support_verified",
+    "anchor_support_basis",
+    "supporting_clean_evidence_ids",
+    "rejection_reason",
+)
+
+CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_OPTIONAL_FIELDS: Tuple[str, ...] = (
+    "target_class_defining_cues",
+    "current_class_positive_cues",
+    "current_class_missing_or_inconsistent_cues",
+    "edge_clip_recoverable",
+    "edge_clip_recoverability_reason",
+    "overlap_rebuttal",
+    "anchor_support_reason",
+)
+
+
+def _class_analysis_qwen_review_cue_verifier_required_fields_text() -> str:
+    return ", ".join(CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_REQUIRED_FIELDS)
+
+
+def _class_analysis_qwen_review_cue_verifier_optional_fields_text() -> str:
+    return ", ".join(CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_OPTIONAL_FIELDS)
+
+
+def _class_analysis_qwen_review_router_tool_spec(
+    *,
+    allow_local_consensus: bool,
+) -> Dict[str, Any]:
+    """Hermes/Qwen-style single-tool schema for the routing state.
+
+    The controller, not the model, decides which tool schemas are visible in
+    each state. This mirrors the OpenClaw-style separation between state policy
+    and model output: the model receives one narrow function contract instead
+    of an open-ended toolbox.
+    """
+    action_enum = ["finalize_now"]
+    if allow_local_consensus:
+        action_enum.append("inspect_local_consensus_context")
+    return {
+        "name": "route_review",
+        "description": (
+            "Choose whether required evidence is enough for a final class review, "
+            "or whether the single optional local-consensus evidence module is required."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "action": {
+                    "type": "string",
+                    "enum": action_enum,
+                    "description": "Next controller action.",
+                },
+                "reason_code": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_ROUTER_REASON_CODES),
+                    "description": "Short reason for the route.",
+                },
+                "confidence": {
+                    "type": "number",
+                    "minimum": 0.0,
+                    "maximum": 1.0,
+                    "description": "Confidence in the route, not the final class decision.",
+                },
+                "rationale_short": {
+                    "type": "string",
+                    "description": "Under 20 words; no hidden reasoning.",
+                },
+            },
+            "required": ["action", "reason_code", "confidence", "rationale_short"],
+        },
+    }
+
+
+def _class_analysis_qwen_review_final_tool_spec(labelmap: Sequence[str]) -> Dict[str, Any]:
+    final_class_schema: Dict[str, Any] = {
+        "type": "string",
+        "description": (
+            "Recommended final label to apply. For confirm_current use the current class; "
+            "for accept_suggested use the suggested class; for change_to_other use a third class."
+        ),
+    }
+    clean_labelmap = [str(name or "").strip() for name in labelmap if str(name or "").strip()]
+    if clean_labelmap:
+        final_class_schema["enum"] = clean_labelmap
+    return {
+        "name": "finalize_review",
+        "description": (
+            "Return the compact final advisory class-review decision. The backend "
+            "expands this into the full audit record and enforces guardrails."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "decision": {
+                    "type": "string",
+                    "enum": ["confirm_current", "accept_suggested", "change_to_other", "skip_uncertain"],
+                },
+                "final_class": final_class_schema,
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "visual_quality": {"type": "string", "enum": ["clear", "limited", "poor"]},
+                "object_visibility": {
+                    "type": "string",
+                    "enum": ["clear", "partial", "tiny_or_blurry", "not_visible"],
+                },
+                "current_evidence": {"type": "string", "enum": ["strong", "moderate", "weak", "none"]},
+                "suggested_evidence": {"type": "string", "enum": ["strong", "moderate", "weak", "none"]},
+                "target_evidence": {"type": "string", "enum": ["strong", "moderate", "weak", "none"]},
+                "overlap_assessment": {
+                    "type": "string",
+                    "enum": [
+                        "none",
+                        "duplicate_like",
+                        "partial_contamination",
+                        "target_contains_other",
+                        "other_contains_target",
+                        "near_context",
+                        "unclear",
+                    ],
+                },
+                "overlap_explains_candidate_similarity": {"type": "boolean"},
+                "specificity_alignment": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS),
+                    "description": (
+                        "SDDF-inspired target/background grounding check. State which class hypothesis is supported by "
+                        "target-contained object-specific cues, not by background, overlap, labels, or neighbor counts."
+                    ),
+                },
+                "target_background_contrast": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS),
+                    "description": (
+                        "Whether the visible evidence is target-object specific or dominated by background/overlap/context."
+                    ),
+                },
+                "target_identity_summary": {
+                    "type": "string",
+                    "description": (
+                        "Under 30 words; class-neutral visible description of the whole reviewed target. "
+                        "Describe shape, parts, material, extent, and target-touching context before naming a class."
+                    ),
+                },
+                "target_identity_uncertainty": {
+                    "type": "string",
+                    "enum": ["low", "moderate", "high"],
+                    "description": (
+                        "Uncertainty in the class-neutral target identity summary. Use high when the whole object "
+                        "cannot be described without guessing."
+                    ),
+                },
+                "target_identity_evidence_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Clean target/source evidence ids used for target_identity_summary.",
+                },
+                "whole_target_extent_supported": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the recommended final class explains the whole reviewed bbox/object extent. "
+                        "For class changes, set false if the clean target contains a large attached extension, "
+                        "compartment, appendage, support, tool, cargo body, roof, trailer-like segment, or continuous "
+                        "structure that the proposed class does not explain."
+                    ),
+                },
+                "whole_target_extent_reason": {
+                    "type": "string",
+                    "description": "Under 25 words; visible-fact reason for whether the final class explains the full target extent.",
+                },
+                "dual_bbox_resolution": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_DUAL_BBOX_RESOLUTIONS),
+                    "description": (
+                        "Use not_applicable unless the controller reports a near-identical cross-class bbox conflict. "
+                        "For such conflicts, resolve the target as current_box_class, overlap_box_class, "
+                        "both_valid_overlapping_objects, or uncertain_or_neither."
+                    ),
+                },
+                "local_consensus_evidence": {
+                    "type": "string",
+                    "enum": ["supports_current", "supports_suggested", "mixed", "absent", "not_applicable"],
+                },
+                "visible_target_cues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Short visible target-object cues observed in clean target/source pixels; no class labels by themselves.",
+                },
+                "supporting_clean_evidence_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": (
+                        "Evidence ids from the controller ledger that support visible_target_cues. "
+                        "Use clean target/source visual evidence, not overlays, dot maps, or label text."
+                    ),
+                },
+                "rationale_short": {"type": "string", "description": "Under 25 words; visible facts only."},
+                "counter_evidence": {"type": "string", "description": "Under 25 words."},
+                "human_review_needed": {"type": "boolean"},
+            },
+            "required": [
+                "decision",
+                "final_class",
+                "confidence",
+                "visual_quality",
+                "object_visibility",
+                "current_evidence",
+                "suggested_evidence",
+                "target_evidence",
+                "overlap_assessment",
+                "overlap_explains_candidate_similarity",
+                "specificity_alignment",
+                "target_background_contrast",
+                "target_identity_summary",
+                "target_identity_uncertainty",
+                "target_identity_evidence_ids",
+                "whole_target_extent_supported",
+                "whole_target_extent_reason",
+                "visible_target_cues",
+                "rationale_short",
+            ],
+        },
+    }
+
+
+def _class_analysis_qwen_review_cue_verifier_tool_spec(labelmap: Sequence[str]) -> Dict[str, Any]:
+    target_class_schema: Dict[str, Any] = {
+        "type": "string",
+        "description": "Canonical target class being verified from the dataset labelmap.",
+    }
+    clean_labelmap = [str(name or "").strip() for name in labelmap if str(name or "").strip()]
+    if clean_labelmap:
+        target_class_schema["enum"] = clean_labelmap
+    return {
+        "name": "verify_visible_cues",
+        "description": (
+            "Verify whether a guarded clear-target class-change recommendation has enough "
+            "positive target-visible evidence to be revalidated by the controller."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "verified": {
+                    "type": "boolean",
+                    "description": "True only when clean target/source pixels show enough positive target-class cues.",
+                },
+                "target_class": target_class_schema,
+                "cue_confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "positive_visible_target_cues": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 90},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": (
+                        "Positive object-internal or target-touching cues for the target class. "
+                        "The cues must describe the reviewed target bbox/object, not only a smaller visible subpart. "
+                        "Use short phrases and do not repeat identical cue text in any other cue array."
+                    ),
+                },
+                "target_class_defining_cues": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 90},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": (
+                        "Optional, only when a one-cue target still needs contrastive support. "
+                        "Use target-class-defining cues that are not exact repeats of positive_visible_target_cues."
+                    ),
+                },
+                "current_class_positive_cues": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 90},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Optional positive cues that still support the current class, if visible.",
+                },
+                "current_class_missing_or_inconsistent_cues": {
+                    "type": "array",
+                    "items": {"type": "string", "maxLength": 90},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": (
+                        "Optional visible absences or contradictions that weaken the current class hypothesis. "
+                        "Examples should be generic and dataset-derived, such as missing expected parts or visible "
+                        "structure inconsistent with the current class."
+                    ),
+                },
+                "current_class_plausibility_basis": {
+                    "type": "string",
+                    "enum": [
+                        "direct_positive_cues",
+                        "shared_generic_cues",
+                        "hypothetical_or_uncertain",
+                        "none",
+                    ],
+                    "description": (
+                        "Why the current class is still plausible. Use direct_positive_cues only for "
+                        "concrete current-class evidence visible in clean target/source pixels."
+                    ),
+                },
+                "current_class_plausible": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when clean target/source pixels show direct positive evidence for the current class. "
+                        "Do not use hypothetical edge cases or shared generic shape/color cues as this boolean."
+                    ),
+                },
+                "current_class_plausibility_reason": {
+                    "type": "string",
+                    "maxLength": 160,
+                    "description": "Short visible-fact reason for why the current class is or is not still plausible.",
+                },
+                "whole_target_extent_supported": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the proposed target class explains the whole reviewed bbox/object extent. "
+                        "Set false if the clean target contains a large attached extension, compartment, appendage, "
+                        "support, tool, cargo body, trailer-like segment, roof, or other continuous structure that "
+                        "the proposed class does not explain."
+                    ),
+                },
+                "whole_target_extent_reason": {
+                    "type": "string",
+                    "maxLength": 160,
+                    "description": (
+                        "Short visible-fact reason for whether the proposed class explains the full target extent, "
+                        "including attached or continuous structures inside the bbox."
+                    ),
+                },
+                "edge_clip_recoverable": {
+                    "type": "boolean",
+                    "description": (
+                        "Optional. True only when the bbox touches the image edge but visible target pixels still "
+                        "show enough class-defining structure that missing outside-image pixels are not necessary "
+                        "for class identity. False or omit for non-edge cases or when edge clipping hides decisive parts."
+                    ),
+                },
+                "edge_clip_recoverability_reason": {
+                    "type": "string",
+                    "maxLength": 160,
+                    "description": (
+                        "Optional short visible-fact reason explaining why image-edge clipping does or does not hide "
+                        "class-critical target parts."
+                    ),
+                },
+                "overlap_rebutted": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when overlap/background/nearby objects do not explain the proposed target-class "
+                        "cues in the clean target/source pixels."
+                    ),
+                },
+                "overlap_risk": {
+                    "type": "string",
+                    "enum": ["target_specific", "overlap_explains", "uncertain", "not_applicable"],
+                    "description": "Whether the apparent target-class evidence is target-contained or overlap/background-driven.",
+                },
+                "overlap_rebuttal": {
+                    "type": "string",
+                    "maxLength": 160,
+                    "description": (
+                        "Optional short visible-fact explanation of why overlap does or does not explain "
+                        "the target-class evidence."
+                    ),
+                },
+                "anchor_support_verified": {
+                    "type": "boolean",
+                    "description": (
+                        "True only when the trusted target-class anchors/examples and class context are specific enough "
+                        "to support the proposed target class for this target, not just generic shape/color/context."
+                    ),
+                },
+                "anchor_support_basis": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_ANCHOR_SUPPORT_BASIS_LEVELS),
+                    "description": (
+                        "How the trusted anchors/examples support the proposed class. Use target_specific_anchors only "
+                        "for object-specific anchor evidence; use shared_generic_anchors for broad shape/color/context."
+                    ),
+                },
+                "anchor_support_reason": {
+                    "type": "string",
+                    "maxLength": 160,
+                    "description": "Optional short visible-fact reason explaining the anchor-support judgment.",
+                },
+                "supporting_clean_evidence_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Clean target/source evidence ids supporting the positive target cues.",
+                },
+                "rejection_reason": {
+                    "type": "string",
+                    "maxLength": 160,
+                    "description": "Short reason when verified=false, or the main remaining uncertainty.",
+                },
+            },
+            "required": list(CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_REQUIRED_FIELDS),
+        },
+    }
+
+
+def _class_analysis_qwen_review_specificity_probe_tool_spec(labelmap: Sequence[str]) -> Dict[str, Any]:
+    clean_labelmap = [str(name or "").strip() for name in labelmap if str(name or "").strip()]
+    class_schema: Dict[str, Any] = {
+        "type": "string",
+        "description": "Dataset class best supported by target-contained visible cues, or empty when unresolved.",
+    }
+    if clean_labelmap:
+        class_schema["enum"] = [""] + clean_labelmap
+    return {
+        "name": "probe_specificity",
+        "description": (
+            "Probe target-vs-background specificity before final class review. "
+            "This is a VLM evidence pass, not a label mutation."
+        ),
+        "parameters": {
+            "type": "object",
+            "additionalProperties": False,
+            "properties": {
+                "target_identity_summary": {
+                    "type": "string",
+                    "description": "Class-neutral visible description of the whole reviewed target.",
+                },
+                "target_identity_uncertainty": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_TARGET_IDENTITY_UNCERTAINTY_LEVELS),
+                },
+                "specificity_alignment": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS),
+                    "description": "Which class hypothesis is supported by target-contained object-specific cues.",
+                },
+                "target_background_contrast": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS),
+                    "description": "Whether evidence is target-specific or dominated by background/overlap/context.",
+                },
+                "best_supported_class": class_schema,
+                "target_specific_cues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Positive cues visible on the reviewed target itself.",
+                },
+                "background_or_overlap_cues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Cues that come from background, neighboring objects, overlap, or scene context.",
+                },
+                "subdescription_assessments": {
+                    "type": "array",
+                    "minItems": 0,
+                    "maxItems": 8,
+                    "description": (
+                        "Qwen region-contrast specificity checks. Generate compact class sub-descriptions from the "
+                        "active class names, glossary/guidance, and trusted exemplar briefs, then score "
+                        "whether each sub-description is supported by target-only pixels, target-removed "
+                        "background/context, or overlap-only pixels."
+                    ),
+                    "items": {
+                        "type": "object",
+                        "additionalProperties": False,
+                        "properties": {
+                            "class_name": class_schema,
+                            "subdescription": {
+                                "type": "string",
+                                "description": "A short class-specific visual attribute or part description.",
+                            },
+                            "target_support": {
+                                "type": "string",
+                                "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_FOCUS_SUPPORT_LEVELS),
+                                "description": "How strongly the reviewed target itself supports this sub-description.",
+                            },
+                            "background_or_overlap_support": {
+                                "type": "string",
+                                "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_FOCUS_SUPPORT_LEVELS),
+                                "description": "How strongly background, overlap, or neighboring objects support it.",
+                            },
+                            "support_location": {
+                                "type": "string",
+                                "enum": ["target", "background", "overlap", "mixed", "absent"],
+                            },
+                            "supporting_clean_evidence_ids": {
+                                "type": "array",
+                                "items": {"type": "string"},
+                                "minItems": 0,
+                                "maxItems": 4,
+                            },
+                            "note": {"type": "string", "description": "Short visible-fact note."},
+                        },
+                        "required": [
+                            "class_name",
+                            "subdescription",
+                            "target_support",
+                            "background_or_overlap_support",
+                            "support_location",
+                            "supporting_clean_evidence_ids",
+                            "note",
+                        ],
+                    },
+                },
+                "specificity_margin": {
+                    "type": "string",
+                    "enum": list(CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MARGIN_LEVELS),
+                    "description": (
+                        "Summary of the target-vs-background contrast across sub-descriptions. "
+                        "Use background_or_overlap_favored when suggested/current support mostly comes from context."
+                    ),
+                },
+                "margin_rationale": {
+                    "type": "string",
+                    "description": "Under 25 words; summarize why the target/background margin points that way.",
+                },
+                "current_class_cues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Target-contained cues supporting the current class, if any.",
+                },
+                "suggested_class_cues": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Target-contained cues supporting the suggested class, if any.",
+                },
+                "whole_target_extent_supported": {
+                    "type": "boolean",
+                    "description": "True only if the best-supported class explains the whole reviewed bbox/object extent.",
+                },
+                "supporting_clean_evidence_ids": {
+                    "type": "array",
+                    "items": {"type": "string"},
+                    "minItems": 0,
+                    "maxItems": 6,
+                    "description": "Clean target/source evidence ids used for target-specific cue claims.",
+                },
+                "confidence": {"type": "number", "minimum": 0.0, "maximum": 1.0},
+                "rationale_short": {"type": "string", "description": "Under 25 words; no hidden reasoning."},
+            },
+            "required": [
+                "target_identity_summary",
+                "target_identity_uncertainty",
+                "specificity_alignment",
+                "target_background_contrast",
+                "best_supported_class",
+                "target_specific_cues",
+                "background_or_overlap_cues",
+                "subdescription_assessments",
+                "specificity_margin",
+                "margin_rationale",
+                "current_class_cues",
+                "suggested_class_cues",
+                "whole_target_extent_supported",
+                "supporting_clean_evidence_ids",
+                "confidence",
+                "rationale_short",
+            ],
+        },
+    }
+
+
+def _class_analysis_qwen_review_tool_specs_for_template(*specs: Dict[str, Any]) -> List[Dict[str, Any]]:
+    return [copy.deepcopy(spec) for spec in specs if isinstance(spec, dict) and spec.get("name")]
+
+
+def _class_analysis_qwen_review_tool_arguments(
+    payload: Dict[str, Any],
+    *,
+    expected_name: str,
+    aliases: Optional[Set[str]] = None,
+) -> Dict[str, Any]:
+    aliases = {str(item or "").strip() for item in (aliases or set()) if str(item or "").strip()}
+    expected = str(expected_name or "").strip()
+    tool_name = str(payload.get("name") or payload.get("tool") or "").strip()
+    args = payload.get("arguments") if isinstance(payload.get("arguments"), dict) else None
+    if not tool_name and args is None:
+        args = payload
+        tool_name = expected
+    if tool_name in aliases:
+        tool_name = expected
+    if tool_name != expected:
+        raise ValueError(f"expected {expected}, got {tool_name or 'missing tool name'}")
+    return dict(args or {})
+
+
+def _class_analysis_qwen_review_local_consensus_policy(
+    *,
+    local_consensus_enabled: bool,
+    visual_quality: Dict[str, Any],
+    point: Dict[str, Any],
+    executed_tools: Set[str],
+) -> Dict[str, Any]:
+    reasons: List[str] = []
+    tier = str(visual_quality.get("tier") or "").strip().lower()
+    if not local_consensus_enabled:
+        reasons.append("local_consensus_disabled")
+    if "inspect_local_consensus_context" in executed_tools:
+        reasons.append("already_inspected")
+    if tier in {"poor", "unknown", ""}:
+        reasons.append("target_quality_not_reviewable")
+    if not str(point.get("suggested_neighbor_class") or "").strip():
+        reasons.append("no_suggested_class")
+    return {
+        "allowed": not reasons,
+        "reasons": reasons,
+    }
+
+
+def _class_analysis_qwen_review_validate_router(
+    payload: Dict[str, Any],
+    *,
+    local_consensus_enabled: bool,
+    visual_quality: Dict[str, Any],
+    point: Dict[str, Any],
+    executed_tools: Set[str],
+) -> Dict[str, Any]:
+    args = _class_analysis_qwen_review_tool_arguments(
+        payload,
+        expected_name="route_review",
+        aliases={"router", "route", "review_route"},
+    )
+    action = str(args.get("action") or "").strip()
+    reason_code = str(args.get("reason_code") or "").strip() or "evidence_complete"
+    rationale_short = str(args.get("rationale_short") or "").strip()[:240]
+    try:
+        confidence = float(args.get("confidence"))
+    except Exception:
+        confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    if action not in CLASS_ANALYSIS_QWEN_REVIEW_ROUTER_ACTIONS:
+        raise ValueError("router action must be finalize_now or inspect_local_consensus_context")
+    policy = _class_analysis_qwen_review_local_consensus_policy(
+        local_consensus_enabled=local_consensus_enabled,
+        visual_quality=visual_quality,
+        point=point,
+        executed_tools=executed_tools,
+    )
+    policy_reasons = list(policy.get("reasons") or [])
+    if action == "inspect_local_consensus_context" and not bool(policy.get("allowed")):
+        action = "finalize_now"
+        reason_code = "policy_blocked"
+        confidence = min(confidence, 0.35)
+    if action == "finalize_now" and reason_code == "needs_same_image_consensus":
+        reason_code = "evidence_complete"
+    if reason_code not in CLASS_ANALYSIS_QWEN_REVIEW_ROUTER_REASON_CODES:
+        reason_code = "evidence_complete"
+    return {
+        "action": action,
+        "reason_code": reason_code,
+        "confidence": confidence,
+        "rationale_short": rationale_short,
+        "policy_allowed_local_consensus": bool(policy.get("allowed")),
+        "policy_reasons": policy_reasons,
+    }
+
+CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS: Tuple[str, ...] = ("strong", "moderate", "weak", "none")
+CLASS_ANALYSIS_QWEN_REVIEW_QUALITY_LEVELS: Tuple[str, ...] = ("clear", "limited", "poor")
+CLASS_ANALYSIS_QWEN_REVIEW_VISIBILITY_LEVELS: Tuple[str, ...] = (
+    "clear",
+    "partial",
+    "tiny_or_blurry",
+    "not_visible",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_OVERLAP_LEVELS: Tuple[str, ...] = (
+    "none",
+    "duplicate_like",
+    "partial_contamination",
+    "target_contains_other",
+    "other_contains_target",
+    "near_context",
+    "unclear",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_LOCAL_CONSENSUS_LEVELS: Tuple[str, ...] = (
+    "supports_current",
+    "supports_suggested",
+    "mixed",
+    "absent",
+    "not_applicable",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_DETERMINISTIC_CONTEXT_LEVELS: Tuple[str, ...] = (
+    "supports_current",
+    "questions_current",
+    "neutral",
+    "insufficient",
+    "not_applicable",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS: Tuple[str, ...] = (
+    "supports_current",
+    "supports_suggested",
+    "supports_other",
+    "mixed",
+    "insufficient",
+    "not_applicable",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS: Tuple[str, ...] = (
+    "target_specific",
+    "background_dominated",
+    "overlap_dominated",
+    "mixed",
+    "insufficient",
+    "not_applicable",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_TARGET_IDENTITY_UNCERTAINTY_LEVELS: Tuple[str, ...] = (
+    "low",
+    "moderate",
+    "high",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_FOCUS_SUPPORT_LEVELS: Tuple[str, ...] = (
+    "strong",
+    "moderate",
+    "weak",
+    "none",
+    "not_applicable",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MARGIN_LEVELS: Tuple[str, ...] = (
+    "current_target_favored",
+    "suggested_target_favored",
+    "other_target_favored",
+    "background_or_overlap_favored",
+    "low_contrast",
+    "insufficient",
+    "not_applicable",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_DUAL_BBOX_RESOLUTIONS: Tuple[str, ...] = (
+    "not_applicable",
+    "current_box_class",
+    "overlap_box_class",
+    "both_valid_overlapping_objects",
+    "uncertain_or_neither",
+)
+CLASS_ANALYSIS_QWEN_REVIEW_ANCHOR_SUPPORT_BASIS_LEVELS: Tuple[str, ...] = (
+    "target_specific_anchors",
+    "shared_generic_anchors",
+    "conflicting_anchors",
+    "insufficient",
+    "not_applicable",
+)
+
+
+def _class_analysis_qwen_review_normalize_label(label: Any) -> str:
+    return re.sub(r"[^a-z0-9]+", "", str(label or "").strip().lower())
+
+
+def _class_analysis_qwen_review_dual_bbox_conflict(
+    point: Dict[str, Any],
+    evidence_ledger: Optional[Dict[str, Any]] = None,
+) -> Optional[Dict[str, Any]]:
+    current_class = str(point.get("class_name") or "").strip()
+    current_norm = _class_analysis_qwen_review_normalize_label(current_class)
+    existing = point.get("dual_bbox_conflict") if isinstance(point.get("dual_bbox_conflict"), dict) else None
+    if existing and bool(existing.get("enabled")):
+        conflict = dict(existing)
+        conflict.setdefault("current_class", current_class)
+        conflict.setdefault("classes", [current_class, str(conflict.get("other_class_name") or conflict.get("class_name") or "")])
+        conflict.setdefault("review_mode", "dual_bbox_class_resolution")
+        conflict.setdefault("kind", "near_identical_cross_class_bbox")
+        conflict.setdefault("source", "analysis_point")
+        return conflict
+    overlap_context = (
+        evidence_ledger.get("overlap_decomposition")
+        if isinstance(evidence_ledger, dict) and isinstance(evidence_ledger.get("overlap_decomposition"), dict)
+        else {}
+    )
+    candidates: List[Dict[str, Any]] = []
+    for item in overlap_context.get("overlaps") or []:
+        if not isinstance(item, dict):
+            continue
+        other_class = str(item.get("class_name") or "").strip()
+        if not other_class or _class_analysis_qwen_review_normalize_label(other_class) == current_norm:
+            continue
+        try:
+            iou = float(item.get("iou") or 0.0)
+            target_cover = float(item.get("target_area_covered") or 0.0)
+            other_cover = float(item.get("other_area_covered") or 0.0)
+        except Exception:
+            continue
+        if iou < 0.90:
+            continue
+        candidates.append(
+            {
+                "enabled": True,
+                "kind": "near_identical_cross_class_bbox",
+                "review_mode": "dual_bbox_class_resolution",
+                "point_id": str(point.get("point_id") or ""),
+                "current_class": current_class,
+                "other_point_id": str(item.get("point_id") or ""),
+                "other_class_name": other_class,
+                "class_name": other_class,
+                "classes": [current_class, other_class],
+                "iou": iou,
+                "corner_similarity": None,
+                "target_area_covered": target_cover,
+                "other_area_covered": other_cover,
+                "relation": str(item.get("relation") or "duplicate_like"),
+                "score": iou,
+                "source": "overlap_decomposition",
+                "question": (
+                    f"Resolve near-identical boxes: should this target be {current_class}, "
+                    f"{other_class}, both valid overlapping objects, or unresolved?"
+                ),
+            }
+        )
+    if not candidates:
+        return None
+    return max(candidates, key=lambda item: float(item.get("score") or 0.0))
+
+
+def _class_analysis_qwen_review_dual_bbox_other_class(conflict: Optional[Dict[str, Any]]) -> str:
+    if not isinstance(conflict, dict):
+        return ""
+    return str(conflict.get("other_class_name") or conflict.get("class_name") or "").strip()
+
+
+def _class_analysis_qwen_review_label_aliases(label: str) -> Tuple[str, ...]:
+    label_text = str(label or "").strip()
+    base_aliases: Set[str] = set()
+    if label_text:
+        base_aliases.add(label_text.lower())
+        spaced = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label_text).replace("_", " ").replace("-", " ").lower()
+        if spaced:
+            base_aliases.add(spaced)
+    return tuple(sorted((alias for alias in base_aliases if alias), key=len, reverse=True))
+
+
+def _class_analysis_qwen_review_text_parts(payload: Dict[str, Any]) -> List[str]:
+    text_parts: List[str] = []
+    for key in ("target_identity_summary", "rationale_short", "counter_evidence", "reason", "rationale"):
+        value = payload.get(key)
+        if isinstance(value, str):
+            text_parts.append(value)
+    for key in ("visible_target_cues", "target_observations", "visible_cues"):
+        value = payload.get(key)
+        if isinstance(value, (list, tuple)):
+            text_parts.extend(str(item) for item in value if str(item or "").strip())
+        elif isinstance(value, str):
+            text_parts.append(value)
+    compact = payload.get("_compact_model_arguments")
+    if isinstance(compact, dict):
+        for key in ("target_identity_summary", "rationale_short", "counter_evidence", "reason", "rationale"):
+            value = compact.get(key)
+            if isinstance(value, str):
+                text_parts.append(value)
+        for key in ("visible_target_cues", "target_observations", "visible_cues"):
+            value = compact.get(key)
+            if isinstance(value, (list, tuple)):
+                text_parts.extend(str(item) for item in value if str(item or "").strip())
+            elif isinstance(value, str):
+                text_parts.append(value)
+    return text_parts
+
+
+def _class_analysis_qwen_review_text_block(payload: Dict[str, Any]) -> str:
+    """Join independent model text fields without creating synthetic sentences."""
+
+    parts = [str(part).strip() for part in _class_analysis_qwen_review_text_parts(payload) if str(part or "").strip()]
+    return ". ".join(parts)
+
+
+def _class_analysis_qwen_review_overlap_ledger_entry(metadata: Any) -> Dict[str, Any]:
+    source = metadata if isinstance(metadata, dict) else {}
+    overlaps: List[Dict[str, Any]] = []
+    for item in source.get("overlaps") or []:
+        if not isinstance(item, dict):
+            continue
+        try:
+            overlap = {
+                "point_id": str(item.get("point_id") or ""),
+                "class_name": str(item.get("class_name") or ""),
+                "relation": str(item.get("relation") or ""),
+                "target_area_covered": float(item.get("target_area_covered") or 0.0),
+                "other_area_covered": float(item.get("other_area_covered") or 0.0),
+                "iou": float(item.get("iou") or 0.0),
+            }
+        except Exception:
+            continue
+        overlaps.append(overlap)
+    return {
+        "overlap_count": int(source.get("overlap_count") or len(overlaps)),
+        "relation_counts": dict(source.get("relation_counts") or {}),
+        "overlaps": overlaps,
+    }
+
+
+def _class_analysis_qwen_review_best_class_material_overlap(
+    evidence_ledger: Any,
+    class_name: str,
+) -> Optional[Dict[str, Any]]:
+    if not isinstance(evidence_ledger, dict):
+        return None
+    class_norm = _class_analysis_qwen_review_normalize_label(class_name)
+    if not class_norm:
+        return None
+    overlap_context = evidence_ledger.get("overlap_decomposition")
+    if not isinstance(overlap_context, dict):
+        return None
+    best: Optional[Dict[str, Any]] = None
+    for item in overlap_context.get("overlaps") or []:
+        if not isinstance(item, dict):
+            continue
+        if _class_analysis_qwen_review_normalize_label(item.get("class_name")) != class_norm:
+            continue
+        relation = str(item.get("relation") or "").strip()
+        if relation in {"", "none"}:
+            continue
+        try:
+            target_cover = float(item.get("target_area_covered") or 0.0)
+            other_cover = float(item.get("other_area_covered") or 0.0)
+            iou = float(item.get("iou") or 0.0)
+        except Exception:
+            continue
+        if max(target_cover, other_cover, iou) <= 0.0:
+            continue
+        candidate = dict(item)
+        candidate["_material_score"] = max(target_cover, other_cover, iou)
+        if best is None or float(candidate["_material_score"]) > float(best.get("_material_score") or 0.0):
+            best = candidate
+    return best
+
+
+def _class_analysis_qwen_review_target_class_material_overlap(
+    evidence_ledger: Any,
+    target_class: str,
+) -> Optional[Dict[str, Any]]:
+    return _class_analysis_qwen_review_best_class_material_overlap(evidence_ledger, target_class)
+
+
+def _class_analysis_qwen_review_current_overlap_false_alarm_result(
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return a controller-only confirm-current result for obvious overlap false alarms."""
+
+    backend_tier = str(visual_quality.get("tier") or "").strip().lower()
+    if backend_tier != "clear":
+        return None
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    if not current_class or not suggested_class:
+        return None
+    current_overlap = _class_analysis_qwen_review_best_class_material_overlap(evidence_ledger, current_class)
+    if not current_overlap:
+        return None
+    suggested_overlap = _class_analysis_qwen_review_target_class_material_overlap(evidence_ledger, suggested_class)
+    try:
+        current_cover = float(current_overlap.get("target_area_covered") or 0.0)
+        suggested_cover = float(suggested_overlap.get("target_area_covered") or 0.0) if suggested_overlap else 0.0
+    except Exception:
+        return None
+    if current_cover < 0.50 or suggested_cover > min(0.25, current_cover * 0.50):
+        return None
+    relation = str(current_overlap.get("relation") or "material_overlap")
+    dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point, evidence_ledger)
+    evidence_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("clean_target_source_evidence_ids") or [])
+        if str(item or "").strip()
+    ][:3]
+    reason = (
+        f"Controller overlap preflight: current class {current_class} dominates target bbox "
+        f"({relation}, current_cover={current_cover:.2f}, suggested_cover={suggested_cover:.2f})."
+    )
+    return {
+        "decision": "confirm_current",
+        "target_class": current_class,
+        "confidence": 0.72,
+        "evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+        "visual_quality": "clear",
+        "object_visibility": "clear",
+        "current_evidence": "strong",
+        "suggested_evidence": "weak",
+        "target_evidence": "strong",
+        "overlap_assessment": "partial_contamination" if relation != "near_context" else "near_context",
+        "overlap_explains_candidate_similarity": True,
+        "specificity_alignment": "supports_current",
+        "target_background_contrast": "overlap_dominated",
+        "dual_bbox_resolution": "current_box_class" if dual_bbox_conflict else "not_applicable",
+        "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+        "visible_target_cues": [
+            f"current-class overlap covers {current_cover:.2f} of target bbox",
+            f"suggested-class overlap covers {suggested_cover:.2f} of target bbox",
+        ],
+        "supporting_clean_evidence_ids": evidence_ids,
+        "anchor_evidence_current": "moderate",
+        "anchor_evidence_suggested": "weak",
+        "local_context_evidence": "moderate",
+        "local_consensus_evidence": "not_applicable",
+        "global_context_evidence": "weak",
+        "same_image_scale_evidence": "not_applicable",
+        "same_image_embedding_evidence": "not_applicable",
+        "glossary_or_guidance_used": False,
+        "backend_visual_quality": visual_quality,
+        "guardrail_reasons": [],
+        "advisory_reasons": [reason],
+        "guarded_recommendation": None,
+        "rationale_short": reason,
+        "counter_evidence": "Qwen generation skipped; deterministic overlap preflight is not visual class recognition.",
+        "human_review_needed": True,
+        "applied": False,
+        "controller_preflight": {
+            "applied": True,
+            "kind": "current_overlap_false_alarm",
+            "current_overlap": dict(current_overlap),
+            "suggested_overlap": dict(suggested_overlap) if suggested_overlap else None,
+            "reason": reason,
+        },
+    }
+
+
+def _class_analysis_qwen_review_local_consensus_signal(job: ClassAnalysisQwenReviewJob) -> Dict[str, Any]:
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        evidence_rows = copy.deepcopy(job.evidence)
+    best: Dict[str, Any] = {"signal": "insufficient", "reason": "no local consensus evidence"}
+    for item in evidence_rows:
+        if not isinstance(item, dict) or str(item.get("kind") or "") != "local_consensus_context":
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        current_count = int(metadata.get("same_image_current_count") or 0)
+        suggested_count = int(metadata.get("same_image_suggested_count") or 0)
+        included_current = int(metadata.get("included_current_count") or 0)
+        included_suggested = int(metadata.get("included_suggested_count") or 0)
+        try:
+            nearest_current = float(metadata.get("nearest_current_distance_px") or 0.0)
+        except Exception:
+            nearest_current = 0.0
+        try:
+            nearest_suggested = float(metadata.get("nearest_suggested_distance_px") or 0.0)
+        except Exception:
+            nearest_suggested = 0.0
+        suggested_dominates = (
+            suggested_count >= 8
+            and included_suggested >= 4
+            and suggested_count >= max(3 * max(1, current_count), current_count + 6)
+            and (nearest_current <= 0.0 or nearest_suggested <= max(180.0, nearest_current * 0.5))
+        )
+        current_dominates = (
+            current_count >= 8
+            and included_current >= 4
+            and current_count >= max(3 * max(1, suggested_count), suggested_count + 6)
+            and (nearest_suggested <= 0.0 or nearest_current <= max(180.0, nearest_suggested * 0.5))
+        )
+        if suggested_dominates:
+            return {
+                "signal": "supports_suggested",
+                "same_image_current_count": current_count,
+                "same_image_suggested_count": suggested_count,
+                "included_current_count": included_current,
+                "included_suggested_count": included_suggested,
+                "nearest_current_distance_px": nearest_current,
+                "nearest_suggested_distance_px": nearest_suggested,
+                "evidence_id": str(item.get("evidence_id") or ""),
+                "reason": (
+                    f"same-image consensus strongly favors suggested class "
+                    f"({suggested_count} suggested vs {current_count} current boxes)"
+                ),
+            }
+        if current_dominates:
+            best = {
+                "signal": "supports_current",
+                "same_image_current_count": current_count,
+                "same_image_suggested_count": suggested_count,
+                "included_current_count": included_current,
+                "included_suggested_count": included_suggested,
+                "nearest_current_distance_px": nearest_current,
+                "nearest_suggested_distance_px": nearest_suggested,
+                "evidence_id": str(item.get("evidence_id") or ""),
+                "reason": (
+                    f"same-image consensus strongly favors current class "
+                    f"({current_count} current vs {suggested_count} suggested boxes)"
+                ),
+            }
+    return best
+
+
+def _class_analysis_qwen_review_deterministic_triage_result(
+    job: ClassAnalysisQwenReviewJob,
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+    deterministic_context: Dict[str, Any],
+) -> Optional[Dict[str, Any]]:
+    """Return a safe human-triage result when deterministic evidence is strong.
+
+    This is intentionally not an automatic relabel. It exists for cases where
+    local MLX VLM final generation is unstable: strong backend evidence should
+    still become a useful vignette hint instead of a missing result.
+    """
+
+    backend_tier = str(visual_quality.get("tier") or "").strip().lower()
+    if backend_tier != "clear":
+        return None
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    if not current_class or not suggested_class:
+        return None
+    local_signal = _class_analysis_qwen_review_local_consensus_signal(job)
+    scale_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "scale")
+    embedding_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "embedding")
+    dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point, evidence_ledger)
+    deterministic_current_supported = (
+        embedding_signal == "supports_current" and scale_signal in {"supports_current", "neutral"}
+    ) or (
+        scale_signal == "supports_current" and embedding_signal in {"supports_current", "neutral"}
+    )
+    if deterministic_current_supported and local_signal.get("signal") != "supports_suggested":
+        local_consensus_label = str(local_signal.get("signal") or "not_applicable")
+        if local_consensus_label not in {"supports_current", "supports_suggested", "mixed", "absent", "not_applicable"}:
+            local_consensus_label = "not_applicable"
+        reason = (
+            "Controller deterministic triage: same-image scale/embedding evidence supports the current class "
+            f"(embedding={embedding_signal}, scale={scale_signal})."
+        )
+        return {
+            "decision": "confirm_current",
+            "target_class": current_class,
+            "confidence": 0.64,
+            "evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+            "visual_quality": "clear",
+            "object_visibility": "clear",
+            "current_evidence": "moderate",
+            "suggested_evidence": "weak",
+            "target_evidence": "moderate",
+            "overlap_assessment": "none",
+            "overlap_explains_candidate_similarity": False,
+            "specificity_alignment": "not_applicable",
+            "target_background_contrast": "not_applicable",
+            "dual_bbox_resolution": "current_box_class" if dual_bbox_conflict else "not_applicable",
+            "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+            "visible_target_cues": [],
+            "supporting_clean_evidence_ids": list(evidence_ledger.get("clean_target_source_evidence_ids") or [])[:3],
+            "anchor_evidence_current": "moderate",
+            "anchor_evidence_suggested": "weak",
+            "local_context_evidence": "moderate",
+            "local_consensus_evidence": local_consensus_label,
+            "global_context_evidence": "weak",
+            "same_image_scale_evidence": scale_signal,
+            "same_image_embedding_evidence": embedding_signal,
+            "glossary_or_guidance_used": False,
+            "backend_visual_quality": visual_quality,
+            "guardrail_reasons": [],
+            "advisory_reasons": [reason],
+            "guarded_recommendation": None,
+            "rationale_short": reason,
+            "counter_evidence": "Qwen final generation skipped; deterministic triage is advisory only.",
+            "human_review_needed": True,
+            "applied": False,
+            "controller_preflight": {
+                "applied": True,
+                "kind": "deterministic_current_triage",
+                "local_consensus": local_signal,
+                "scale_signal": scale_signal,
+                "embedding_signal": embedding_signal,
+                "reason": reason,
+            },
+        }
+    if local_signal.get("signal") == "supports_current" and embedding_signal in {"supports_current", "neutral", "insufficient"}:
+        reason = f"Controller deterministic triage: {local_signal.get('reason')}; embedding={embedding_signal}, scale={scale_signal}."
+        return {
+            "decision": "confirm_current",
+            "target_class": current_class,
+            "confidence": 0.62,
+            "evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+            "visual_quality": "clear",
+            "object_visibility": "clear",
+            "current_evidence": "moderate",
+            "suggested_evidence": "weak",
+            "target_evidence": "moderate",
+            "overlap_assessment": "none",
+            "overlap_explains_candidate_similarity": False,
+            "specificity_alignment": "not_applicable",
+            "target_background_contrast": "not_applicable",
+            "dual_bbox_resolution": "current_box_class" if dual_bbox_conflict else "not_applicable",
+            "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+            "visible_target_cues": [],
+            "supporting_clean_evidence_ids": list(evidence_ledger.get("clean_target_source_evidence_ids") or [])[:3],
+            "anchor_evidence_current": "moderate",
+            "anchor_evidence_suggested": "weak",
+            "local_context_evidence": "moderate",
+            "local_consensus_evidence": "supports_current",
+            "global_context_evidence": "weak",
+            "same_image_scale_evidence": scale_signal,
+            "same_image_embedding_evidence": embedding_signal,
+            "glossary_or_guidance_used": False,
+            "backend_visual_quality": visual_quality,
+            "guardrail_reasons": [],
+            "advisory_reasons": [reason],
+            "guarded_recommendation": None,
+            "rationale_short": reason,
+            "counter_evidence": "Qwen final generation skipped; deterministic triage is advisory only.",
+            "human_review_needed": True,
+            "applied": False,
+            "controller_preflight": {
+                "applied": True,
+                "kind": "deterministic_current_triage",
+                "local_consensus": local_signal,
+                "scale_signal": scale_signal,
+                "embedding_signal": embedding_signal,
+                "reason": reason,
+            },
+        }
+    suggested_supported = local_signal.get("signal") == "supports_suggested" and embedding_signal in {
+        "questions_current",
+    }
+    if local_signal.get("signal") == "supports_suggested" and scale_signal == "questions_current":
+        suggested_supported = True
+    if not suggested_supported:
+        return None
+    current_overlap = _class_analysis_qwen_review_best_class_material_overlap(evidence_ledger, current_class)
+    suggested_overlap = _class_analysis_qwen_review_target_class_material_overlap(evidence_ledger, suggested_class)
+    try:
+        current_cover = float(current_overlap.get("target_area_covered") or 0.0) if current_overlap else 0.0
+        suggested_cover = float(suggested_overlap.get("target_area_covered") or 0.0) if suggested_overlap else 0.0
+    except Exception:
+        current_cover = suggested_cover = 0.0
+    if current_cover >= 0.50 and suggested_cover <= min(0.25, current_cover * 0.50):
+        return None
+    reason = f"Controller deterministic triage: {local_signal.get('reason')}; embedding={embedding_signal}, scale={scale_signal}."
+    return {
+        "decision": "skip_uncertain",
+        "target_class": current_class,
+        "confidence": 0.45,
+        "evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+        "visual_quality": "clear",
+        "object_visibility": "clear",
+        "current_evidence": "weak",
+        "suggested_evidence": "moderate",
+        "target_evidence": "weak",
+        "overlap_assessment": "none" if max(current_cover, suggested_cover) <= 0.0 else "near_context",
+        "overlap_explains_candidate_similarity": False,
+        "specificity_alignment": "insufficient",
+        "target_background_contrast": "insufficient",
+        "dual_bbox_resolution": "uncertain_or_neither" if dual_bbox_conflict else "not_applicable",
+        "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+        "visible_target_cues": [],
+        "supporting_clean_evidence_ids": [],
+        "anchor_evidence_current": "weak",
+        "anchor_evidence_suggested": "moderate",
+        "local_context_evidence": "weak",
+        "local_consensus_evidence": "supports_suggested",
+        "global_context_evidence": "weak",
+        "same_image_scale_evidence": scale_signal,
+        "same_image_embedding_evidence": embedding_signal,
+        "glossary_or_guidance_used": False,
+        "backend_visual_quality": visual_quality,
+        "guardrail_reasons": [reason, "controller deterministic triage lacks target-visible VLM confirmation"],
+        "advisory_reasons": [],
+        "guarded_recommendation": {
+            "blocked": True,
+            "decision": "accept_suggested",
+            "target_class": suggested_class,
+            "confidence": 0.58,
+            "current_class": current_class,
+            "suggested_neighbor_class": suggested_class,
+            "visual_quality": "clear",
+            "object_visibility": "clear",
+            "backend_tier": backend_tier,
+            "current_evidence": "weak",
+            "suggested_evidence": "moderate",
+            "target_evidence": "weak",
+            "same_image_scale_evidence": scale_signal,
+            "same_image_embedding_evidence": embedding_signal,
+            "overlap_assessment": "none" if max(current_cover, suggested_cover) <= 0.0 else "near_context",
+            "specificity_alignment": "insufficient",
+            "target_background_contrast": "insufficient",
+            "dual_bbox_resolution": "uncertain_or_neither" if dual_bbox_conflict else "not_applicable",
+            "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+            "visible_target_cues": [],
+            "supporting_clean_evidence_ids": [],
+            "guardrail_reasons": ["controller deterministic triage lacks target-visible VLM confirmation"],
+            "advisory_reasons": [reason],
+            "rationale_short": reason,
+            "counter_evidence": "No Qwen visual final was used.",
+        },
+        "rationale_short": reason,
+        "counter_evidence": "Qwen final generation skipped; deterministic triage is advisory only.",
+        "human_review_needed": True,
+        "applied": False,
+        "controller_preflight": {
+            "applied": True,
+            "kind": "deterministic_suggested_triage",
+            "local_consensus": local_signal,
+            "scale_signal": scale_signal,
+            "embedding_signal": embedding_signal,
+            "current_cover": current_cover,
+            "suggested_cover": suggested_cover,
+            "reason": reason,
+        },
+    }
+
+
+def _class_analysis_qwen_review_final_would_use_mlx(model_id: Optional[str]) -> bool:
+    requested_model = (
+        str(model_id or "").strip()
+        or str((active_qwen_metadata or {}).get("model_id") or "").strip()
+        or QWEN_MODEL_NAME
+    )
+    try:
+        return _resolve_qwen_runtime_platform(
+            requested_model,
+            adapter_path=active_qwen_model_path,
+            metadata=active_qwen_metadata,
+        ) == QWEN_PLATFORM_MLX
+    except Exception:
+        try:
+            return is_qwen_mlx_model_id(requested_model)
+        except Exception:
+            return False
+
+
+def _class_analysis_qwen_review_mlx_final_disabled_result(
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+) -> Dict[str, Any]:
+    reason = (
+        "Controller skipped MLX Qwen final generation because the local MLX-VLM path "
+        "hit Metal GPU timeouts in review benchmarks; deterministic preflight was insufficient."
+    )
+    backend_tier = str(visual_quality.get("tier") or "unknown").strip().lower()
+    dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point, evidence_ledger)
+    return {
+        **_class_analysis_qwen_review_skip_result(point, reason),
+        "visual_quality": backend_tier if backend_tier in {"clear", "limited"} else "poor",
+        "object_visibility": "clear" if backend_tier == "clear" else "partial",
+        "backend_visual_quality": visual_quality,
+        "evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+        "supporting_clean_evidence_ids": [],
+        "dual_bbox_resolution": "uncertain_or_neither" if dual_bbox_conflict else "not_applicable",
+        "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+        "guardrail_reasons": [reason],
+        "rationale_short": reason,
+        "controller_preflight": {
+            "applied": True,
+            "kind": "mlx_final_disabled",
+            "reason": reason,
+        },
+    }
+
+
+def _class_analysis_qwen_review_semantic_aliases_for_label(
+    label: str,
+    *,
+    labelmap: Sequence[str] = (),
+    labelmap_glossary: str = "",
+) -> Tuple[str, ...]:
+    aliases: Set[str] = set(_class_analysis_qwen_review_label_aliases(label))
+    spaced_label = re.sub(r"(?<=[a-z])(?=[A-Z])", " ", str(label or "")).replace("_", " ").replace("-", " ").lower()
+    generic_tokens = {
+        "class",
+        "label",
+        "object",
+        "target",
+        "small",
+        "large",
+        "light",
+        "heavy",
+        "other",
+        "misc",
+    }
+    for token in re.findall(r"[a-z0-9]{4,}", spaced_label):
+        if token not in generic_tokens:
+            aliases.add(token)
+    raw_glossary = ""
+    if str(labelmap_glossary or "").strip():
+        raw_glossary = _normalize_labelmap_glossary(labelmap_glossary)
+    elif labelmap:
+        raw_glossary = _default_agent_glossary_for_labelmap(labelmap)
+    try:
+        decoded = json.loads(raw_glossary or "{}")
+    except Exception:
+        decoded = {}
+    if isinstance(decoded, dict):
+        values = decoded.get(str(label or "").strip())
+        if isinstance(values, str):
+            values = [values]
+        if isinstance(values, list):
+            for item in values:
+                text = re.sub(r"\s+", " ", str(item or "").strip().lower())
+                if not text:
+                    continue
+                if len(text) <= 48:
+                    aliases.add(text)
+                for token in re.findall(r"[a-z0-9]{4,}", text):
+                    if token not in generic_tokens:
+                        aliases.add(token)
+    return tuple(sorted((alias for alias in aliases if len(alias) >= 3), key=len, reverse=True))
+
+
+def _class_analysis_qwen_review_text_rejects_semantic_aliases(
+    aliases: Sequence[str],
+    payload: Dict[str, Any],
+) -> Optional[str]:
+    text = _class_analysis_qwen_review_text_block(payload).strip().lower()
+    if not text:
+        return None
+    def _context_only_negation(match: re.Match[str]) -> bool:
+        sentence_start = max(text.rfind(".", 0, match.start()), text.rfind("?", 0, match.start()), text.rfind("!", 0, match.start()), text.rfind(";", 0, match.start()))
+        sentence = text[sentence_start + 1 : match.end() + 80]
+        prefix = sentence[: max(0, match.start() - sentence_start - 1)]
+        has_target_marker = bool(re.search(r"\b(?:target|object|crop|target\s+crop)\b", prefix[-140:]))
+        has_context_marker = bool(re.search(r"\b(?:background|overlap|overlapping|nearby|adjacent|context|road|markings)\b", prefix[-140:]))
+        return bool(has_context_marker and not has_target_marker)
+
+    for alias in aliases:
+        alias_text = str(alias or "").strip().lower()
+        if len(alias_text) < 3:
+            continue
+        alias_expr = re.escape(alias_text)
+        patterns = (
+            rf"\b(?:target|object|crop|target\s+crop)\b[^.;?!]{{0,160}}\bnot\s+(?:a\s+|an\s+|the\s+)?{alias_expr}s?\b",
+            rf"\bnot\s+(?:a\s+|an\s+|the\s+)?{alias_expr}s?\b",
+            rf"\bno\b[^.;?!]{{0,80}}\b{alias_expr}s?\b[^.;?!]{{0,80}}\b(?:features|cues|evidence|support)\b",
+            rf"\b{alias_expr}s?\b[^.;?!]{{0,80}}\b(?:not\s+visible|not\s+present|absent|missing)\b",
+        )
+        for pattern in patterns:
+            for match in re.finditer(pattern, text):
+                if _context_only_negation(match):
+                    continue
+                return alias_text
+    return None
+
+
+def _class_analysis_qwen_review_text_directly_supports_label(
+    *,
+    label: str,
+    payload: Dict[str, Any],
+) -> bool:
+    aliases = _class_analysis_qwen_review_label_aliases(label)
+    if not aliases:
+        return False
+    text = _class_analysis_qwen_review_text_block(payload).strip().lower()
+    if not text:
+        return False
+    sentences = [part.strip() for part in re.split(r"[.?!;\n]+", text) if part.strip()]
+    target_markers = (
+        "target crop",
+        "target object",
+        "the target",
+        "target",
+        "object",
+        "crop",
+    )
+    positive_markers = (
+        "shows",
+        "showing",
+        "visible",
+        "visibly",
+        "clear",
+        "clearly",
+        "looks",
+        "appears",
+        "is a",
+        "is an",
+        "matching",
+        "supporting",
+        "with ",
+    )
+    negative_markers = (
+        "no ",
+        "not ",
+        "lacks ",
+        "without ",
+        "weak",
+        "incorrect",
+        "contradict",
+        "distinct from",
+        "not part of",
+        "not a",
+        "not an",
+        "rather than",
+        "instead of",
+        "mismatched",
+    )
+    for sentence in sentences:
+        for alias in aliases:
+            alias_match = re.search(rf"\b{re.escape(alias)}s?\b", sentence)
+            if not alias_match:
+                continue
+            alias_pos = alias_match.start()
+            target_pos = max((sentence.rfind(marker, 0, alias_pos) for marker in target_markers), default=-1)
+            if target_pos < 0:
+                continue
+            between_target_and_alias = sentence[target_pos:alias_pos]
+            if len(between_target_and_alias) > 120:
+                continue
+            if any(marker in between_target_and_alias for marker in ("current", "anchor", "anchors", "consensus")):
+                continue
+            if not any(marker in sentence[target_pos : alias_pos + len(alias) + 48] for marker in positive_markers):
+                continue
+            prefix = sentence[max(0, alias_pos - 48) : alias_pos]
+            negative_prefix = sentence[max(0, alias_pos - 96) : alias_pos]
+            suffix = sentence[alias_pos + len(alias) : alias_pos + len(alias) + 48]
+            if any(marker in negative_prefix for marker in negative_markers):
+                continue
+            if any(marker in suffix for marker in (" is weak", " is incorrect", " label is weak", " class is weak")):
+                continue
+            suffix_head = suffix.lstrip(" )(")
+            if any(suffix_head.startswith(marker) for marker in ("anchor", "anchors", "label", "class", "evidence")):
+                continue
+            return True
+    return False
+
+
+def _class_analysis_qwen_review_text_rejects_label_for_target(
+    *,
+    label: str,
+    payload: Dict[str, Any],
+) -> bool:
+    label_text = str(label or "").strip()
+    if not label_text:
+        return False
+    text = _class_analysis_qwen_review_text_block(payload).strip().lower()
+    if not text:
+        return False
+    label_pattern = re.escape(label_text.lower())
+    spaced_label_pattern = re.escape(
+        re.sub(r"(?<=[a-z])(?=[A-Z])", " ", label_text).replace("_", " ").replace("-", " ").lower()
+    )
+    label_expr = rf"(?:{label_pattern}|{spaced_label_pattern})"
+    rejection_patterns = (
+        rf"\b(?:current\s+)?{label_expr}\s+(?:label|class)\b[^.?!]{{0,120}}\b(?:incorrect|wrong|mismatched|misclassified|misclassification)\b",
+        rf"\b(?:target|object|crop|target\s+crop)\b[^.?!]{{0,120}}\b(?:contradicts|contradicting|not\s+a|not\s+an|not)\b[^.?!]{{0,80}}\b{label_expr}\b",
+        rf"\bno\b[^.?!]{{0,80}}\b{label_expr}\b[^.?!]{{0,80}}\b(?:cues|features|evidence|support)\b",
+    )
+    return any(re.search(pattern, text) for pattern in rejection_patterns)
+
+
+def _class_analysis_qwen_review_text_allows_adjacent_accept(
+    *,
+    current_class: str,
+    suggested_class: str,
+    payload: Dict[str, Any],
+) -> bool:
+    """Avoid false text-conflict blocks for adjacent dataset classes.
+
+    Some class pairs share ordinary-language terms. This helper is deliberately
+    narrow: it only relaxes text conflicts when the model explicitly supports
+    the suggested class from the target pixels and explicitly downgrades the
+    current label/class. It uses only the project label names, not built-in
+    domain synonyms.
+    """
+    current_norm = _class_analysis_qwen_review_normalize_label(current_class)
+    suggested_norm = _class_analysis_qwen_review_normalize_label(suggested_class)
+    text = _class_analysis_qwen_review_text_block(payload).strip().lower()
+    if not text or not current_norm or not suggested_norm:
+        return False
+    current_label = re.escape(str(current_class).strip().lower())
+    suggested_label = re.escape(str(suggested_class).strip().lower())
+    suggested_spaced = re.escape(re.sub(r"(?<=[a-z])(?=[A-Z])", " ", str(suggested_class)).replace("_", " ").replace("-", " ").lower())
+    current_downgraded = any(
+        re.search(pattern, text)
+        for pattern in (
+            rf"\bcurrent\s+(?:{current_label}\s+)?(?:label|class)\b[^.?!]{{0,120}}\b(?:broad|weak|incorrect|wrong|mismatched|less\s+plausible)\b",
+            rf"\b{current_label}\s+(?:label|class)\b[^.?!]{{0,120}}\b(?:broad|weak|incorrect|wrong|mismatched|less\s+plausible)\b",
+            rf"\bcurrent\s+{current_label}\b[^.?!]{{0,120}}\b(?:broad|weak|incorrect|wrong|mismatched|less\s+plausible)\b",
+        )
+    )
+    parenthetical_disambiguation = bool(
+        re.search(
+            rf"\b(?:target|object|crop|target\s+crop)\b[^.?!]{{0,120}}\b{current_label}\b\s*\([^)]*(?:{suggested_label}|{suggested_spaced})[^)]*\)",
+            text,
+        )
+    )
+    if not current_downgraded:
+        return parenthetical_disambiguation
+    target_supports_suggested = any(
+        re.search(pattern, text)
+        for pattern in (
+            rf"\b(?:target|object|crop|target\s+crop)\b[^.?!]{{0,180}}\b(?:fit|fits|fitting|match|matches|matching|support|supports|supporting)\b[^.?!]{{0,80}}\b(?:{suggested_label}|{suggested_spaced})\b",
+            rf"\b(?:fit|fits|fitting|match|matches|matching|support|supports|supporting)\b[^.?!]{{0,80}}\b(?:{suggested_label}|{suggested_spaced})\b[^.?!]{{0,120}}\b(?:target|object|crop|target\s+crop)\b",
+            rf"\b(?:target|object|crop|target\s+crop)\b[^.?!]{{0,160}}\b(?:{suggested_label}|{suggested_spaced})\b[^.?!]{{0,120}}\b(?:features|class|label)\b",
+            rf"\b(?:target|object|crop|target\s+crop)\b[^.?!]{{0,180}}\([^)]*(?:{suggested_label}|{suggested_spaced})[^)]*\)",
+        )
+    )
+    return bool(target_supports_suggested)
+
+
+def _class_analysis_qwen_review_text_conflicts_with_accept_suggested(
+    *,
+    current_class: str,
+    suggested_class: str,
+    payload: Dict[str, Any],
+    labelmap: Sequence[str] = (),
+    labelmap_glossary: str = "",
+) -> Optional[str]:
+    """Block relabels contradicted by the model's own visible-fact text."""
+    current_norm = _class_analysis_qwen_review_normalize_label(current_class)
+    suggested_norm = _class_analysis_qwen_review_normalize_label(suggested_class)
+    if not current_norm or not suggested_norm or current_norm == suggested_norm:
+        return None
+    text = _class_analysis_qwen_review_text_block(payload)
+    if not text.strip():
+        return None
+    text_lower = text.lower()
+    compact_text = _class_analysis_qwen_review_normalize_label(text)
+    semantic_rejection = _class_analysis_qwen_review_text_rejects_semantic_aliases(
+        _class_analysis_qwen_review_semantic_aliases_for_label(
+            suggested_class,
+            labelmap=labelmap,
+            labelmap_glossary=labelmap_glossary,
+        ),
+        payload,
+    )
+    if semantic_rejection:
+        return (
+            "accept_suggested conflicts with model text rejecting "
+            f"suggested-class cue `{semantic_rejection}`"
+        )
+    if suggested_norm in compact_text:
+        suggested_patterns = [
+            rf"\bnot\s+(?:a|an|the)?\s*{re.escape(str(suggested_class).strip().lower())}\b",
+            rf"\bnot\s+(?:a|an|the)?\s*{re.escape(str(suggested_class).strip().lower().replace('_', ' '))}\b",
+            rf"\bcontradict(?:s|ing)?\s+(?:the\s+)?{re.escape(str(suggested_class).strip().lower())}\s+(?:suggestion|label|class)\b",
+        ]
+        for pattern in suggested_patterns:
+            if re.search(pattern, text_lower):
+                return f"accept_suggested conflicts with model text rejecting suggested class {suggested_class}"
+    explicit_current_support_patterns = [
+        rf"\b(?:could|may|might|would)\s+(?:justify|support|fit|explain)\s+(?:the\s+)?{re.escape(str(current_class).strip().lower())}\s+(?:label|class)\b",
+        rf"\b{re.escape(str(current_class).strip().lower())}\s+(?:label|class)\s+(?:is|remains|could\s+be|may\s+be|might\s+be)\s+(?:valid|plausible|supported|justified)\b",
+        rf"\bcurrent\s+(?:class|label)\s+{re.escape(str(current_class).strip().lower())}\b[^.?!]{{0,120}}\b(?:is|remains|could\s+be|may\s+be|might\s+be)\s+(?:valid|plausible|supported|justified)\b",
+        rf"\bcurrent\s+(?:class|label)\b[^.?!]{{0,80}}\b{re.escape(str(current_class).strip().lower())}\b[^.?!]{{0,80}}\b(?:valid|plausible|supported|justified)\b",
+    ]
+    for pattern in explicit_current_support_patterns:
+        if re.search(pattern, text_lower):
+            return f"accept_suggested conflicts with model text supporting current class {current_class}"
+    if _class_analysis_qwen_review_text_allows_adjacent_accept(
+        current_class=current_class,
+        suggested_class=suggested_class,
+        payload=payload,
+    ):
+        return None
+    if _class_analysis_qwen_review_text_rejects_label_for_target(label=current_class, payload=payload):
+        return None
+    target_current_support_patterns = [
+        rf"\b(?:target|object|crop|target\s+crop)\b[^.;?!]{{0,80}}\b(?:clearly|visibly|obviously|unambiguously)\b[^.;?!]{{0,80}}\b(?:shows|is|appears|looks)\b[^.;,?!]{{0,80}}\b{re.escape(str(current_class).strip().lower())}\b",
+        rf"\b(?:target|object|crop|target\s+crop)\b[^.;?!]{{0,80}}\b(?:shows|is|appears|looks)\b[^.;?!]{{0,80}}\b(?:clearly|visibly|obviously|unambiguously)\b[^.;,?!]{{0,80}}\b{re.escape(str(current_class).strip().lower())}\b",
+    ]
+    for pattern in target_current_support_patterns:
+        if re.search(pattern, text_lower):
+            return f"accept_suggested conflicts with model text supporting current class {current_class}"
+    if _class_analysis_qwen_review_text_directly_supports_label(label=current_class, payload=payload):
+        return f"accept_suggested conflicts with visible target text supporting current class {current_class}"
+    return None
+
+
+def _class_analysis_qwen_review_text_rebuts_overlap_contamination(
+    payload: Dict[str, Any],
+    *,
+    target_class: str = "",
+    labelmap: Sequence[str] = (),
+    labelmap_glossary: str = "",
+) -> bool:
+    """Detect explicit model text saying overlap does not explain the target features."""
+    text_lower = _class_analysis_qwen_review_text_block(payload).lower()
+    if not text_lower:
+        return False
+    rebuttal_patterns: List[str] = [
+        r"\boverlap(?:ping)?\b[^.?!]{0,180}\b(?:does\s+not|doesn't|do\s+not|not)\b[^.?!]{0,180}\b(?:explain|account\s+for)\b[^.?!]{0,180}\b(?:target|object|own|features?)\b",
+        r"\boverlap(?:ping)?\b[^.?!]{0,180}\b(?:does\s+not|doesn't|do\s+not|not)\b[^.?!]{0,180}\b(?:explain|account\s+for)\b[^.?!]{0,180}\btarget[-\s]?contained\b",
+        r"\b(?:target|object)\b[^.?!]{0,180}\b(?:own|intrinsic|visible)\b[^.?!]{0,180}\bfeatures?\b[^.?!]{0,180}\b(?:not|do\s+not|does\s+not|doesn't)\b[^.?!]{0,180}\b(?:explained|caused|accounted\s+for)\b[^.?!]{0,180}\boverlap\b",
+        r"\boverlap\b[^.?!]{0,80}\b(?:minor|minimal|small|low|weak|slight)\b",
+        r"\b(?:minor|minimal|small|low|weak|slight)\b[^.?!]{0,80}\boverlap\b",
+        r"\boverlapping\b[^.?!]{0,180}\b(?:adjacent|nearby|separate)\b[^.?!]{0,120}\b(?:not|not\s+the|not\s+part\s+of)\b[^.?!]{0,80}\b(?:target|object|itself)\b",
+        r"\boverlapping\b[^.?!]{0,180}\b(?:are|is)\b[^.?!]{0,80}\b(?:adjacent|nearby|separate)\b[^.?!]{0,120}\b(?:not|rather\s+than)\b[^.?!]{0,80}\b(?:target|object|itself)\b",
+        r"\boverlap\b[^.?!]{0,120}\bbackground\b[^.?!]{0,120}\bnot\b[^.?!]{0,80}\b(?:target|object|primary|main)\b",
+        r"\b(?:minor|small)\s+background\s+(?:element|object|structure)\b",
+        r"\b(?:background|minor)\b[^.?!]{0,80}\b(?:element|object|structure)\b[^.?!]{0,80}\b(?:not|rather\s+than|instead\s+of)\b[^.?!]{0,80}\b(?:target|primary|main)\b",
+        r"\bnot\s+(?:merely\s+)?(?:an?\s+)?(?:artifact|artifacts?)\s+of\s+(?:the\s+)?(?:partial\s+)?overlap\b",
+        r"\b(?:partial\s+)?(?:overlap|contamination)\s+(?:does\s+not|doesn't)\s+(?:obscure|explain|account\s+for)\b",
+        r"\b(?:target|target\s+pixels?)\s+(?:clearly\s+)?show(?:s)?\b[^.?!]{0,180}\b(?:distinct|intrinsic|primary|structural|defining)\b",
+        r"\b(?:intrinsic|primary|defining|target-contained|target-specific)\b[^.?!]{0,180}\b(?:target|object|geometry|surface|features?|cues?)\b",
+        r"\b(?:visually|structurally)\s+distinct\s+from\s+(?:the\s+)?(?:partial\s+)?(?:overlap|contamination|background|nearby|adjacent)\b",
+    ]
+    target_aliases = _class_analysis_qwen_review_semantic_aliases_for_label(
+        target_class,
+        labelmap=labelmap,
+        labelmap_glossary=labelmap_glossary,
+    )
+    alias_patterns = [
+        re.escape(alias).replace(r"\ ", r"\s+")
+        for alias in target_aliases
+        if str(alias or "").strip()
+    ]
+    if alias_patterns:
+        alias_expr = "|".join(alias_patterns[:8])
+        rebuttal_patterns.append(
+            rf"\boverlap\b[^.?!]{{0,120}}\bbackground\b[^.?!]{{0,120}}\bnot\b[^.?!]{{0,80}}\b(?:{alias_expr})s?\b"
+        )
+    return any(re.search(pattern, text_lower) for pattern in rebuttal_patterns)
+
+
+def _class_analysis_qwen_review_coerce_bool(value: Any, default: bool = False) -> bool:
+    if isinstance(value, bool):
+        return value
+    if isinstance(value, (int, float)):
+        if not math.isfinite(float(value)):
+            return default
+        return bool(value)
+    text = str(value or "").strip().lower()
+    if text in {"1", "true", "yes", "y", "on"}:
+        return True
+    if text in {"0", "false", "no", "n", "off"}:
+        return False
+    return default
+
+
+def _class_analysis_qwen_review_normalize_visible_cues(
+    value: Any,
+    *,
+    current_class: str = "",
+    suggested_class: str = "",
+    target_class: str = "",
+) -> List[str]:
+    """Normalize model-emitted visible target cues without dataset-specific terms."""
+
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    elif value is None:
+        raw_items = []
+    else:
+        raw_text = str(value or "").strip()
+        raw_items = re.split(r"[;\n|]+", raw_text) if raw_text else []
+
+    class_terms = {
+        _class_analysis_qwen_review_normalize_label(item)
+        for item in (current_class, suggested_class, target_class)
+        if str(item or "").strip()
+    }
+    generic_terms = {
+        _class_analysis_qwen_review_normalize_label(item)
+        for item in (
+            "matches class",
+            "matches target class",
+            "matches suggested class",
+            "fits class",
+            "fits target class",
+            "fits suggested class",
+            "target is clear",
+            "clear target",
+            "visible target",
+            "visible object",
+            "object visible",
+            "same as anchors",
+            "looks like class",
+            "class specific cues",
+            "class-specific cues",
+        )
+    }
+    boilerplate_tokens = (
+        "target",
+        "object",
+        "class",
+        "specific",
+        "cue",
+        "cues",
+        "visible",
+        "clear",
+        "matches",
+        "match",
+        "fits",
+        "fit",
+        "suggested",
+        "current",
+        "candidate",
+    )
+    context_only_tokens = {
+        "aerial",
+        "adjacent",
+        "area",
+        "background",
+        "beside",
+        "clear",
+        "context",
+        "crop",
+        "down",
+        "ground",
+        "image",
+        "inside",
+        "located",
+        "location",
+        "multiple",
+        "near",
+        "nearby",
+        "on",
+        "outside",
+        "overhead",
+        "parked",
+        "partial",
+        "pavement",
+        "perspective",
+        "region",
+        "road",
+        "scene",
+        "shadow",
+        "shadows",
+        "sitting",
+        "standing",
+        "top",
+        "view",
+        "visible",
+        "water",
+    }
+    color_or_lighting_tokens = {
+        "black",
+        "blue",
+        "bright",
+        "brown",
+        "color",
+        "colors",
+        "colored",
+        "colour",
+        "colours",
+        "coloured",
+        "dark",
+        "gray",
+        "green",
+        "grey",
+        "highlight",
+        "highlights",
+        "light",
+        "orange",
+        "purple",
+        "red",
+        "shadow",
+        "shadows",
+        "specular",
+        "white",
+        "yellow",
+    }
+    abstract_visual_tokens = {
+        "boundary",
+        "detail",
+        "details",
+        "geometry",
+        "outline",
+        "pattern",
+        "shape",
+        "surface",
+        "texture",
+    }
+    connector_tokens = {"a", "an", "and", "at", "by", "from", "in", "of", "the", "to", "with"}
+
+    def _context_only_cue(text_value: str) -> bool:
+        lowered = str(text_value or "").strip().lower()
+        if not lowered:
+            return True
+        if re.search(r"\b(?:no|not|without|lacks?|missing|absent|does\s+not|doesn't)\b", lowered):
+            return True
+        if (
+            re.search(r"\b(?:adjacent|beside|between|nearby|next\s+to|surrounding|surrounded\s+by)\b", lowered)
+            and not re.search(r"\b(?:attached|connected|touching|mounted|joined|linked)\b", lowered)
+        ):
+            return True
+        if re.search(
+            r"\b(?:flat|open|empty|bright|dark|gray|grey|green|brown)?\s*"
+            r"(?:ground|pavement|road|water|background|scene|shadow|shadows)\s+"
+            r"(?:surface|area|region|texture|context)\b",
+            lowered,
+        ):
+            return True
+        if re.search(
+            r"\b(?:surface|area|region|texture|context)\s+"
+            r"(?:of|on|from)?\s*"
+            r"(?:ground|pavement|road|water|background|scene|shadow|shadows)\b",
+            lowered,
+        ):
+            return True
+        tokens = [
+            token
+            for token in re.findall(r"[a-z0-9]+", lowered)
+            if token not in connector_tokens and token not in boilerplate_tokens
+        ]
+        if not tokens:
+            return True
+        if all(token in context_only_tokens for token in tokens):
+            return True
+        if (
+            re.search(r"\b(?:top[-\s]?down|overhead|aerial)\b", lowered)
+            and len([token for token in tokens if token not in context_only_tokens]) == 0
+        ):
+            return True
+        if re.search(
+            r"\b(?:top[-\s]?down|overhead|aerial|parked|color|colors|colou?r(?:ed)?|multiple)\b",
+            lowered,
+        ) and all(token in context_only_tokens or token in color_or_lighting_tokens for token in tokens):
+            return True
+        informative_tokens = [
+            token
+            for token in tokens
+            if token not in context_only_tokens
+            and token not in color_or_lighting_tokens
+            and len(token) >= 3
+        ]
+        # Keep this domain-agnostic: the model must supply concrete target-pixel
+        # descriptors, but class/object vocabulary itself comes from the labelmap,
+        # glossary, and generated concept briefs rather than committed word lists.
+        if not informative_tokens:
+            return True
+        if len(informative_tokens) == 1 and informative_tokens[0] in abstract_visual_tokens:
+            return True
+        return False
+
+    cues: List[str] = []
+    seen: Set[str] = set()
+    for raw_item in raw_items:
+        text = re.sub(r"\s+", " ", str(raw_item or "")).strip(" .,:;-")
+        if not text:
+            continue
+        text = text[:140]
+        norm = _class_analysis_qwen_review_normalize_label(text)
+        if not norm or norm in seen:
+            continue
+        if norm in class_terms or norm in generic_terms:
+            continue
+        if not re.search(r"[a-zA-Z]", text):
+            continue
+        if _context_only_cue(text):
+            continue
+        stripped_norm = norm
+        for class_term in class_terms:
+            if class_term:
+                stripped_norm = stripped_norm.replace(class_term, "")
+        for token in boilerplate_tokens:
+            stripped_norm = re.sub(rf"\b{re.escape(token)}\b", "", stripped_norm)
+        if len(stripped_norm.strip()) < 3:
+            continue
+        cues.append(text)
+        seen.add(norm)
+        if len(cues) >= 6:
+            break
+    return cues
+
+
+def _class_analysis_qwen_review_visible_cues_from_payload(
+    payload: Dict[str, Any],
+    *,
+    current_class: str = "",
+    suggested_class: str = "",
+    target_class: str = "",
+) -> List[str]:
+    cue_field_present = False
+    raw_value: Any = None
+    for field_name in ("visible_target_cues", "target_observations", "visible_cues"):
+        if payload.get(field_name) is not None:
+            cue_field_present = True
+            raw_value = payload.get(field_name)
+            break
+    if cue_field_present:
+        return _class_analysis_qwen_review_normalize_visible_cues(
+            raw_value,
+            current_class=current_class,
+            suggested_class=suggested_class,
+            target_class=target_class,
+        )
+    fallback_text = " ".join(
+        str(payload.get(key) or "")
+        for key in ("rationale_short", "rationale", "reason")
+        if str(payload.get(key) or "").strip()
+    )
+    if not fallback_text:
+        return []
+    fragments = re.split(r"[.;\n|,]+|\band\b|\bwith\b|\bbut\b", fallback_text)
+    return _class_analysis_qwen_review_normalize_visible_cues(
+        fragments,
+        current_class=current_class,
+        suggested_class=suggested_class,
+        target_class=target_class,
+    )
+
+
+def _class_analysis_qwen_review_normalize_contrast_cues(
+    value: Any,
+    *,
+    current_class: str = "",
+    target_class: str = "",
+    limit: int = 6,
+) -> List[str]:
+    """Normalize verifier-emitted missing/inconsistent current-class cues.
+
+    These are allowed to be negative statements, unlike visible positive cues.
+    The filter is deliberately dataset-agnostic: class meaning comes from the
+    labelmap, glossary, and concept briefs, while this code only rejects empty
+    or boilerplate text.
+    """
+
+    if isinstance(value, (list, tuple)):
+        raw_items = list(value)
+    elif value is None:
+        raw_items = []
+    else:
+        raw_text = str(value or "").strip()
+        raw_items = re.split(r"[;\n|]+", raw_text) if raw_text else []
+    class_terms = {
+        _class_analysis_qwen_review_normalize_label(item)
+        for item in (current_class, target_class)
+        if str(item or "").strip()
+    }
+    boilerplate_norms = {
+        _class_analysis_qwen_review_normalize_label(item)
+        for item in (
+            "not current class",
+            "does not match current class",
+            "missing current class cues",
+            "no current class cues",
+            "current class absent",
+            "not plausible",
+            "weak evidence",
+            "target class cues",
+            "matches target class",
+        )
+    }
+    cues: List[str] = []
+    seen: Set[str] = set()
+    for raw_item in raw_items:
+        text = re.sub(r"\s+", " ", str(raw_item or "")).strip(" .,:;-")
+        if not text:
+            continue
+        text = text[:160]
+        norm = _class_analysis_qwen_review_normalize_label(text)
+        if not norm or norm in seen or norm in boilerplate_norms:
+            continue
+        if norm in class_terms:
+            continue
+        if not re.search(r"[a-zA-Z]", text):
+            continue
+        lowered = text.lower()
+        if re.search(
+            r"\b(?:absence|absent|lack|lacking|lacks|missing|no|not|without)\b"
+            r"[^.?!]{0,80}\b(?:background|context|environment|ground|marine|nearby|pavement|road|scene|surroundings?|water)\b",
+            lowered,
+        ):
+            continue
+        if re.search(
+            r"\b(?:background|context|environment|ground|nearby|pavement|road|scene|surroundings?|water)\b"
+            r"[^.?!]{0,80}\b(?:absent|missing|not|without)\b",
+            lowered,
+        ):
+            continue
+        stripped_norm = norm
+        for class_term in class_terms:
+            if class_term:
+                stripped_norm = stripped_norm.replace(class_term, "")
+        stripped_norm = re.sub(
+            r"\b(?:current|target|class|cue|cues|missing|absent|none|no|not|without|lacks?|weak|evidence|object|visible)\b",
+            "",
+            stripped_norm,
+        )
+        if len(stripped_norm.strip()) < 3:
+            continue
+        cues.append(text)
+        seen.add(norm)
+        if len(cues) >= max(1, limit):
+            break
+    return cues
+
+
+def _class_analysis_qwen_review_split_independent_current_cues(
+    *,
+    target_cues: Sequence[str],
+    current_cues: Sequence[str],
+) -> Tuple[List[str], List[str]]:
+    """Separate independent current-class cues from cues already claimed for target.
+
+    This deliberately uses only lexical overlap between model-emitted cue text.
+    It is a domain-generic consistency check: if Qwen lists the same target-pixel
+    property as evidence for both classes, that property is shared/ambiguous and
+    cannot independently block or support a relabel recommendation.
+    """
+
+    def _tokens(text_value: str) -> Set[str]:
+        tokens = set(re.findall(r"[a-z0-9]+", str(text_value or "").lower()))
+        stop = {
+            "a",
+            "an",
+            "and",
+            "as",
+            "at",
+            "by",
+            "for",
+            "from",
+            "in",
+            "inside",
+            "of",
+            "on",
+            "the",
+            "to",
+            "with",
+            "target",
+            "object",
+            "visible",
+            "class",
+            "cue",
+            "cues",
+            "shape",
+            "structure",
+            "surface",
+            "texture",
+        }
+        return {token for token in tokens if len(token) >= 3 and token not in stop}
+
+    target_token_sets = [_tokens(cue) for cue in target_cues if str(cue or "").strip()]
+    independent: List[str] = []
+    shared: List[str] = []
+    for cue in current_cues:
+        text = str(cue or "").strip()
+        if not text:
+            continue
+        cue_tokens = _tokens(text)
+        is_shared = False
+        if cue_tokens and target_token_sets:
+            for target_tokens in target_token_sets:
+                if not target_tokens:
+                    continue
+                intersection = cue_tokens.intersection(target_tokens)
+                union = cue_tokens.union(target_tokens)
+                overlap = len(intersection) / max(1, min(len(cue_tokens), len(target_tokens)))
+                jaccard = len(intersection) / max(1, len(union))
+                if overlap >= 0.80 or jaccard >= 0.62:
+                    is_shared = True
+                    break
+        if is_shared:
+            shared.append(text)
+        else:
+            independent.append(text)
+    return independent, shared
+
+
+def _class_analysis_qwen_review_normalize_evidence_id_list(
+    raw_value: Any,
+    *,
+    allowed_ids: Optional[Set[str]] = None,
+    limit: int = 12,
+) -> List[str]:
+    """Normalize model-cited evidence ids while preserving first-seen order."""
+
+    if raw_value is None:
+        return []
+    if isinstance(raw_value, str):
+        raw_items: Iterable[Any] = re.split(r"[,;\s]+", raw_value)
+    elif isinstance(raw_value, (list, tuple, set)):
+        raw_items = raw_value
+    else:
+        raw_items = [raw_value]
+    allowed = {str(item or "").strip() for item in (allowed_ids or set()) if str(item or "").strip()}
+    normalized: List[str] = []
+    seen: Set[str] = set()
+    for raw_item in raw_items:
+        text = str(raw_item or "").strip()
+        if not text or text in seen:
+            continue
+        if allowed and text not in allowed:
+            continue
+        normalized.append(text)
+        seen.add(text)
+        if len(normalized) >= max(1, limit):
+            break
+    return normalized
+
+
+def _class_analysis_qwen_review_coerce_choice(
+    value: Any,
+    allowed: Sequence[str],
+    default: str,
+    *,
+    synonyms: Optional[Dict[str, str]] = None,
+) -> str:
+    allowed_set = {str(item) for item in allowed}
+    text = str(value or "").strip().lower().replace("-", "_").replace(" ", "_")
+    if text in allowed_set:
+        return text
+    if synonyms:
+        if text in synonyms:
+            return synonyms[text]
+        raw_text = str(value or "").strip().lower()
+        for marker, replacement in synonyms.items():
+            if marker and marker in raw_text:
+                return replacement
+    if isinstance(value, (int, float)) and math.isfinite(float(value)):
+        score = float(value)
+        if score >= 0.75 and "strong" in allowed_set:
+            return "strong"
+        if score >= 0.45 and "moderate" in allowed_set:
+            return "moderate"
+        if score > 0.05 and "weak" in allowed_set:
+            return "weak"
+        if "none" in allowed_set:
+            return "none"
+    return default
+
+
+def _class_analysis_qwen_review_rank_evidence(level: str) -> int:
+    return {"none": 0, "weak": 1, "moderate": 2, "strong": 3}.get(str(level or "").strip().lower(), 0)
+
+
+def _class_analysis_qwen_review_max_evidence(*levels: str) -> str:
+    ranked = sorted(
+        (_class_analysis_qwen_review_coerce_choice(level, CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS, "none") for level in levels),
+        key=_class_analysis_qwen_review_rank_evidence,
+        reverse=True,
+    )
+    return ranked[0] if ranked else "none"
+
+
+def _class_analysis_qwen_review_deterministic_signal(
+    deterministic_context: Optional[Dict[str, Any]],
+    key: str,
+) -> str:
+    context = deterministic_context if isinstance(deterministic_context, dict) else {}
+    entry = context.get(key) if isinstance(context.get(key), dict) else {}
+    signal = str(entry.get("signal") or "").strip().lower()
+    if signal in CLASS_ANALYSIS_QWEN_REVIEW_DETERMINISTIC_CONTEXT_LEVELS:
+        return signal
+    return "not_applicable"
+
+
+def _class_analysis_qwen_review_decision_default_evidence(
+    decision: str,
+    *,
+    field: str,
+) -> str:
+    if decision == "confirm_current":
+        return "strong" if field in {"current_evidence", "target_evidence"} else "weak"
+    if decision == "accept_suggested":
+        return "strong" if field in {"suggested_evidence", "target_evidence"} else "weak"
+    if decision == "change_to_other":
+        return "strong" if field == "target_evidence" else "weak"
+    return "moderate" if field == "target_evidence" else "weak"
+
+
+def _class_analysis_qwen_review_expand_compact_final(
+    payload: Dict[str, Any],
+    *,
+    point: Dict[str, Any],
+    evidence_ids: Set[str],
+    visual_quality: Optional[Dict[str, Any]],
+    executed_tools: Set[str],
+    labelmap_glossary: str = "",
+    review_guidance: str = "",
+    deterministic_context: Optional[Dict[str, Any]] = None,
+    evidence_ledger: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    """Expand the model's compact final call into the full validator payload.
+
+    The model is intentionally not asked to maintain controller/audit book-
+    keeping. This follows the OpenClaw/Hermes-style split used elsewhere in the
+    flow: the model chooses a small semantic action; the controller records
+    evidence provenance and normalizes guardrail fields.
+    """
+    args = dict(payload or {})
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    raw_target_class = (
+        str(
+            args.get("final_class")
+            or args.get("recommended_class")
+            or args.get("target_class")
+            or args.get("target")
+            or args.get("class")
+            or args.get("uncertain_class")
+            or args.get("candidate_class")
+            or ""
+        ).strip()
+    )
+    decision = _class_analysis_qwen_review_coerce_choice(
+        args.get("decision"),
+        ("confirm_current", "accept_suggested", "change_to_other", "skip_uncertain"),
+        "skip_uncertain",
+    )
+    target_class = raw_target_class
+    if decision == "change_to_other" and suggested_class and raw_target_class == suggested_class:
+        decision = "accept_suggested"
+    if decision == "confirm_current":
+        target_class = current_class
+    elif decision == "accept_suggested":
+        target_class = suggested_class
+    elif decision == "skip_uncertain":
+        target_class = (
+            target_class
+            or str(args.get("target") or "").strip()
+            or current_class
+        )
+    backend_tier = str((visual_quality or {}).get("tier") or "").strip().lower()
+    visual_quality_value = _class_analysis_qwen_review_coerce_choice(
+        args.get("visual_quality") if args.get("visual_quality") is not None else args.get("quality"),
+        CLASS_ANALYSIS_QWEN_REVIEW_QUALITY_LEVELS,
+        backend_tier if backend_tier in CLASS_ANALYSIS_QWEN_REVIEW_QUALITY_LEVELS else "poor",
+    )
+    object_visibility = _class_analysis_qwen_review_coerce_choice(
+        args.get("object_visibility")
+        if args.get("object_visibility") is not None
+        else args.get("visibility")
+        if args.get("visibility") is not None
+        else args.get("object")
+        if args.get("object") is not None
+        else args.get("limited_visibility"),
+        CLASS_ANALYSIS_QWEN_REVIEW_VISIBILITY_LEVELS,
+        "clear" if visual_quality_value == "clear" else "partial" if visual_quality_value == "limited" else "tiny_or_blurry",
+        synonyms={
+            "tiny": "tiny_or_blurry",
+            "blurry": "tiny_or_blurry",
+            "not visible": "not_visible",
+            "not_visible": "not_visible",
+        },
+    )
+    current_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("current_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        _class_analysis_qwen_review_decision_default_evidence(decision, field="current_evidence"),
+    )
+    suggested_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("suggested_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        _class_analysis_qwen_review_decision_default_evidence(decision, field="suggested_evidence"),
+    )
+    target_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("target_evidence") if args.get("target_evidence") is not None else args.get("target_class_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        _class_analysis_qwen_review_decision_default_evidence(decision, field="target_evidence"),
+    )
+    overlap_assessment = _class_analysis_qwen_review_coerce_choice(
+        args.get("overlap_assessment") if args.get("overlap_assessment") is not None else args.get("overlap"),
+        CLASS_ANALYSIS_QWEN_REVIEW_OVERLAP_LEVELS,
+        "unclear",
+        synonyms={
+            "no_material_overlap": "none",
+            "no material overlap": "none",
+            "no_overlap": "none",
+            "none": "none",
+            "partial": "partial_contamination",
+            "contamination": "partial_contamination",
+            "duplicate": "duplicate_like",
+            "high_overlap": "duplicate_like",
+            "high overlap": "duplicate_like",
+            "near_identical": "duplicate_like",
+            "near identical": "duplicate_like",
+            "contains_other": "target_contains_other",
+            "other_contains": "other_contains_target",
+            "near": "near_context",
+            "weak": "none",
+            "clear": "none",
+        },
+    )
+    overlap_explains = _class_analysis_qwen_review_coerce_bool(
+        args.get("overlap_explains_candidate_similarity")
+        if args.get("overlap_explains_candidate_similarity") is not None
+        else args.get("overlap_explains_candidate")
+        if args.get("overlap_explains_candidate") is not None
+        else args.get("overlap_plains"),
+        default=False,
+    )
+    if "overlap_explanation" in args and "no" in str(args.get("overlap_explanation") or "").strip().lower():
+        overlap_explains = False
+    dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point, evidence_ledger)
+    dual_bbox_resolution = _class_analysis_qwen_review_coerce_choice(
+        args.get("dual_bbox_resolution")
+        if args.get("dual_bbox_resolution") is not None
+        else args.get("dual_box_resolution")
+        if args.get("dual_box_resolution") is not None
+        else args.get("overlap_resolution"),
+        CLASS_ANALYSIS_QWEN_REVIEW_DUAL_BBOX_RESOLUTIONS,
+        "not_applicable",
+        synonyms={
+            "current": "current_box_class",
+            "current_class": "current_box_class",
+            "keep_current": "current_box_class",
+            "overlap": "overlap_box_class",
+            "other": "overlap_box_class",
+            "other_class": "overlap_box_class",
+            "suggested": "overlap_box_class",
+            "both": "both_valid_overlapping_objects",
+            "both_valid": "both_valid_overlapping_objects",
+            "both valid": "both_valid_overlapping_objects",
+            "valid_overlap": "both_valid_overlapping_objects",
+            "uncertain": "uncertain_or_neither",
+            "neither": "uncertain_or_neither",
+            "skip": "uncertain_or_neither",
+            "n/a": "not_applicable",
+            "not applicable": "not_applicable",
+        },
+    )
+    if dual_bbox_conflict:
+        dual_other_class = _class_analysis_qwen_review_dual_bbox_other_class(dual_bbox_conflict)
+        target_norm_for_dual = _class_analysis_qwen_review_normalize_label(target_class)
+        current_norm_for_dual = _class_analysis_qwen_review_normalize_label(current_class)
+        other_norm_for_dual = _class_analysis_qwen_review_normalize_label(dual_other_class)
+        if dual_bbox_resolution == "not_applicable":
+            if decision == "confirm_current":
+                dual_bbox_resolution = "current_box_class"
+            elif decision in {"accept_suggested", "change_to_other"} and target_norm_for_dual == other_norm_for_dual:
+                dual_bbox_resolution = "overlap_box_class"
+            elif decision == "skip_uncertain":
+                dual_bbox_resolution = "uncertain_or_neither"
+        elif (
+            dual_bbox_resolution == "both_valid_overlapping_objects"
+            and decision in {"accept_suggested", "change_to_other"}
+            and target_norm_for_dual == other_norm_for_dual
+            and current_evidence in {"weak", "none"}
+            and target_evidence == "strong"
+        ):
+            # Compact VLM outputs sometimes say "both valid" while their
+            # decision/rationale explicitly picks the near-identical overlap
+            # box class. Preserve the model's semantic choice; the validator
+            # still blocks unsafe overlap/background cases below.
+            dual_bbox_resolution = "overlap_box_class"
+        if dual_bbox_resolution == "current_box_class" and decision == "skip_uncertain" and current_norm_for_dual:
+            target_class = current_class
+        elif dual_bbox_resolution == "overlap_box_class" and dual_other_class and target_norm_for_dual in {"", current_norm_for_dual}:
+            target_class = dual_other_class
+            if _class_analysis_qwen_review_normalize_label(suggested_class) == other_norm_for_dual:
+                decision = "accept_suggested"
+            elif decision != "accept_suggested":
+                decision = "change_to_other"
+        elif dual_bbox_resolution in {"both_valid_overlapping_objects", "uncertain_or_neither"} and decision != "skip_uncertain":
+            decision = "skip_uncertain"
+            target_class = current_class
+            target_evidence = _class_analysis_qwen_review_max_evidence(target_evidence, "moderate")
+    else:
+        dual_bbox_resolution = "not_applicable"
+    local_consensus_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("local_consensus_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_LOCAL_CONSENSUS_LEVELS,
+        "mixed" if "inspect_local_consensus_context" in executed_tools else "not_applicable",
+    )
+    if "inspect_local_consensus_context" not in executed_tools:
+        local_consensus_evidence = "not_applicable"
+
+    anchor_evidence_current = _class_analysis_qwen_review_coerce_choice(
+        args.get("anchor_evidence_current"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        "moderate" if current_evidence in {"strong", "moderate"} else "weak",
+    )
+    anchor_evidence_suggested = _class_analysis_qwen_review_coerce_choice(
+        args.get("anchor_evidence_suggested"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        "moderate" if suggested_evidence in {"strong", "moderate"} else "weak",
+    )
+    local_context_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("local_context_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        target_evidence,
+    )
+    global_context_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("global_context_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_EVIDENCE_LEVELS,
+        _class_analysis_qwen_review_max_evidence(current_evidence, suggested_evidence, target_evidence),
+    )
+    scale_context_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "scale")
+    embedding_context_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "embedding")
+    same_image_scale_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("same_image_scale_evidence")
+        if args.get("same_image_scale_evidence") is not None
+        else args.get("scale_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_DETERMINISTIC_CONTEXT_LEVELS,
+        scale_context_signal,
+        synonyms={
+            "supports": "supports_current",
+            "support_current": "supports_current",
+            "supports current": "supports_current",
+            "questions": "questions_current",
+            "questions current": "questions_current",
+            "outlier": "questions_current",
+            "mismatch": "questions_current",
+            "insufficient": "insufficient",
+            "not applicable": "not_applicable",
+            "n/a": "not_applicable",
+        },
+    )
+    same_image_embedding_evidence = _class_analysis_qwen_review_coerce_choice(
+        args.get("same_image_embedding_evidence")
+        if args.get("same_image_embedding_evidence") is not None
+        else args.get("embedding_evidence"),
+        CLASS_ANALYSIS_QWEN_REVIEW_DETERMINISTIC_CONTEXT_LEVELS,
+        embedding_context_signal,
+        synonyms={
+            "supports": "supports_current",
+            "support_current": "supports_current",
+            "supports current": "supports_current",
+            "questions": "questions_current",
+            "questions current": "questions_current",
+            "outlier": "questions_current",
+            "mismatch": "questions_current",
+            "insufficient": "insufficient",
+            "not applicable": "not_applicable",
+            "n/a": "not_applicable",
+        },
+    )
+    if scale_context_signal != "not_applicable":
+        same_image_scale_evidence = scale_context_signal
+    if embedding_context_signal != "not_applicable":
+        same_image_embedding_evidence = embedding_context_signal
+    specificity_alignment = _class_analysis_qwen_review_coerce_choice(
+        args.get("specificity_alignment")
+        if args.get("specificity_alignment") is not None
+        else args.get("target_specificity_alignment")
+        if args.get("target_specificity_alignment") is not None
+        else args.get("target_vs_background_alignment"),
+        CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS,
+        "insufficient",
+        synonyms={
+            "current": "supports_current",
+            "current_class": "supports_current",
+            "supports current": "supports_current",
+            "suggested": "supports_suggested",
+            "suggested_class": "supports_suggested",
+            "target_suggested": "supports_suggested",
+            "supports suggested": "supports_suggested",
+            "other": "supports_other",
+            "third_class": "supports_other",
+            "supports other": "supports_other",
+            "mixed": "mixed",
+            "ambiguous": "mixed",
+            "insufficient": "insufficient",
+            "none": "insufficient",
+            "not applicable": "not_applicable",
+            "n/a": "not_applicable",
+        },
+    )
+    target_background_contrast = _class_analysis_qwen_review_coerce_choice(
+        args.get("target_background_contrast")
+        if args.get("target_background_contrast") is not None
+        else args.get("target_vs_background_contrast")
+        if args.get("target_vs_background_contrast") is not None
+        else args.get("object_background_contrast"),
+        CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS,
+        "insufficient",
+        synonyms={
+            "target": "target_specific",
+            "target_specific": "target_specific",
+            "target-specific": "target_specific",
+            "clear_target_cues": "target_specific",
+            "object_specific": "target_specific",
+            "object-specific": "target_specific",
+            "background": "background_dominated",
+            "background_dominated": "background_dominated",
+            "background-dominated": "background_dominated",
+            "context": "background_dominated",
+            "context_dominated": "background_dominated",
+            "overlap": "overlap_dominated",
+            "overlap_dominated": "overlap_dominated",
+            "overlap-dominated": "overlap_dominated",
+            "mixed": "mixed",
+            "ambiguous": "mixed",
+            "insufficient": "insufficient",
+            "none": "insufficient",
+            "not applicable": "not_applicable",
+            "n/a": "not_applicable",
+        },
+    )
+    target_identity_summary = str(
+        args.get("target_identity_summary")
+        or args.get("identity_summary")
+        or args.get("target_description")
+        or args.get("class_neutral_target_description")
+        or ""
+    ).strip()[:1200]
+    target_identity_uncertainty = _class_analysis_qwen_review_coerce_choice(
+        args.get("target_identity_uncertainty")
+        if args.get("target_identity_uncertainty") is not None
+        else args.get("identity_uncertainty")
+        if args.get("identity_uncertainty") is not None
+        else args.get("target_uncertainty"),
+        CLASS_ANALYSIS_QWEN_REVIEW_TARGET_IDENTITY_UNCERTAINTY_LEVELS,
+        "high" if decision in {"accept_suggested", "change_to_other"} else "moderate",
+        synonyms={
+            "clear": "low",
+            "certain": "low",
+            "confident": "low",
+            "medium": "moderate",
+            "uncertain": "high",
+            "unclear": "high",
+            "ambiguous": "high",
+        },
+    )
+    whole_target_extent_supported = _class_analysis_qwen_review_coerce_bool(
+        args.get("whole_target_extent_supported"),
+        default=decision not in {"accept_suggested", "change_to_other"},
+    )
+    whole_target_extent_reason = str(args.get("whole_target_extent_reason") or "")[:1200]
+    rationale = (
+        str(
+            args.get("rationale_short")
+            or args.get("rationale")
+            or args.get("reason")
+            or args.get("short_reason")
+            or ""
+        ).strip()
+        or "Compact model decision expanded by controller."
+    )
+    text_payload = dict(args)
+    text_payload.setdefault("rationale_short", rationale)
+    confidence_value = args.get("confidence", 0.0)
+
+    reconciliation: Dict[str, Any] = {"applied": False}
+    raw_target_norm = _class_analysis_qwen_review_normalize_label(raw_target_class)
+    current_norm = _class_analysis_qwen_review_normalize_label(current_class)
+    suggested_norm = _class_analysis_qwen_review_normalize_label(suggested_class)
+    if (
+        decision == "accept_suggested"
+        and current_class
+        and raw_target_norm
+        and raw_target_norm == current_norm
+        and _class_analysis_qwen_review_text_directly_supports_label(label=current_class, payload=text_payload)
+        and not _class_analysis_qwen_review_text_rejects_label_for_target(label=current_class, payload=text_payload)
+        and not _class_analysis_qwen_review_text_directly_supports_label(label=suggested_class, payload=text_payload)
+    ):
+        decision = "confirm_current"
+        target_class = current_class
+        current_evidence = _class_analysis_qwen_review_max_evidence(current_evidence, target_evidence)
+        suggested_evidence = "weak"
+        anchor_evidence_current = _class_analysis_qwen_review_max_evidence(anchor_evidence_current, "moderate")
+        anchor_evidence_suggested = "weak"
+        try:
+            confidence_value = min(float(confidence_value), 0.72)
+        except Exception:
+            confidence_value = 0.72
+        reconciliation = {
+            "applied": True,
+            "from_decision": "accept_suggested",
+            "to_decision": "confirm_current",
+            "reason": (
+                "compact accept_suggested contradicted raw target_class and "
+                "visible-fact text supporting the current class"
+            ),
+        }
+    counter_evidence = str(args.get("counter_evidence") or args.get("counter") or "").strip()
+    if not counter_evidence:
+        counter_evidence = "No explicit counterevidence provided."
+    visible_target_cues = _class_analysis_qwen_review_visible_cues_from_payload(
+        args,
+        current_class=current_class,
+        suggested_class=suggested_class,
+        target_class=target_class,
+    )
+    supporting_clean_evidence_ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+        args.get("supporting_clean_evidence_ids")
+        if args.get("supporting_clean_evidence_ids") is not None
+        else args.get("visible_cue_evidence_ids")
+        if args.get("visible_cue_evidence_ids") is not None
+        else args.get("clean_evidence_ids"),
+        allowed_ids=evidence_ids,
+        limit=6,
+    )
+    target_identity_evidence_ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+        args.get("target_identity_evidence_ids")
+        if args.get("target_identity_evidence_ids") is not None
+        else args.get("identity_evidence_ids")
+        if args.get("identity_evidence_ids") is not None
+        else supporting_clean_evidence_ids,
+        allowed_ids=evidence_ids,
+        limit=6,
+    )
+    expanded = {
+        "decision": decision,
+        "target_class": target_class,
+        "confidence": confidence_value,
+        "visual_quality": visual_quality_value,
+        "object_visibility": object_visibility,
+        "current_evidence": current_evidence,
+        "suggested_evidence": suggested_evidence,
+        "target_evidence": target_evidence,
+        "overlap_assessment": overlap_assessment,
+        "overlap_explains_candidate_similarity": overlap_explains,
+        "specificity_alignment": specificity_alignment,
+        "target_background_contrast": target_background_contrast,
+        "target_identity_summary": target_identity_summary,
+        "target_identity_uncertainty": target_identity_uncertainty,
+        "target_identity_evidence_ids": target_identity_evidence_ids,
+        "whole_target_extent_supported": whole_target_extent_supported,
+        "whole_target_extent_reason": whole_target_extent_reason,
+        "dual_bbox_resolution": dual_bbox_resolution,
+        "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+        "anchor_evidence_current": anchor_evidence_current,
+        "anchor_evidence_suggested": anchor_evidence_suggested,
+        "local_context_evidence": local_context_evidence,
+        "local_consensus_evidence": local_consensus_evidence,
+        "global_context_evidence": global_context_evidence,
+        "same_image_scale_evidence": same_image_scale_evidence,
+        "same_image_embedding_evidence": same_image_embedding_evidence,
+        "glossary_or_guidance_used": _class_analysis_qwen_review_coerce_bool(
+            args.get("glossary_or_guidance_used", args.get("glossary_used")),
+            default=bool(str(labelmap_glossary or "").strip() or str(review_guidance or "").strip()),
+        ),
+        "visible_target_cues": visible_target_cues,
+        "supporting_clean_evidence_ids": supporting_clean_evidence_ids,
+        "evidence_ids": sorted(str(item) for item in evidence_ids if str(item or "").strip()),
+        "rationale_short": rationale[:1200],
+        "counter_evidence": counter_evidence[:1200],
+        "human_review_needed": _class_analysis_qwen_review_coerce_bool(
+            args.get("human_review_needed") if args.get("human_review_needed") is not None else args.get("human_needed"),
+            default=decision == "skip_uncertain" or bool(reconciliation.get("applied")),
+        ),
+        "_compact_model_arguments": args,
+        "_expanded_by_controller": True,
+        "_controller_reconciliation": reconciliation,
+    }
+    return expanded
+
+
+def _class_analysis_qwen_review_parse_payload(raw_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    _initial_payload, error = _parse_tool_call_json(raw_text)
+    text = str(raw_text or "")
+    repaired_text = re.sub(r"(?<=\d)\.\s+(?=\d)", ".", text)
+    repaired_text = repaired_text.replace("{%", "{")
+    candidate_texts: List[str] = []
+    for candidate_text in (text, repaired_text):
+        if candidate_text not in candidate_texts:
+            candidate_texts.append(candidate_text)
+        stripped = candidate_text.strip()
+        if not stripped:
+            continue
+        for key in ('"name"', '"tool"', '"decision"', '"target_class"', '"confidence"'):
+            key_index = stripped.find(key)
+            if key_index > 0:
+                wrapped = "{" + stripped[key_index:]
+                if wrapped not in candidate_texts:
+                    candidate_texts.append(wrapped)
+                break
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def _add_candidate(decoded: Any) -> None:
+        if not isinstance(decoded, dict):
+            return
+        try:
+            key = json.dumps(decoded, sort_keys=True, default=str)
+        except Exception:
+            key = repr(decoded)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(decoded)
+
+    _add_candidate(_initial_payload)
+    for pattern in (
+        r"```json\s*(\{.*?\})\s*```",
+        r"```\s*(\{.*?\})\s*```",
+        r"(\{.*\})",
+    ):
+        for candidate_text in candidate_texts:
+            match = re.search(pattern, candidate_text, flags=re.DOTALL)
+            if not match:
+                continue
+            try:
+                _add_candidate(json.loads(match.group(1)))
+            except Exception:
+                continue
+    decoder = json.JSONDecoder()
+    for candidate_text in candidate_texts:
+        for match in re.finditer(r"\{", candidate_text):
+            try:
+                decoded, _end = decoder.raw_decode(candidate_text[match.start():])
+            except Exception:
+                continue
+            if isinstance(decoded, dict):
+                _add_candidate(decoded)
+    final_aliases = {"finalize_review", "final_review", "final", "review_final", "finalize"}
+    for candidate in reversed(candidates):
+        tool_name = str(candidate.get("name") or candidate.get("tool") or "").strip()
+        if tool_name in final_aliases:
+            return candidate, None
+    for candidate in reversed(candidates):
+        if not (candidate.get("name") or candidate.get("tool")) and any(
+            key in candidate for key in ("decision", "confidence", "target_class")
+        ):
+            return candidate, None
+    if candidates:
+        return candidates[0], None
+    return None, error or "parse_error"
+
+
+def _class_analysis_qwen_review_parse_specificity_probe_raw(raw_text: str) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    """Parse a specificity probe without the final-output compact fallback.
+
+    `_class_analysis_qwen_review_parse_payload` intentionally prefers compact
+    final-review argument objects; that heuristic can reduce a direct
+    specificity probe response to only `{confidence, rationale_short}`. The
+    probe is a separate VLM evidence pass, so keep it schema-aware here.
+    """
+
+    initial_payload, error = _parse_tool_call_json(raw_text)
+    text = str(raw_text or "")
+    repaired_text = re.sub(r"(?<=\d)\.\s+(?=\d)", ".", text).replace("{%", "{")
+    candidates: List[Dict[str, Any]] = []
+    seen: Set[str] = set()
+
+    def _add_candidate(decoded: Any) -> None:
+        if not isinstance(decoded, dict):
+            return
+        try:
+            key = json.dumps(decoded, sort_keys=True, default=str)
+        except Exception:
+            key = repr(decoded)
+        if key in seen:
+            return
+        seen.add(key)
+        candidates.append(decoded)
+
+    _add_candidate(initial_payload)
+    for candidate_text in (text, repaired_text):
+        stripped = candidate_text.strip()
+        if not stripped:
+            continue
+        try:
+            _add_candidate(json.loads(stripped))
+        except Exception:
+            pass
+        for pattern in (r"```json\s*(\{.*?\})\s*```", r"```\s*(\{.*?\})\s*```", r"(\{.*\})"):
+            match = re.search(pattern, stripped, flags=re.DOTALL)
+            if not match:
+                continue
+            try:
+                _add_candidate(json.loads(match.group(1)))
+            except Exception:
+                continue
+        decoder = json.JSONDecoder()
+        for match in re.finditer(r"\{", stripped):
+            try:
+                decoded, _end = decoder.raw_decode(stripped[match.start():])
+            except Exception:
+                continue
+            _add_candidate(decoded)
+
+    probe_aliases = {"probe_specificity", "specificity_probe", "specificity", "target_specificity_probe"}
+    probe_keys = {
+        "specificity_alignment",
+        "target_background_contrast",
+        "target_vs_background_contrast",
+        "target_specific_cues",
+        "best_supported_class",
+        "target_identity_summary",
+        "subdescription_assessments",
+        "contrastive_subdescriptions",
+        "specificity_margin",
+    }
+    for candidate in candidates:
+        tool_name = str(candidate.get("name") or candidate.get("tool") or "").strip()
+        if tool_name in probe_aliases:
+            return candidate, None
+    for candidate in candidates:
+        args = candidate.get("arguments") if isinstance(candidate.get("arguments"), dict) else None
+        if args and any(key in args for key in probe_keys):
+            return candidate, None
+    for candidate in candidates:
+        if any(key in candidate for key in probe_keys):
+            return candidate, None
+    salvaged = _class_analysis_qwen_review_salvage_specificity_probe_args(repaired_text)
+    if salvaged:
+        return salvaged, "salvaged_malformed_specificity_probe_json"
+    if candidates:
+        return candidates[0], None
+    return None, error or "specificity_probe_parse_error"
+
+
+def _class_analysis_qwen_review_salvage_specificity_probe_args(raw_text: str) -> Dict[str, Any]:
+    """Recover leading probe fields from malformed Qwen JSON.
+
+    MLX VLM generations sometimes stop in the middle of a later array/string
+    while earlier specificity-probe fields are complete. Keep this scoped to
+    the pre-final evidence probe so final decisions still require valid JSON.
+    """
+
+    text = str(raw_text or "")
+    if not text.strip():
+        return {}
+    recovered: Dict[str, Any] = {}
+
+    def _decode_json_string(value: str) -> str:
+        try:
+            return str(json.loads(f'"{value}"'))
+        except Exception:
+            return value.replace('\\"', '"').replace("\\n", "\n").replace("\\/", "/")
+
+    for key in (
+        "target_identity_summary",
+        "target_identity_uncertainty",
+        "specificity_alignment",
+        "target_background_contrast",
+        "target_vs_background_contrast",
+        "best_supported_class",
+        "target_class",
+        "supported_class",
+        "specificity_margin",
+        "margin_rationale",
+        "rationale_short",
+        "reason",
+    ):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*"((?:\\.|[^"\\])*)"', text, flags=re.DOTALL)
+        if match:
+            recovered[key] = _decode_json_string(match.group(1)).strip()
+
+    for key in (
+        "target_specific_cues",
+        "background_or_overlap_cues",
+        "target_background_cues",
+        "background_cues",
+        "context_cues",
+        "current_class_cues",
+        "suggested_class_cues",
+        "supporting_clean_evidence_ids",
+        "clean_evidence_ids",
+    ):
+        match = re.search(rf'"{re.escape(key)}"\s*:\s*(\[[^\]]*\])', text, flags=re.DOTALL)
+        if not match:
+            continue
+        try:
+            decoded = json.loads(match.group(1))
+        except Exception:
+            decoded = re.findall(r'"((?:\\.|[^"\\])*)"', match.group(1))
+            decoded = [_decode_json_string(item).strip() for item in decoded]
+        if isinstance(decoded, list):
+            recovered[key] = decoded
+
+    def _extract_json_array_from(start: int) -> str:
+        if start < 0:
+            return ""
+        depth = 0
+        in_string = False
+        escape = False
+        for idx in range(start, len(text)):
+            ch = text[idx]
+            if escape:
+                escape = False
+                continue
+            if ch == "\\":
+                escape = True
+                continue
+            if ch == '"':
+                in_string = not in_string
+                continue
+            if in_string:
+                continue
+            if ch == "[":
+                depth += 1
+            elif ch == "]":
+                depth -= 1
+                if depth == 0:
+                    return text[start : idx + 1]
+        return ""
+
+    def _extract_json_arrays_after_key(key: str) -> List[str]:
+        arrays: List[str] = []
+        for key_match in re.finditer(rf'"{re.escape(key)}"\s*:', text):
+            start = text.find("[", key_match.end())
+            extracted = _extract_json_array_from(start)
+            if extracted:
+                arrays.append(extracted)
+        return arrays
+
+    def _extract_json_array_after_key(key: str) -> str:
+        arrays = _extract_json_arrays_after_key(key)
+        if not arrays:
+            return ""
+        return arrays[0]
+
+    for key in ("supporting_clean_evidence_ids", "clean_evidence_ids"):
+        for array_text in reversed(_extract_json_arrays_after_key(key)):
+            try:
+                decoded = json.loads(array_text)
+            except Exception:
+                decoded = []
+            if isinstance(decoded, list):
+                recovered[key] = decoded
+                break
+
+    subdescription_text = _extract_json_array_after_key("subdescription_assessments")
+    if subdescription_text:
+        try:
+            subdescription_assessments = json.loads(subdescription_text)
+        except Exception:
+            subdescription_assessments = []
+        if isinstance(subdescription_assessments, list):
+            recovered["subdescription_assessments"] = subdescription_assessments
+
+    match = re.search(r'"confidence"\s*:\s*(-?\d+(?:\.\d+)?)', text)
+    if match:
+        try:
+            recovered["confidence"] = float(match.group(1))
+        except Exception:
+            pass
+    match = re.search(r'"whole_target_extent_supported"\s*:\s*(true|false)', text, flags=re.IGNORECASE)
+    if match:
+        recovered["whole_target_extent_supported"] = match.group(1).lower() == "true"
+
+    probe_keys = {
+        "target_identity_summary",
+        "specificity_alignment",
+        "target_background_contrast",
+        "target_specific_cues",
+        "best_supported_class",
+    }
+    if len([key for key in probe_keys if recovered.get(key)]) < 2:
+        return {}
+    return recovered
+
+
+def _class_analysis_qwen_review_normalize_subdescription_assessments(
+    raw_value: Any,
+    *,
+    labelmap: Sequence[str],
+    evidence_ids: Set[str],
+    limit: int = 8,
+) -> List[Dict[str, Any]]:
+    label_names = [str(item or "").strip() for item in labelmap if str(item or "").strip()]
+    label_by_norm = {
+        _class_analysis_qwen_review_normalize_label(name): name
+        for name in label_names
+        if _class_analysis_qwen_review_normalize_label(name)
+    }
+    if isinstance(raw_value, dict):
+        raw_items = raw_value.get("items") or raw_value.get("assessments") or raw_value.get("subdescriptions") or []
+    elif isinstance(raw_value, list):
+        raw_items = raw_value
+    else:
+        raw_items = []
+    normalized: List[Dict[str, Any]] = []
+    seen: Set[Tuple[str, str]] = set()
+    for item in raw_items:
+        if not isinstance(item, dict):
+            continue
+        class_raw = str(
+            item.get("class_name")
+            or item.get("class")
+            or item.get("target_class")
+            or item.get("hypothesis_class")
+            or ""
+        ).strip()
+        class_name = label_by_norm.get(_class_analysis_qwen_review_normalize_label(class_raw), "")
+        subdescription = str(
+            item.get("subdescription")
+            or item.get("description")
+            or item.get("attribute")
+            or item.get("cue")
+            or ""
+        ).strip()
+        if not subdescription:
+            continue
+        key = (class_name, subdescription.lower())
+        if key in seen:
+            continue
+        seen.add(key)
+        target_support = _class_analysis_qwen_review_coerce_choice(
+            item.get("target_support")
+            if item.get("target_support") is not None
+            else item.get("target_score")
+            if item.get("target_score") is not None
+            else item.get("target"),
+            CLASS_ANALYSIS_QWEN_REVIEW_FOCUS_SUPPORT_LEVELS,
+            "none",
+            synonyms={
+                "present": "strong",
+                "visible": "strong",
+                "partial": "moderate",
+                "maybe": "weak",
+                "absent": "none",
+                "background": "none",
+                "overlap": "none",
+            },
+        )
+        background_support = _class_analysis_qwen_review_coerce_choice(
+            item.get("background_or_overlap_support")
+            if item.get("background_or_overlap_support") is not None
+            else item.get("context_support")
+            if item.get("context_support") is not None
+            else item.get("background_support")
+            if item.get("background_support") is not None
+            else item.get("overlap_support"),
+            CLASS_ANALYSIS_QWEN_REVIEW_FOCUS_SUPPORT_LEVELS,
+            "none",
+            synonyms={
+                "present": "strong",
+                "visible": "strong",
+                "partial": "moderate",
+                "maybe": "weak",
+                "absent": "none",
+                "target": "none",
+            },
+        )
+        support_location = _class_analysis_qwen_review_coerce_choice(
+            item.get("support_location") if item.get("support_location") is not None else item.get("location"),
+            ("target", "background", "overlap", "mixed", "absent"),
+            "mixed" if target_support != "none" and background_support != "none" else "target" if target_support != "none" else "background" if background_support != "none" else "absent",
+            synonyms={
+                "target_pixels": "target",
+                "object": "target",
+                "inside_bbox": "target",
+                "context": "background",
+                "neighbor": "overlap",
+                "nearby": "overlap",
+                "both": "mixed",
+                "none": "absent",
+            },
+        )
+        ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+            item.get("supporting_clean_evidence_ids")
+            if item.get("supporting_clean_evidence_ids") is not None
+            else item.get("evidence_ids")
+            if item.get("evidence_ids") is not None
+            else item.get("clean_evidence_ids"),
+            allowed_ids=evidence_ids,
+            limit=4,
+        )
+        normalized.append(
+            {
+                "class_name": class_name,
+                "subdescription": subdescription[:240],
+                "target_support": target_support,
+                "background_or_overlap_support": background_support,
+                "support_location": support_location,
+                "supporting_clean_evidence_ids": ids,
+                "note": str(item.get("note") or item.get("rationale") or item.get("reason") or "")[:360],
+            }
+        )
+        if len(normalized) >= max(1, limit):
+            break
+    return normalized
+
+
+def _class_analysis_qwen_review_specificity_probe_instruction(
+    *,
+    point: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    labelmap: Sequence[str],
+    labelmap_glossary: str = "",
+    review_guidance: str = "",
+    class_concept_brief_text: str = "",
+) -> Dict[str, Any]:
+    clean_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("clean_target_source_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    reference_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("clean_visual_reference_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    concept_text = str(class_concept_brief_text or "").strip()
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    current_glossary = _class_analysis_qwen_review_glossary_entry_for_class(labelmap_glossary, current_class)
+    suggested_glossary = _class_analysis_qwen_review_glossary_entry_for_class(labelmap_glossary, suggested_class)
+    probe_skeleton = {
+        "target_identity_summary": "class-neutral visible description of the reviewed target",
+        "target_identity_uncertainty": "low|moderate|high",
+        "specificity_alignment": "supports_current|supports_suggested|supports_other|mixed|insufficient|not_applicable",
+        "target_background_contrast": "target_specific|background_dominated|overlap_dominated|mixed|insufficient|not_applicable",
+        "best_supported_class": "",
+        "target_specific_cues": ["positive cue visible on the target itself"],
+        "background_or_overlap_cues": [],
+        "subdescription_assessments": [
+            {
+                "class_name": "one dataset class or empty",
+                "subdescription": "short discriminative class attribute, part, material, or target-touching policy",
+                "target_support": "strong|moderate|weak|none|not_applicable",
+                "background_or_overlap_support": "strong|moderate|weak|none|not_applicable",
+                "support_location": "target|background|overlap|mixed|absent",
+                "supporting_clean_evidence_ids": [],
+                "note": "short visible-fact note",
+            }
+        ],
+        "specificity_margin": "current_target_favored|suggested_target_favored|other_target_favored|background_or_overlap_favored|low_contrast|insufficient|not_applicable",
+        "margin_rationale": "under 25 words",
+        "current_class_cues": [],
+        "suggested_class_cues": [],
+        "whole_target_extent_supported": False,
+        "supporting_clean_evidence_ids": [],
+        "confidence": 0.0,
+        "rationale_short": "under 25 words",
+    }
+    lines = [
+        "Specificity probe state.",
+        "Return only the probe_specificity JSON arguments object. No markdown, no prose, no chain-of-thought.",
+        "This is a pre-final VLM evidence pass inspired by SDDF target/background separation.",
+        "V3 adds explicit region-contrast evidence: make compact sub-descriptions for the relevant class hypotheses, then compare target-only pixels against target-removed background/context and overlap-only pixels.",
+        "Question: which visible cues belong to the reviewed target itself, and which come from background, overlap, nearby objects, labels, or neighbor statistics?",
+        f"Current class: {current_class}",
+        f"Suggested class: {suggested_class or '(none)'}",
+        f"Dataset classes: {', '.join(str(item) for item in labelmap) or '(none)'}",
+        _class_analysis_qwen_review_quality_summary(visual_quality),
+        f"Clean target/source evidence ids allowed for supporting_clean_evidence_ids: {', '.join(clean_ids) or '(none)'}",
+        f"Clean reference evidence ids are context only: {', '.join(reference_ids) or '(none)'}",
+        "Use clean target/detail/zoom pixels for target_specific_cues.",
+        "When specificity_region_contrast evidence is available, use panel B for target-only support, panel C for target-removed background/context support, and panel D for overlap-only support.",
+        "Use overlays, dot maps, overlap reports, neighbor labels, and class names only as context, not as target cues.",
+        "Do not set target_background_contrast=background_dominated merely because the target touches a road, water, ground, wall, or other scene context. Use background_dominated only when the class support would mostly remain after target pixels are removed.",
+        "If target pixels contain the discriminative object cues and scene/context only explains placement, set target_background_contrast=target_specific or mixed, not background_dominated.",
+        "Keep target_specific_cues and background_or_overlap_cues separate. Do not combine target cues with context in one cue string.",
+        "If the apparent suggested-class evidence is mostly a nearby object, overlap pixels, background texture, or scene context, set target_background_contrast accordingly and do not mark it target_specific.",
+        "Pairwise Switch blockers / hard negatives, when present, are traps against class changes. Treat them as negative evidence for switching, not as positive evidence for the suggested class.",
+        "Scene, location, medium, surface, lighting, and nearby-object cues are context, not class evidence, unless the active glossary or review guidance explicitly defines the class by that target-touching context.",
+        "Do not place scene/location/context cues in current_class_cues or suggested_class_cues unless the cue is visibly part of the reviewed target under the active class policy.",
+        "For subdescription_assessments, include at least one current-class and one suggested-class entry when both classes exist. If the suggested-class sub-description is supported mainly by background/overlap, say that explicitly.",
+        "Do not invent dataset rules. Derive sub-descriptions from visible pixels, class names, glossary/guidance, and trusted exemplar briefs only.",
+        "Set specificity_margin from the sub-description assessments: target-favored only when target_support exceeds background_or_overlap_support on discriminative cues; background_or_overlap_favored when context wins.",
+        "target_background_contrast must be one literal string from the schema, never a numeric score; put numeric certainty only in confidence.",
+        "specificity_alignment must be one literal string from the schema, never high/medium/low.",
+        "If neither current nor suggested is supported by target-contained cues, set specificity_alignment=insufficient or mixed and best_supported_class=\"\".",
+        "Set whole_target_extent_supported=false if the best-supported class explains only a subpart of the reviewed bbox/object.",
+        "Every key below is required exactly once. Use [] for empty lists and \"\" only for best_supported_class when unresolved.",
+        "target_identity_summary is mandatory: describe the visible target in class-neutral terms before deciding which class it supports.",
+        "When target_background_contrast=target_specific, supporting_clean_evidence_ids must contain at least one allowed clean target/source evidence id.",
+        "When subdescription target_support is strong or moderate, its supporting_clean_evidence_ids should cite clean target/source ids whenever available.",
+        "Required JSON skeleton and key order:",
+        json.dumps(probe_skeleton, ensure_ascii=False, separators=(",", ":")),
+        "Keep rationale_short under 25 words.",
+    ]
+    if current_glossary or suggested_glossary or str(review_guidance or "").strip():
+        lines.append("Relevant class policy for deriving sub-descriptions:")
+        if current_glossary:
+            lines.append(f"- Current class {current_class}: {_class_analysis_qwen_review_compact_line(current_glossary, 480)}")
+        if suggested_class and suggested_glossary:
+            lines.append(f"- Suggested class {suggested_class}: {_class_analysis_qwen_review_compact_line(suggested_glossary, 480)}")
+        if str(review_guidance or "").strip():
+            lines.append(f"- Additional review guidance: {_class_analysis_qwen_review_compact_line(str(review_guidance), 700)}")
+    if concept_text:
+        lines.extend(
+            [
+                "Advisory class concept and pairwise contrast briefs are available as compressed exemplar memory.",
+                _class_analysis_qwen_review_compact_line(concept_text, 1400),
+                "Use briefs only to interpret visible target pixels; they cannot override fresh target evidence.",
+                "Pairwise 'Switch blockers / hard negatives' are traps against class changes. Treat them as negative evidence for switching, not as positive evidence for the suggested class.",
+            ]
+        )
+    return {"role": "user", "content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+def _class_analysis_qwen_review_derive_specificity_from_subdescriptions(
+    subdescription_assessments: Sequence[Dict[str, Any]],
+    *,
+    current_class: str,
+    suggested_class: str,
+) -> Dict[str, Any]:
+    current_norm = _class_analysis_qwen_review_normalize_label(current_class)
+    suggested_norm = _class_analysis_qwen_review_normalize_label(suggested_class)
+    class_scores: Dict[str, Dict[str, Any]] = {}
+    background_wins = 0
+    target_wins = 0
+    for assessment in subdescription_assessments:
+        if not isinstance(assessment, dict):
+            continue
+        class_name = str(assessment.get("class_name") or "").strip()
+        class_norm = _class_analysis_qwen_review_normalize_label(class_name)
+        if not class_norm:
+            continue
+        target_rank = _class_analysis_qwen_review_rank_evidence(str(assessment.get("target_support") or "none"))
+        background_rank = _class_analysis_qwen_review_rank_evidence(
+            str(assessment.get("background_or_overlap_support") or "none")
+        )
+        score = class_scores.setdefault(
+            class_norm,
+            {
+                "class_name": class_name,
+                "target_score": 0,
+                "background_score": 0,
+                "net_score": 0,
+                "target_wins": 0,
+                "background_wins": 0,
+            },
+        )
+        score["target_score"] += int(target_rank)
+        score["background_score"] += int(background_rank)
+        score["net_score"] += int(target_rank - background_rank)
+        if target_rank > background_rank and target_rank >= 2:
+            score["target_wins"] += 1
+            target_wins += 1
+        elif background_rank > target_rank and background_rank >= 2:
+            score["background_wins"] += 1
+            background_wins += 1
+
+    if not class_scores:
+        return {}
+    ranked = sorted(
+        class_scores.values(),
+        key=lambda item: (
+            int(item.get("net_score") or 0),
+            int(item.get("target_score") or 0),
+            -int(item.get("background_score") or 0),
+        ),
+        reverse=True,
+    )
+    best = ranked[0]
+    second = ranked[1] if len(ranked) > 1 else None
+    best_norm = _class_analysis_qwen_review_normalize_label(best.get("class_name"))
+    best_net = int(best.get("net_score") or 0)
+    best_target = int(best.get("target_score") or 0)
+    best_background = int(best.get("background_score") or 0)
+    if isinstance(second, dict):
+        second_net = int(second.get("net_score") or 0)
+        second_target = int(second.get("target_score") or 0)
+        second_background = int(second.get("background_score") or 0)
+        if best_net == second_net and best_target == second_target:
+            if background_wins >= max(1, target_wins) or best_background > best_target or second_background > second_target:
+                return {
+                    "specificity_alignment": "insufficient",
+                    "specificity_margin": "background_or_overlap_favored",
+                    "target_background_contrast": "background_dominated",
+                    "best_supported_class": "",
+                    "support_scores": class_scores,
+                }
+            return {
+                "specificity_alignment": "mixed",
+                "specificity_margin": "low_contrast",
+                "target_background_contrast": "mixed",
+                "best_supported_class": "",
+                "support_scores": class_scores,
+            }
+    if best_net <= 0 or best_target < 2:
+        if background_wins >= max(1, target_wins):
+            return {
+                "specificity_alignment": "insufficient",
+                "specificity_margin": "background_or_overlap_favored",
+                "target_background_contrast": "background_dominated",
+                "best_supported_class": "",
+                "support_scores": class_scores,
+            }
+        return {
+            "specificity_alignment": "mixed",
+            "specificity_margin": "low_contrast",
+            "target_background_contrast": "mixed",
+            "best_supported_class": "",
+            "support_scores": class_scores,
+        }
+    if best_norm == current_norm:
+        alignment = "supports_current"
+        margin = "current_target_favored"
+    elif suggested_norm and best_norm == suggested_norm:
+        alignment = "supports_suggested"
+        margin = "suggested_target_favored"
+    else:
+        alignment = "supports_other"
+        margin = "other_target_favored"
+    contrast = "target_specific" if best_target > best_background else "mixed"
+    return {
+        "specificity_alignment": alignment,
+        "specificity_margin": margin,
+        "target_background_contrast": contrast,
+        "best_supported_class": str(best.get("class_name") or ""),
+        "support_scores": class_scores,
+    }
+
+
+def _class_analysis_qwen_review_parse_specificity_probe_payload(
+    raw_text: str,
+    *,
+    current_class: str,
+    suggested_class: str,
+    labelmap: Sequence[str],
+    evidence_ids: Set[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    payload, error = _class_analysis_qwen_review_parse_specificity_probe_raw(raw_text)
+    if not isinstance(payload, dict):
+        return None, error or "specificity_probe_parse_error"
+    try:
+        args = _class_analysis_qwen_review_tool_arguments(
+            payload,
+            expected_name="probe_specificity",
+            aliases={"specificity_probe", "specificity", "target_specificity_probe"},
+        )
+    except Exception:
+        if any(key in payload for key in ("specificity_alignment", "target_background_contrast", "target_specific_cues")):
+            args = payload
+        else:
+            return None, error or "specificity_probe_missing_arguments"
+    current_class = str(current_class or "").strip()
+    suggested_class = str(suggested_class or "").strip()
+    label_names = [str(item or "").strip() for item in labelmap if str(item or "").strip()]
+    label_by_norm = {
+        _class_analysis_qwen_review_normalize_label(name): name
+        for name in label_names
+        if _class_analysis_qwen_review_normalize_label(name)
+    }
+    best_supported_raw = str(
+        args.get("best_supported_class")
+        or args.get("target_class")
+        or args.get("supported_class")
+        or ""
+    ).strip()
+    best_supported = label_by_norm.get(_class_analysis_qwen_review_normalize_label(best_supported_raw), "")
+    specificity_alignment = _class_analysis_qwen_review_coerce_choice(
+        args.get("specificity_alignment")
+        if args.get("specificity_alignment") is not None
+        else args.get("target_specificity_alignment"),
+        CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS,
+        "insufficient",
+        synonyms={
+            "current": "supports_current",
+            "current_class": "supports_current",
+            "suggested": "supports_suggested",
+            "suggested_class": "supports_suggested",
+            "other": "supports_other",
+            "third_class": "supports_other",
+            "ambiguous": "mixed",
+            "none": "insufficient",
+            "target": "supports_suggested",
+            "n/a": "not_applicable",
+        },
+    )
+    if specificity_alignment in {"insufficient", "not_applicable"} and best_supported:
+        best_norm = _class_analysis_qwen_review_normalize_label(best_supported)
+        if best_norm == _class_analysis_qwen_review_normalize_label(current_class):
+            specificity_alignment = "supports_current"
+        elif best_norm == _class_analysis_qwen_review_normalize_label(suggested_class):
+            specificity_alignment = "supports_suggested"
+        else:
+            specificity_alignment = "supports_other"
+    target_background_contrast = _class_analysis_qwen_review_coerce_choice(
+        args.get("target_background_contrast")
+        if args.get("target_background_contrast") is not None
+        else args.get("target_vs_background_contrast"),
+        CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS,
+        "insufficient",
+        synonyms={
+            "target": "target_specific",
+            "high": "target_specific",
+            "strong": "target_specific",
+            "clear": "target_specific",
+            "object_specific": "target_specific",
+            "object-specific": "target_specific",
+            "background": "background_dominated",
+            "context": "background_dominated",
+            "context_dominated": "background_dominated",
+            "overlap": "overlap_dominated",
+            "medium": "mixed",
+            "moderate": "mixed",
+            "low": "insufficient",
+            "weak": "insufficient",
+            "ambiguous": "mixed",
+            "none": "insufficient",
+            "n/a": "not_applicable",
+        },
+    )
+    target_identity_uncertainty = _class_analysis_qwen_review_coerce_choice(
+        args.get("target_identity_uncertainty") if args.get("target_identity_uncertainty") is not None else args.get("identity_uncertainty"),
+        CLASS_ANALYSIS_QWEN_REVIEW_TARGET_IDENTITY_UNCERTAINTY_LEVELS,
+        "high",
+        synonyms={
+            "clear": "low",
+            "certain": "low",
+            "medium": "moderate",
+            "uncertain": "high",
+            "ambiguous": "high",
+        },
+    )
+    target_specific_cues = _class_analysis_qwen_review_normalize_visible_cues(
+        args.get("target_specific_cues")
+        if args.get("target_specific_cues") is not None
+        else args.get("positive_visible_target_cues"),
+        current_class=current_class,
+        suggested_class=suggested_class,
+        target_class=best_supported or suggested_class,
+    )[:6]
+    current_class_cues = _class_analysis_qwen_review_normalize_visible_cues(
+        args.get("current_class_cues"),
+        current_class=current_class,
+        suggested_class=suggested_class,
+        target_class=current_class,
+    )[:6]
+    suggested_class_cues = _class_analysis_qwen_review_normalize_visible_cues(
+        args.get("suggested_class_cues"),
+        current_class=current_class,
+        suggested_class=suggested_class,
+        target_class=suggested_class,
+    )[:6]
+    background_or_overlap_cues = [
+        str(item or "").strip()[:240]
+        for item in (
+            args.get("background_or_overlap_cues")
+            or args.get("target_background_cues")
+            or args.get("background_cues")
+            or args.get("context_cues")
+            or []
+        )
+        if str(item or "").strip()
+    ][:6]
+    subdescription_assessments = _class_analysis_qwen_review_normalize_subdescription_assessments(
+        args.get("subdescription_assessments")
+        if args.get("subdescription_assessments") is not None
+        else args.get("contrastive_subdescriptions")
+        if args.get("contrastive_subdescriptions") is not None
+        else args.get("sddf_assessments")
+        if args.get("sddf_assessments") is not None
+        else args.get("focus_assessments"),
+        labelmap=labelmap,
+        evidence_ids=evidence_ids,
+        limit=8,
+    )
+    specificity_margin = _class_analysis_qwen_review_coerce_choice(
+        args.get("specificity_margin")
+        if args.get("specificity_margin") is not None
+        else args.get("target_background_margin")
+        if args.get("target_background_margin") is not None
+        else args.get("sddf_margin"),
+        CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MARGIN_LEVELS,
+        "insufficient",
+        synonyms={
+            "current": "current_target_favored",
+            "current_class": "current_target_favored",
+            "supports_current": "current_target_favored",
+            "suggested": "suggested_target_favored",
+            "suggested_class": "suggested_target_favored",
+            "supports_suggested": "suggested_target_favored",
+            "other": "other_target_favored",
+            "third_class": "other_target_favored",
+            "background": "background_or_overlap_favored",
+            "context": "background_or_overlap_favored",
+            "overlap": "background_or_overlap_favored",
+            "low": "low_contrast",
+            "mixed": "low_contrast",
+            "weak": "insufficient",
+            "none": "insufficient",
+            "n/a": "not_applicable",
+        },
+    )
+    derived_specificity = _class_analysis_qwen_review_derive_specificity_from_subdescriptions(
+        subdescription_assessments,
+        current_class=current_class,
+        suggested_class=suggested_class,
+    )
+    reconciled_from_subdescriptions: List[str] = []
+    if derived_specificity:
+        derived_margin = str(derived_specificity.get("specificity_margin") or "").strip()
+        derived_alignment = str(derived_specificity.get("specificity_alignment") or "").strip()
+        derived_contrast = str(derived_specificity.get("target_background_contrast") or "").strip()
+        derived_best_class = str(derived_specificity.get("best_supported_class") or "").strip()
+        if specificity_margin in {"insufficient", "not_applicable"} and derived_margin:
+            specificity_margin = derived_margin
+            reconciled_from_subdescriptions.append("specificity_margin_missing")
+        elif derived_margin and derived_margin != specificity_margin:
+            raw_margin_target_favored = specificity_margin in {
+                "current_target_favored",
+                "suggested_target_favored",
+                "other_target_favored",
+            }
+            derived_target_favored = derived_margin in {
+                "current_target_favored",
+                "suggested_target_favored",
+                "other_target_favored",
+            }
+            if (
+                derived_margin == "background_or_overlap_favored"
+                or specificity_margin == "background_or_overlap_favored"
+                or (raw_margin_target_favored and derived_target_favored)
+            ):
+                specificity_margin = derived_margin
+                reconciled_from_subdescriptions.append("specificity_margin_contradicted_assessments")
+        if derived_alignment and derived_alignment != specificity_alignment:
+            if derived_margin in {
+                "current_target_favored",
+                "suggested_target_favored",
+                "other_target_favored",
+                "background_or_overlap_favored",
+            }:
+                specificity_alignment = derived_alignment
+                reconciled_from_subdescriptions.append("specificity_alignment_contradicted_assessments")
+        if derived_contrast and derived_contrast != target_background_contrast:
+            if derived_contrast in {"target_specific", "background_dominated", "mixed"}:
+                target_background_contrast = derived_contrast
+                reconciled_from_subdescriptions.append("target_background_contrast_contradicted_assessments")
+        if derived_best_class and derived_best_class != best_supported and derived_margin in {
+            "current_target_favored",
+            "suggested_target_favored",
+            "other_target_favored",
+        }:
+            best_supported = derived_best_class
+            reconciled_from_subdescriptions.append("best_supported_class_contradicted_assessments")
+    if target_background_contrast == "insufficient":
+        try:
+            contrast_score = float(
+                args.get("target_background_contrast")
+                if args.get("target_background_contrast") is not None
+                else args.get("target_vs_background_contrast")
+                if args.get("target_vs_background_contrast") is not None
+                else args.get("target_specificity_score")
+            )
+        except Exception:
+            contrast_score = float("nan")
+        if math.isfinite(contrast_score):
+            if contrast_score >= 0.70 and (target_specific_cues or current_class_cues or suggested_class_cues or best_supported):
+                target_background_contrast = "target_specific"
+            elif contrast_score >= 0.35:
+                target_background_contrast = "mixed"
+    supporting_ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+        args.get("supporting_clean_evidence_ids")
+        if args.get("supporting_clean_evidence_ids") is not None
+        else args.get("clean_evidence_ids"),
+        allowed_ids=evidence_ids,
+        limit=6,
+    )
+    try:
+        confidence = float(
+            args.get("confidence")
+            if args.get("confidence") is not None
+            else args.get("target_specificity_score")
+            if args.get("target_specificity_score") is not None
+            else args.get("target_background_contrast")
+            if isinstance(args.get("target_background_contrast"), (int, float))
+            else 0.0
+        )
+    except Exception:
+        confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    return {
+        "enabled": True,
+        "status": "completed",
+        "version": CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION,
+        "target_identity_summary": str(args.get("target_identity_summary") or "")[:1200],
+        "target_identity_uncertainty": target_identity_uncertainty,
+        "specificity_alignment": specificity_alignment,
+        "target_background_contrast": target_background_contrast,
+        "best_supported_class": best_supported,
+        "target_specific_cues": target_specific_cues,
+        "background_or_overlap_cues": background_or_overlap_cues,
+        "subdescription_assessments": subdescription_assessments,
+        "specificity_margin": specificity_margin,
+        "margin_rationale": str(args.get("margin_rationale") or args.get("specificity_margin_rationale") or "")[:1200],
+        "subdescription_derived_specificity": json_sanitize(derived_specificity) if derived_specificity else {},
+        "reconciled_from_subdescription_assessments": list(dict.fromkeys(reconciled_from_subdescriptions)),
+        "current_class_cues": current_class_cues,
+        "suggested_class_cues": suggested_class_cues,
+        "whole_target_extent_supported": _class_analysis_qwen_review_coerce_bool(
+            args.get("whole_target_extent_supported"),
+            default=False,
+        ),
+        "supporting_clean_evidence_ids": supporting_ids,
+        "confidence": confidence,
+        "rationale_short": str(args.get("rationale_short") or args.get("reason") or "")[:1200],
+        "raw_arguments": args,
+    }, None
+
+
+def _class_analysis_qwen_review_specificity_probe_validation_errors(
+    probe: Dict[str, Any],
+    *,
+    evidence_ids: Set[str],
+) -> List[str]:
+    if not isinstance(probe, dict) or probe.get("status") != "completed":
+        return ["specificity probe did not complete"]
+    errors: List[str] = []
+    if not str(probe.get("target_identity_summary") or "").strip():
+        errors.append("target_identity_summary is required")
+    try:
+        confidence = float(probe.get("confidence") or 0.0)
+    except Exception:
+        confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    if str(probe.get("target_identity_uncertainty") or "").strip().lower() == "high" and confidence >= 0.75:
+        errors.append("high-confidence probe cannot leave target_identity_uncertainty=high")
+    target_contrast = str(probe.get("target_background_contrast") or "").strip().lower()
+    alignment = str(probe.get("specificity_alignment") or "").strip().lower()
+    if target_contrast == "target_specific" and not probe.get("target_specific_cues"):
+        errors.append("target_specific probe requires target_specific_cues")
+    if alignment in {"supports_current", "supports_suggested", "supports_other"} and not str(probe.get("best_supported_class") or "").strip():
+        errors.append("class-supporting probe requires best_supported_class")
+    if target_contrast == "target_specific" and evidence_ids and not probe.get("supporting_clean_evidence_ids"):
+        errors.append("target_specific probe requires supporting_clean_evidence_ids")
+    if confidence >= 0.75 and not probe.get("subdescription_assessments"):
+        errors.append("high-confidence probe requires subdescription_assessments")
+    margin = str(probe.get("specificity_margin") or "").strip().lower()
+    if probe.get("subdescription_assessments") and margin in {"", "insufficient", "not_applicable"} and confidence >= 0.75:
+        errors.append("high-confidence subdescription probe requires specificity_margin")
+    return errors
+
+
+def _class_analysis_qwen_review_specificity_probe_repair_instruction(
+    *,
+    raw_probe: str,
+    validation_errors: Sequence[str],
+    evidence_ids: Set[str],
+) -> Dict[str, Any]:
+    lines = [
+        "Your previous specificity probe output was incomplete.",
+        "Return one complete probe_specificity JSON arguments object now. No markdown, no prose, no code fence.",
+        "Fix these validation errors:",
+        *[f"- {str(error)[:220]}" for error in validation_errors],
+        "Do not change the target object or invent evidence. Use only the clean target/source images already attached above.",
+        "Required fields: target_identity_summary, target_identity_uncertainty, specificity_alignment, target_background_contrast, best_supported_class, target_specific_cues, background_or_overlap_cues, subdescription_assessments, specificity_margin, margin_rationale, current_class_cues, suggested_class_cues, whole_target_extent_supported, supporting_clean_evidence_ids, confidence, rationale_short.",
+        f"Allowed clean evidence ids: {', '.join(sorted(evidence_ids)) or '(none)'}",
+        "Use literal schema strings, not high/medium/low, for specificity_alignment and target_background_contrast.",
+        "For subdescription_assessments, score compact class sub-descriptions against target pixels versus background/overlap/context.",
+        "If confidence is high, target_identity_summary must describe the visible object in class-neutral terms.",
+        "Previous incomplete output:",
+        str(raw_probe or "")[:2200],
+    ]
+    return {"role": "user", "content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+def _class_analysis_qwen_review_specificity_probe_message(probe: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(probe, dict) or probe.get("status") != "completed":
+        text = "Specificity probe result: unavailable. Final review must rely on rendered evidence directly."
+    else:
+        text = "\n".join(
+            [
+                "Specificity probe result.",
+                f"Version: {probe.get('version') or CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION}.",
+                f"Target identity: {probe.get('target_identity_summary') or '(none)'}",
+                f"Identity uncertainty: {probe.get('target_identity_uncertainty') or 'high'}.",
+                f"Specificity alignment: {probe.get('specificity_alignment') or 'insufficient'}.",
+                f"Target/background contrast: {probe.get('target_background_contrast') or 'insufficient'}.",
+                f"Best supported class: {probe.get('best_supported_class') or '(unresolved)'}.",
+                f"Target-specific cues: {json.dumps(probe.get('target_specific_cues') or [], ensure_ascii=False)}",
+                f"Background/overlap/context cues: {json.dumps(probe.get('background_or_overlap_cues') or [], ensure_ascii=False)}",
+                f"Sub-description assessments: {json.dumps(probe.get('subdescription_assessments') or [], ensure_ascii=False)}",
+                f"Specificity margin: {probe.get('specificity_margin') or 'insufficient'}; {probe.get('margin_rationale') or ''}",
+                f"Controller reconciliation from sub-descriptions: {json.dumps(probe.get('reconciled_from_subdescription_assessments') or [], ensure_ascii=False)}",
+                f"Supporting clean evidence ids: {', '.join(probe.get('supporting_clean_evidence_ids') or []) or '(none)'}.",
+                f"Confidence: {float(probe.get('confidence') or 0.0):.2f}.",
+                f"Probe rationale: {probe.get('rationale_short') or '(none)'}",
+                "Use this as a VLM self-critique. If final review contradicts it, cite stronger clean target/source evidence.",
+            ]
+        )
+    return {"role": "user", "content": [{"type": "text", "text": text}]}
+
+
+def _class_analysis_qwen_review_thinking_scratchpad_instruction(
+    *,
+    point: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+) -> Dict[str, Any]:
+    clean_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("clean_target_source_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    overlay_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("geometry_overlay_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    context_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("local_consensus_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    lines = [
+        "Two-phase visual reasoning notes.",
+        "This is a freeform evidence-reading pass. Do not return JSON, XML, markdown tables, or a tool call.",
+        "The controller will run a separate schema-only finalization pass after this. Your job here is to write concise visual audit notes that help that pass.",
+        f"Current class: {current_class or '(none)'}",
+        f"Suggested class: {suggested_class or '(none)'}",
+        _class_analysis_qwen_review_quality_summary(visual_quality),
+        f"Clean target/source evidence ids to prioritize: {', '.join(clean_ids) or '(none)'}",
+        f"Geometry/overlay ids are only for bbox/overlap reasoning: {', '.join(overlay_ids) or '(none)'}",
+        f"Local consensus ids are only distribution context: {', '.join(context_ids) or '(none)'}",
+        "Write at most 10 short bullet points.",
+        "Cover these points:",
+        "- What the reviewed target pixels themselves appear to show.",
+        "- Which cues support the current class, if any.",
+        "- Which cues support the suggested class, if any.",
+        "- Which cues are likely background, overlap, neighboring objects, or annotation-density artifacts.",
+        "- Whether the whole target extent is explained by one class or only by a subpart/overlap.",
+        "- A provisional decision: confirm_current, accept_suggested, change_to_other, or skip_uncertain.",
+        "Keep the notes grounded in visible evidence ids and avoid dataset-specific assumptions not present in the label glossary or rendered evidence.",
+    ]
+    return {"role": "user", "content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+def _class_analysis_qwen_review_thinking_scratchpad_message(packet: Dict[str, Any]) -> Dict[str, Any]:
+    if not isinstance(packet, dict) or packet.get("status") != "completed":
+        text = "Two-phase reasoning notes: unavailable. Continue with rendered evidence and strict schema instructions."
+    else:
+        text = "\n".join(
+            [
+                "Two-phase reasoning notes from the thinking-enabled evidence pass.",
+                "Use these notes as advisory visual self-critique only; final schema fields must still cite rendered evidence.",
+                str(packet.get("text") or "")[:5000],
+            ]
+        )
+    return {"role": "user", "content": [{"type": "text", "text": text}]}
+
+
+def _class_analysis_qwen_review_run_thinking_scratchpad(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    final_base_messages: Sequence[Dict[str, Any]],
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+    model_id: Optional[str],
+) -> Dict[str, Any]:
+    messages = copy.deepcopy(list(final_base_messages))
+    messages.append(
+        _class_analysis_qwen_review_thinking_scratchpad_instruction(
+            point=point,
+            evidence_ledger=evidence_ledger,
+            visual_quality=visual_quality,
+        )
+    )
+    try:
+        raw_text = _class_analysis_qwen_review_model_call(
+            job,
+            messages,
+            phase="thinking_scratchpad",
+            model_id=model_id,
+            tool_specs=[],
+            max_new_tokens=1200,
+            progress=0.255,
+            event_extra={
+                "reasoning_protocol": "two_phase_thinking_scratchpad_v1",
+                "reasoning_visual_policy": "compact_scratchpad_core",
+                "schema_phase": False,
+            },
+            assistant_prefix=None,
+            image_max_side=CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE,
+            image_limit=CLASS_ANALYSIS_QWEN_REVIEW_FINAL_MAX_IMAGES,
+            enable_thinking=True,
+        )
+        text = str(raw_text or "").strip()
+        if not text:
+            raise ValueError("empty_thinking_scratchpad")
+        if _class_analysis_qwen_review_text_is_degenerate(text):
+            raise ValueError("degenerate_thinking_scratchpad")
+        packet = {
+            "enabled": True,
+            "status": "completed",
+            "version": "two_phase_thinking_scratchpad_v1",
+            "text": text[:6000],
+        }
+    except Exception as exc:
+        packet = {
+            "enabled": True,
+            "status": "failed",
+            "version": "two_phase_thinking_scratchpad_v1",
+            "error": str(exc),
+        }
+    _class_analysis_qwen_review_write_json(job, "thinking_scratchpad.json", packet)
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "thinking_scratchpad_result",
+            "status": packet.get("status"),
+            "version": packet.get("version"),
+            "text_preview": str(packet.get("text") or "")[:600],
+            "error": packet.get("error"),
+        },
+    )
+    return packet
+
+
+def _class_analysis_qwen_review_run_specificity_probe(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    final_base_messages: Sequence[Dict[str, Any]],
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+    evidence_ids: Set[str],
+    labelmap: Sequence[str],
+    labelmap_glossary: str = "",
+    review_guidance: str = "",
+    class_concept_brief_text: str = "",
+    model_id: Optional[str],
+) -> Dict[str, Any]:
+    probe_messages = copy.deepcopy(list(final_base_messages))
+    probe_messages.append(
+        _class_analysis_qwen_review_specificity_probe_instruction(
+            point=point,
+            evidence_ledger=evidence_ledger,
+                visual_quality=visual_quality,
+                labelmap=labelmap,
+                labelmap_glossary=labelmap_glossary,
+                review_guidance=review_guidance,
+                class_concept_brief_text=class_concept_brief_text,
+            )
+    )
+    raw_probe = _class_analysis_qwen_review_model_call(
+        job,
+        probe_messages,
+        phase="specificity_probe",
+        model_id=model_id,
+        tool_specs=_class_analysis_qwen_review_tool_specs_for_template(
+            _class_analysis_qwen_review_specificity_probe_tool_spec(labelmap)
+        ),
+        max_new_tokens=800,
+        progress=0.28,
+        event_extra={
+            "version": CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION,
+            "assistant_prefix_strategy": "plain_json_arguments",
+            "reasoning_visual_policy": "compact_probe_core",
+        },
+        assistant_prefix=None,
+        image_max_side=CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE,
+        image_limit=CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MAX_IMAGES,
+    )
+    probe, error = _class_analysis_qwen_review_parse_specificity_probe_payload(
+        raw_probe,
+        current_class=str(point.get("class_name") or ""),
+        suggested_class=str(point.get("suggested_neighbor_class") or ""),
+        labelmap=labelmap,
+        evidence_ids=evidence_ids,
+    )
+    validation_errors = (
+        _class_analysis_qwen_review_specificity_probe_validation_errors(probe, evidence_ids=evidence_ids)
+        if isinstance(probe, dict)
+        else [error or "specificity_probe_parse_error"]
+    )
+    if validation_errors:
+        repair_messages = copy.deepcopy(probe_messages)
+        repair_messages.append(
+            _class_analysis_qwen_review_specificity_probe_repair_instruction(
+                raw_probe=raw_probe,
+                validation_errors=validation_errors,
+                evidence_ids=evidence_ids,
+            )
+        )
+        raw_repair = _class_analysis_qwen_review_model_call(
+            job,
+            repair_messages,
+            phase="specificity_probe",
+            model_id=model_id,
+            tool_specs=_class_analysis_qwen_review_tool_specs_for_template(
+                _class_analysis_qwen_review_specificity_probe_tool_spec(labelmap)
+            ),
+            max_new_tokens=1000,
+            progress=0.30,
+            event_extra={
+                "version": CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION,
+                "assistant_prefix_strategy": "plain_json_arguments",
+                "repair_attempt": 1,
+                "validation_errors": list(validation_errors),
+                "reasoning_visual_policy": "compact_probe_core_repair",
+            },
+            assistant_prefix=None,
+            image_max_side=CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE,
+            image_limit=CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_MAX_IMAGES,
+        )
+        repaired_probe, repaired_error = _class_analysis_qwen_review_parse_specificity_probe_payload(
+            raw_repair,
+            current_class=str(point.get("class_name") or ""),
+            suggested_class=str(point.get("suggested_neighbor_class") or ""),
+            labelmap=labelmap,
+            evidence_ids=evidence_ids,
+        )
+        repaired_errors = (
+            _class_analysis_qwen_review_specificity_probe_validation_errors(repaired_probe, evidence_ids=evidence_ids)
+            if isinstance(repaired_probe, dict)
+            else [repaired_error or "specificity_probe_repair_parse_error"]
+        )
+        if isinstance(repaired_probe, dict) and len(repaired_errors) <= len(validation_errors):
+            probe = repaired_probe
+            raw_probe = raw_repair
+            validation_errors = repaired_errors
+        if isinstance(probe, dict) and validation_errors:
+            probe["validation_errors"] = list(validation_errors)
+    if not isinstance(probe, dict):
+        probe = {
+            "enabled": True,
+            "status": "failed",
+            "version": CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION,
+            "error": error or "specificity_probe_parse_error",
+            "raw_output_preview": str(raw_probe or "")[:800],
+        }
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "specificity_probe_result",
+            "status": str(probe.get("status") or ""),
+            "specificity_probe": copy.deepcopy(probe),
+        },
+    )
+    return probe
+
+
+def _class_analysis_qwen_review_text_is_degenerate(raw_text: str) -> bool:
+    text = str(raw_text or "").strip()
+    if len(text) < 80:
+        return False
+    compact = re.sub(r"\s+", "", text)
+    if not compact:
+        return False
+    most_common_char_ratio = max((compact.count(ch) for ch in set(compact)), default=0) / max(1, len(compact))
+    if most_common_char_ratio >= 0.80:
+        return True
+    for width in range(2, 17):
+        if len(compact) < width * 12:
+            continue
+        chunk = compact[:width]
+        if chunk and chunk * (len(compact) // width) == compact[: width * (len(compact) // width)]:
+            return True
+    return bool(re.search(r"(.{2,16})\1{12,}", compact))
+
+
+def _class_analysis_qwen_review_validate_final(
+    payload: Dict[str, Any],
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    evidence_ids: Set[str],
+    visual_quality: Optional[Dict[str, Any]] = None,
+    evidence_ledger: Optional[Dict[str, Any]] = None,
+    labelmap_glossary: str = "",
+) -> Dict[str, Any]:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    labelmap = [str(name or "").strip() for name in (summary.get("labelmap") or []) if str(name or "").strip()]
+    decision = str(payload.get("decision") or "").strip().lower()
+    allowed = {"confirm_current", "accept_suggested", "change_to_other", "skip_uncertain"}
+    if decision not in allowed:
+        raise ValueError("decision must be confirm_current, accept_suggested, change_to_other, or skip_uncertain")
+    current_class = str(point.get("class_name") or "").strip()
+    suggested_class = str(point.get("suggested_neighbor_class") or "").strip()
+    target_class = str(payload.get("target_class") or "").strip()
+    if decision == "confirm_current":
+        target_class = current_class
+    elif decision == "accept_suggested":
+        if not suggested_class:
+            raise ValueError("accept_suggested requires a suggested class")
+        target_class = suggested_class
+    elif decision == "change_to_other":
+        if not target_class:
+            raise ValueError("change_to_other requires target_class")
+    elif decision == "skip_uncertain":
+        target_class = target_class or current_class
+    if target_class and labelmap and target_class not in labelmap:
+        raise ValueError("target_class is not in this analysis labelmap")
+    visual_quality_value = str(payload.get("visual_quality") or "").strip().lower()
+    object_visibility = str(payload.get("object_visibility") or "").strip().lower()
+    current_evidence = str(payload.get("current_evidence") or "").strip().lower()
+    suggested_evidence = str(payload.get("suggested_evidence") or "").strip().lower()
+    target_evidence = str(payload.get("target_evidence") or "").strip().lower()
+    overlap_assessment = str(payload.get("overlap_assessment") or "").strip().lower()
+    anchor_evidence_current = str(payload.get("anchor_evidence_current") or "").strip().lower()
+    anchor_evidence_suggested = str(payload.get("anchor_evidence_suggested") or "").strip().lower()
+    local_context_evidence = str(payload.get("local_context_evidence") or "").strip().lower()
+    local_consensus_evidence = str(payload.get("local_consensus_evidence") or "").strip().lower() or "not_applicable"
+    global_context_evidence = str(payload.get("global_context_evidence") or "").strip().lower()
+    same_image_scale_evidence = str(payload.get("same_image_scale_evidence") or "").strip().lower() or "not_applicable"
+    same_image_embedding_evidence = str(payload.get("same_image_embedding_evidence") or "").strip().lower() or "not_applicable"
+    expanded_by_controller = bool(payload.get("_expanded_by_controller") or payload.get("expanded_by_controller"))
+
+    def _default_specificity_alignment() -> str:
+        if expanded_by_controller:
+            return "insufficient"
+        if decision == "confirm_current":
+            return "supports_current"
+        if decision == "accept_suggested":
+            return "supports_suggested"
+        if decision == "change_to_other":
+            return "supports_other"
+        return "insufficient"
+
+    def _default_target_background_contrast() -> str:
+        if expanded_by_controller:
+            return "insufficient"
+        return "target_specific" if decision != "skip_uncertain" else "insufficient"
+
+    specificity_alignment = _class_analysis_qwen_review_coerce_choice(
+        payload.get("specificity_alignment")
+        if payload.get("specificity_alignment") is not None
+        else payload.get("target_specificity_alignment")
+        if payload.get("target_specificity_alignment") is not None
+        else payload.get("target_vs_background_alignment"),
+        CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS,
+        _default_specificity_alignment(),
+        synonyms={
+            "current": "supports_current",
+            "current_class": "supports_current",
+            "supports current": "supports_current",
+            "suggested": "supports_suggested",
+            "suggested_class": "supports_suggested",
+            "supports suggested": "supports_suggested",
+            "other": "supports_other",
+            "third_class": "supports_other",
+            "supports other": "supports_other",
+            "ambiguous": "mixed",
+            "none": "insufficient",
+            "not applicable": "not_applicable",
+            "n/a": "not_applicable",
+        },
+    )
+    target_background_contrast = _class_analysis_qwen_review_coerce_choice(
+        payload.get("target_background_contrast")
+        if payload.get("target_background_contrast") is not None
+        else payload.get("target_vs_background_contrast")
+        if payload.get("target_vs_background_contrast") is not None
+        else payload.get("object_background_contrast"),
+        CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS,
+        _default_target_background_contrast(),
+        synonyms={
+            "target": "target_specific",
+            "high": "target_specific",
+            "strong": "target_specific",
+            "clear": "target_specific",
+            "target-specific": "target_specific",
+            "clear_target_cues": "target_specific",
+            "object_specific": "target_specific",
+            "object-specific": "target_specific",
+            "background": "background_dominated",
+            "background-dominated": "background_dominated",
+            "context": "background_dominated",
+            "context_dominated": "background_dominated",
+            "overlap": "overlap_dominated",
+            "overlap-dominated": "overlap_dominated",
+            "medium": "mixed",
+            "moderate": "mixed",
+            "low": "insufficient",
+            "weak": "insufficient",
+            "ambiguous": "mixed",
+            "none": "insufficient",
+            "not applicable": "not_applicable",
+            "n/a": "not_applicable",
+        },
+    )
+    target_identity_summary = str(payload.get("target_identity_summary") or "").strip()[:1200]
+    target_identity_uncertainty = _class_analysis_qwen_review_coerce_choice(
+        payload.get("target_identity_uncertainty")
+        if payload.get("target_identity_uncertainty") is not None
+        else payload.get("identity_uncertainty"),
+        CLASS_ANALYSIS_QWEN_REVIEW_TARGET_IDENTITY_UNCERTAINTY_LEVELS,
+        "high" if expanded_by_controller and decision in {"accept_suggested", "change_to_other"} else "low",
+        synonyms={
+            "clear": "low",
+            "certain": "low",
+            "confident": "low",
+            "medium": "moderate",
+            "uncertain": "high",
+            "unclear": "high",
+            "ambiguous": "high",
+        },
+    )
+    dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point, evidence_ledger)
+    payload_dual_conflict = payload.get("dual_bbox_conflict") if isinstance(payload.get("dual_bbox_conflict"), dict) else None
+    if not dual_bbox_conflict and payload_dual_conflict:
+        dual_bbox_conflict = dict(payload_dual_conflict)
+    dual_bbox_resolution = str(payload.get("dual_bbox_resolution") or "").strip().lower() or "not_applicable"
+    if dual_bbox_resolution not in CLASS_ANALYSIS_QWEN_REVIEW_DUAL_BBOX_RESOLUTIONS:
+        dual_bbox_resolution = "not_applicable"
+    def _coerce_payload_bool(value: Any) -> bool:
+        if isinstance(value, bool):
+            return value
+        if isinstance(value, (int, float)):
+            return bool(value)
+        return str(value or "").strip().lower() in {"1", "true", "yes", "y", "on"}
+
+    cue_verifier_class_change_verified = _coerce_payload_bool(
+        payload.get("_cue_verifier_class_change_verified")
+    )
+    try:
+        cue_verifier_confidence = float(payload.get("_cue_verifier_confidence") or 0.0)
+    except Exception:
+        cue_verifier_confidence = 0.0
+    if not math.isfinite(cue_verifier_confidence):
+        cue_verifier_confidence = 0.0
+    cue_verifier_confidence = max(0.0, min(1.0, cue_verifier_confidence))
+
+    overlap_explains_candidate_similarity = _coerce_payload_bool(payload.get("overlap_explains_candidate_similarity"))
+    overlap_adjudication_verified = _coerce_payload_bool(
+        payload.get("overlap_adjudication_verified")
+        if "overlap_adjudication_verified" in payload
+        else payload.get("_overlap_adjudication_verified")
+    )
+    anchor_adjudication_verified = _coerce_payload_bool(
+        payload.get("anchor_adjudication_verified")
+        if "anchor_adjudication_verified" in payload
+        else payload.get("_anchor_adjudication_verified")
+    )
+    anchor_adjudication_reason = str(payload.get("anchor_adjudication_reason") or "")[:1200]
+    current_class_plausible = _coerce_payload_bool(payload.get("current_class_plausible"))
+    current_class_plausibility_checked = "current_class_plausible" in payload
+    current_class_plausibility_reason = str(payload.get("current_class_plausibility_reason") or "")[:1200]
+    whole_target_extent_supported = _coerce_payload_bool(payload.get("whole_target_extent_supported"))
+    whole_target_extent_reason = str(payload.get("whole_target_extent_reason") or "")[:1200]
+    if payload.get("whole_target_extent_supported") is None and not expanded_by_controller:
+        whole_target_extent_supported = True
+    glossary_or_guidance_used = _coerce_payload_bool(payload.get("glossary_or_guidance_used"))
+    visible_target_cues = _class_analysis_qwen_review_visible_cues_from_payload(
+        payload,
+        current_class=current_class,
+        suggested_class=suggested_class,
+        target_class=target_class,
+    )
+    supporting_clean_evidence_ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+        payload.get("supporting_clean_evidence_ids")
+        if payload.get("supporting_clean_evidence_ids") is not None
+        else payload.get("visible_cue_evidence_ids")
+        if payload.get("visible_cue_evidence_ids") is not None
+        else payload.get("clean_evidence_ids"),
+        allowed_ids=evidence_ids,
+        limit=6,
+    )
+    target_identity_evidence_ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+        payload.get("target_identity_evidence_ids")
+        if payload.get("target_identity_evidence_ids") is not None
+        else payload.get("identity_evidence_ids")
+        if payload.get("identity_evidence_ids") is not None
+        else supporting_clean_evidence_ids,
+        allowed_ids=evidence_ids,
+        limit=6,
+    )
+    quality_allowed = {"clear", "limited", "poor"}
+    visibility_allowed = {"clear", "partial", "tiny_or_blurry", "not_visible"}
+    evidence_allowed = {"strong", "moderate", "weak", "none"}
+    local_consensus_allowed = {"supports_current", "supports_suggested", "mixed", "absent", "not_applicable"}
+    deterministic_context_allowed = {
+        "supports_current",
+        "questions_current",
+        "neutral",
+        "insufficient",
+        "not_applicable",
+    }
+    specificity_alignment_allowed = set(CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_ALIGNMENT_LEVELS)
+    target_background_contrast_allowed = set(CLASS_ANALYSIS_QWEN_REVIEW_TARGET_BACKGROUND_CONTRAST_LEVELS)
+    overlap_allowed = {
+        "none",
+        "duplicate_like",
+        "partial_contamination",
+        "target_contains_other",
+        "other_contains_target",
+        "near_context",
+        "unclear",
+    }
+    if overlap_assessment not in overlap_allowed and "|" in overlap_assessment:
+        overlap_assessment = "unclear"
+    missing_schema = [
+        name
+        for name, value in (
+            ("visual_quality", visual_quality_value),
+            ("object_visibility", object_visibility),
+            ("current_evidence", current_evidence),
+            ("suggested_evidence", suggested_evidence),
+            ("target_evidence", target_evidence),
+            ("overlap_assessment", overlap_assessment),
+            ("anchor_evidence_current", anchor_evidence_current),
+            ("anchor_evidence_suggested", anchor_evidence_suggested),
+            ("local_context_evidence", local_context_evidence),
+            ("global_context_evidence", global_context_evidence),
+        )
+        if not value
+    ]
+    for boolean_field in ("overlap_explains_candidate_similarity", "glossary_or_guidance_used"):
+        if boolean_field not in payload:
+            missing_schema.append(boolean_field)
+    if missing_schema:
+        raise ValueError(f"final schema missing: {', '.join(missing_schema)}")
+    if visual_quality_value not in quality_allowed:
+        raise ValueError("visual_quality must be clear, limited, or poor")
+    if object_visibility not in visibility_allowed:
+        raise ValueError("object_visibility must be clear, partial, tiny_or_blurry, or not_visible")
+    if local_consensus_evidence not in local_consensus_allowed:
+        raise ValueError("local_consensus_evidence must be supports_current, supports_suggested, mixed, absent, or not_applicable")
+    if same_image_scale_evidence not in deterministic_context_allowed:
+        same_image_scale_evidence = "not_applicable"
+    if same_image_embedding_evidence not in deterministic_context_allowed:
+        same_image_embedding_evidence = "not_applicable"
+    if specificity_alignment not in specificity_alignment_allowed:
+        raise ValueError("specificity_alignment must be supports_current, supports_suggested, supports_other, mixed, insufficient, or not_applicable")
+    if target_background_contrast not in target_background_contrast_allowed:
+        raise ValueError("target_background_contrast must be target_specific, background_dominated, overlap_dominated, mixed, insufficient, or not_applicable")
+    if overlap_assessment not in overlap_allowed:
+        raise ValueError("overlap_assessment must be none, duplicate_like, partial_contamination, target_contains_other, other_contains_target, near_context, or unclear")
+    for field_name, field_value in (
+        ("current_evidence", current_evidence),
+        ("suggested_evidence", suggested_evidence),
+        ("target_evidence", target_evidence),
+        ("anchor_evidence_current", anchor_evidence_current),
+        ("anchor_evidence_suggested", anchor_evidence_suggested),
+        ("local_context_evidence", local_context_evidence),
+        ("global_context_evidence", global_context_evidence),
+    ):
+        if field_value not in evidence_allowed:
+            raise ValueError(f"{field_name} must be strong, moderate, weak, or none")
+    try:
+        confidence = float(payload.get("confidence"))
+    except Exception:
+        confidence = 0.0
+    if not math.isfinite(confidence):
+        confidence = 0.0
+    confidence = max(0.0, min(1.0, confidence))
+    final_evidence_ids = [
+        str(item or "").strip()
+        for item in (payload.get("evidence_ids") or [])
+        if str(item or "").strip() in evidence_ids
+    ]
+    backend_quality = dict(visual_quality or {})
+    backend_tier = str(backend_quality.get("tier") or "unknown").strip().lower()
+    backend_edge_clipped = _coerce_payload_bool(backend_quality.get("edge_clipped"))
+    guardrail_reasons: List[str] = []
+    advisory_reasons: List[str] = []
+    confidence_cap: Optional[float] = None
+
+    def _hard(reason: str) -> None:
+        guardrail_reasons.append(reason)
+
+    def _advise(reason: str, cap: float = 0.72) -> None:
+        nonlocal confidence_cap
+        advisory_reasons.append(reason)
+        confidence_cap = cap if confidence_cap is None else min(confidence_cap, cap)
+
+    dual_other_class = _class_analysis_qwen_review_dual_bbox_other_class(dual_bbox_conflict)
+    dual_current_norm = _class_analysis_qwen_review_normalize_label(current_class)
+    dual_other_norm = _class_analysis_qwen_review_normalize_label(dual_other_class)
+    dual_target_norm = _class_analysis_qwen_review_normalize_label(target_class)
+    dual_bbox_active = bool(dual_bbox_conflict and dual_other_class and dual_other_norm != dual_current_norm)
+    dual_bbox_target_switch_path = (
+        dual_bbox_active
+        and decision in {"accept_suggested", "change_to_other"}
+        and dual_bbox_resolution == "overlap_box_class"
+        and dual_target_norm == dual_other_norm
+        and backend_tier == "clear"
+        and visual_quality_value == "clear"
+        and object_visibility == "clear"
+        and current_evidence in {"weak", "none"}
+        and target_evidence == "strong"
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+    )
+    class_change_specificity_probe = (
+        evidence_ledger.get("specificity_probe")
+        if isinstance(evidence_ledger, dict) and isinstance(evidence_ledger.get("specificity_probe"), dict)
+        else None
+    )
+    try:
+        class_change_probe_confidence = (
+            float(class_change_specificity_probe.get("confidence") or 0.0)
+            if class_change_specificity_probe
+            else 0.0
+        )
+    except Exception:
+        class_change_probe_confidence = 0.0
+    if not math.isfinite(class_change_probe_confidence):
+        class_change_probe_confidence = 0.0
+    class_change_probe_alignment = (
+        str(class_change_specificity_probe.get("specificity_alignment") or "").strip().lower()
+        if class_change_specificity_probe
+        else ""
+    )
+    class_change_probe_contrast = (
+        str(class_change_specificity_probe.get("target_background_contrast") or "").strip().lower()
+        if class_change_specificity_probe
+        else ""
+    )
+    class_change_probe_margin = (
+        str(class_change_specificity_probe.get("specificity_margin") or "").strip().lower()
+        if class_change_specificity_probe
+        else ""
+    )
+    class_change_probe_best_norm = _class_analysis_qwen_review_normalize_label(
+        class_change_specificity_probe.get("best_supported_class") if class_change_specificity_probe else ""
+    )
+    class_change_target_norm = _class_analysis_qwen_review_normalize_label(target_class)
+    raw_class_change_probe_validation_errors = (
+        class_change_specificity_probe.get("validation_errors")
+        if isinstance(class_change_specificity_probe, dict)
+        else []
+    )
+    if raw_class_change_probe_validation_errors is None:
+        raw_class_change_probe_validation_errors = []
+    if isinstance(raw_class_change_probe_validation_errors, str):
+        raw_class_change_probe_validation_errors = [raw_class_change_probe_validation_errors]
+    if not isinstance(raw_class_change_probe_validation_errors, (list, tuple)):
+        raw_class_change_probe_validation_errors = []
+    class_change_probe_validation_errors = [
+        str(item or "").strip()
+        for item in raw_class_change_probe_validation_errors
+        if str(item or "").strip()
+    ]
+    class_change_probe_completed = (
+        isinstance(class_change_specificity_probe, dict)
+        and str(class_change_specificity_probe.get("status") or "").strip().lower() == "completed"
+    )
+    class_change_probe_supports_target = (
+        class_change_probe_completed
+        and class_change_probe_confidence >= 0.75
+        and class_change_probe_alignment == "supports_suggested"
+        and class_change_probe_contrast == "target_specific"
+        and class_change_probe_margin
+        not in {"current_target_favored", "background_or_overlap_favored", "low_contrast", "insufficient"}
+        and bool(class_change_probe_best_norm)
+        and class_change_probe_best_norm == class_change_target_norm
+    )
+    class_change_probe_target_favored_but_incomplete = (
+        class_change_probe_completed
+        and bool(class_change_probe_validation_errors)
+        and class_change_probe_confidence >= 0.75
+        and class_change_probe_alignment == "supports_suggested"
+        and class_change_probe_margin
+        not in {"current_target_favored", "background_or_overlap_favored", "low_contrast", "insufficient"}
+        and bool(class_change_probe_best_norm)
+        and class_change_probe_best_norm == class_change_target_norm
+    )
+    deterministic_current_support_count = sum(
+        1
+        for value in (
+            same_image_scale_evidence,
+            same_image_embedding_evidence,
+            local_consensus_evidence,
+        )
+        if str(value or "").strip().lower() == "supports_current"
+    )
+    cue_verified_overlap_rebuttal = _coerce_payload_bool(
+        payload.get("_cue_verifier_overlap_rebutted")
+    )
+    cue_verified_target_specific_overlap = (
+        str(payload.get("_cue_verifier_overlap_risk") or "").strip().lower()
+        in {"target_specific", "not_applicable"}
+    )
+    cue_verified_edge_clip_recoverable = _coerce_payload_bool(
+        payload.get("_cue_verifier_edge_clip_recoverable")
+    )
+    cue_verified_edge_clip_ok = (
+        not backend_edge_clipped
+        or (
+            backend_edge_clipped
+            and object_visibility == "clear"
+            and cue_verifier_confidence >= 0.92
+            and cue_verified_edge_clip_recoverable
+            and whole_target_extent_supported
+            and not current_class_plausible
+        )
+    )
+    cue_verified_reviewable_partial_path = (
+        object_visibility == "partial"
+        and cue_verifier_confidence >= 0.9
+        and deterministic_current_support_count <= 1
+        and cue_verified_overlap_rebuttal
+        and cue_verified_target_specific_overlap
+    )
+    cue_verified_deterministic_context_ok = (
+        deterministic_current_support_count == 0
+        or (
+            deterministic_current_support_count == 1
+            and cue_verifier_confidence >= 0.9
+            and not current_class_plausible
+            and cue_verified_overlap_rebuttal
+            and cue_verified_target_specific_overlap
+        )
+    )
+    cue_verified_overlap_ok = (
+        overlap_assessment in {"none", "near_context"}
+        or (
+            overlap_assessment == "partial_contamination"
+            and overlap_adjudication_verified
+            and cue_verified_overlap_rebuttal
+            and cue_verified_target_specific_overlap
+        )
+        or (
+            overlap_assessment == "unclear"
+            and cue_verified_overlap_rebuttal
+            and cue_verified_target_specific_overlap
+            and deterministic_current_support_count <= 1
+        )
+    )
+    cue_verified_probe_ok = class_change_probe_supports_target or (
+        class_change_probe_target_favored_but_incomplete
+        and cue_verifier_class_change_verified
+        and cue_verifier_confidence >= 0.9
+        and cue_verified_target_specific_overlap
+        and not current_class_plausible
+    )
+    cue_verified_limited_class_change_path = (
+        decision == "accept_suggested"
+        and expanded_by_controller
+        and cue_verifier_class_change_verified
+        and cue_verifier_confidence >= 0.9
+        and backend_tier == "limited"
+        and cue_verified_edge_clip_ok
+        and visual_quality_value in {"clear", "limited"}
+        and (
+            object_visibility == "clear"
+            or cue_verified_reviewable_partial_path
+        )
+        and current_evidence in {"weak", "none"}
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and anchor_evidence_suggested in {"strong", "moderate"}
+        and (
+            anchor_evidence_suggested == "strong"
+            or anchor_adjudication_verified
+        )
+        and current_class_plausibility_checked
+        and not current_class_plausible
+        and specificity_alignment == "supports_suggested"
+        and target_background_contrast == "target_specific"
+        and cue_verified_probe_ok
+        and len(visible_target_cues) >= 2
+        and bool(supporting_clean_evidence_ids)
+        and whole_target_extent_supported
+        and (
+            not overlap_explains_candidate_similarity
+            or (cue_verified_overlap_rebuttal and cue_verified_target_specific_overlap)
+        )
+        and cue_verified_deterministic_context_ok
+        and cue_verified_overlap_ok
+    )
+    cue_verified_limited_dual_bbox_switch_path = (
+        decision == "accept_suggested"
+        and expanded_by_controller
+        and dual_bbox_active
+        and dual_bbox_resolution == "overlap_box_class"
+        and dual_target_norm == dual_other_norm
+        and overlap_assessment == "duplicate_like"
+        and not backend_edge_clipped
+        and cue_verifier_class_change_verified
+        and cue_verifier_confidence >= 0.9
+        and cue_verified_overlap_rebuttal
+        and cue_verified_target_specific_overlap
+        and backend_tier == "limited"
+        and visual_quality_value in {"clear", "limited"}
+        and (
+            object_visibility == "clear"
+            or cue_verified_reviewable_partial_path
+        )
+        and current_evidence in {"weak", "none"}
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and anchor_evidence_suggested in {"strong", "moderate"}
+        and (
+            anchor_evidence_suggested == "strong"
+            or anchor_adjudication_verified
+        )
+        and current_class_plausibility_checked
+        and not current_class_plausible
+        and specificity_alignment == "supports_suggested"
+        and target_background_contrast == "target_specific"
+        and cue_verified_probe_ok
+        and len(visible_target_cues) >= 2
+        and bool(supporting_clean_evidence_ids)
+        and whole_target_extent_supported
+        and deterministic_current_support_count == 0
+    )
+    if dual_bbox_active:
+        _advise(
+            (
+                f"dual-bbox conflict active: near-identical cross-class boxes "
+                f"{current_class} vs {dual_other_class}"
+            ),
+            0.86,
+        )
+        if dual_bbox_resolution == "not_applicable":
+            _hard("dual-bbox conflict requires dual_bbox_resolution")
+        elif dual_bbox_resolution == "current_box_class" and decision not in {"confirm_current", "skip_uncertain"}:
+            _hard("dual_bbox_resolution=current_box_class requires confirm_current or skip_uncertain")
+        elif dual_bbox_resolution == "overlap_box_class":
+            if decision not in {"accept_suggested", "change_to_other"}:
+                _hard("dual_bbox_resolution=overlap_box_class requires a class-change decision")
+            elif dual_target_norm != dual_other_norm:
+                _hard(
+                    f"dual-bbox overlap resolution may only switch to overlapping class {dual_other_class}, got {target_class}"
+                )
+        elif dual_bbox_resolution in {"both_valid_overlapping_objects", "uncertain_or_neither"} and decision != "skip_uncertain":
+            _hard(f"dual_bbox_resolution={dual_bbox_resolution} requires skip_uncertain")
+        if decision == "change_to_other" and dual_bbox_resolution == "overlap_box_class" and dual_other_class == suggested_class:
+            _hard("dual-bbox overlap class equals suggested class; use accept_suggested")
+    elif dual_bbox_resolution != "not_applicable":
+        _advise("dual_bbox_resolution supplied without a controller-detected dual-bbox conflict", 0.72)
+
+    if backend_tier == "poor":
+        _hard("backend visual-quality tier is poor")
+    elif backend_tier and backend_tier != "clear":
+        _advise(f"backend visual-quality tier is {backend_tier}", 0.65)
+        if (
+            decision in {"accept_suggested", "change_to_other"}
+            and backend_edge_clipped
+            and not cue_verified_limited_class_change_path
+            and not cue_verified_limited_dual_bbox_switch_path
+        ):
+            _hard(f"{decision} is advisory-only because the target bbox is clipped by the source image edge")
+        if (
+            decision in {"accept_suggested", "change_to_other"}
+            and not cue_verified_limited_class_change_path
+            and not cue_verified_limited_dual_bbox_switch_path
+        ):
+            _hard(f"{decision} is advisory-only because backend visual-quality tier is {backend_tier}")
+    if visual_quality_value == "poor":
+        _hard("model visual-quality self-check is poor")
+    elif visual_quality_value != "clear":
+        _advise(f"model visual-quality self-check is {visual_quality_value}", 0.65)
+    if object_visibility in {"tiny_or_blurry", "not_visible"}:
+        _hard(f"model object visibility is {object_visibility}")
+    elif object_visibility != "clear":
+        _advise(f"model object visibility is {object_visibility}", 0.65)
+    if decision != "skip_uncertain" and target_evidence not in {"strong", "moderate"}:
+        _hard(f"target class evidence is only {target_evidence}")
+    if (
+        decision in {"accept_suggested", "change_to_other"}
+        and backend_tier != "clear"
+        and not cue_verified_limited_class_change_path
+        and not cue_verified_limited_dual_bbox_switch_path
+    ):
+        _hard(f"{decision} requires clear backend visual-quality tier, got {backend_tier or 'unknown'}")
+    if decision in {"accept_suggested", "change_to_other"}:
+        required_specificity = "supports_suggested" if decision == "accept_suggested" else "supports_other"
+        if specificity_alignment != required_specificity:
+            _hard(
+                f"{decision} requires target-contained specificity_alignment={required_specificity}, "
+                f"got {specificity_alignment}"
+            )
+        if target_background_contrast != "target_specific":
+            _hard(
+                f"{decision} requires target_background_contrast=target_specific, got {target_background_contrast}"
+            )
+        specificity_probe = (
+            evidence_ledger.get("specificity_probe")
+            if isinstance(evidence_ledger, dict) and isinstance(evidence_ledger.get("specificity_probe"), dict)
+            else None
+        )
+        if specificity_probe and specificity_probe.get("status") == "completed":
+            try:
+                probe_confidence = float(specificity_probe.get("confidence") or 0.0)
+            except Exception:
+                probe_confidence = 0.0
+            if not math.isfinite(probe_confidence):
+                probe_confidence = 0.0
+            probe_confidence = max(0.0, min(1.0, probe_confidence))
+            probe_alignment = str(specificity_probe.get("specificity_alignment") or "insufficient").strip().lower()
+            probe_contrast = str(specificity_probe.get("target_background_contrast") or "insufficient").strip().lower()
+            probe_margin = str(specificity_probe.get("specificity_margin") or "insufficient").strip().lower()
+            probe_best_class = str(specificity_probe.get("best_supported_class") or "").strip()
+            probe_target_norm = _class_analysis_qwen_review_normalize_label(probe_best_class)
+            final_target_norm = _class_analysis_qwen_review_normalize_label(target_class)
+            if probe_confidence >= 0.75:
+                if probe_alignment == "supports_current":
+                    _hard(
+                        "class change contradicts Qwen specificity probe: target-contained cues support current class"
+                    )
+                elif probe_contrast in {"background_dominated", "overlap_dominated"}:
+                    if cue_verified_probe_ok and class_change_probe_validation_errors:
+                        _advise(
+                            (
+                                "Qwen specificity probe contrast was incomplete or context-mixed, "
+                                "but cue verifier supplied target-specific support"
+                            ),
+                            0.72,
+                        )
+                    else:
+                        _hard(
+                            f"class change contradicts Qwen specificity probe: target/background contrast is {probe_contrast}"
+                        )
+                elif probe_margin == "background_or_overlap_favored":
+                    _hard(
+                        "class change contradicts Qwen specificity probe: sub-description margin favors background/overlap"
+                    )
+                elif probe_margin == "current_target_favored":
+                    _hard(
+                        "class change contradicts Qwen specificity probe: sub-description margin favors the current target class"
+                    )
+                elif decision == "accept_suggested" and probe_margin in {"other_target_favored", "low_contrast", "insufficient"}:
+                    _advise(
+                        f"Qwen specificity probe sub-description margin is {probe_margin}",
+                        0.72,
+                    )
+                elif decision == "change_to_other" and probe_margin in {"suggested_target_favored", "current_target_favored", "low_contrast", "insufficient"}:
+                    _advise(
+                        f"Qwen specificity probe sub-description margin is {probe_margin}",
+                        0.72,
+                    )
+                elif probe_target_norm and probe_target_norm != final_target_norm and probe_alignment in {"supports_suggested", "supports_other"}:
+                    _hard(
+                        f"class change contradicts Qwen specificity probe best-supported class {probe_best_class}"
+                    )
+                elif probe_alignment == "mixed" or probe_contrast == "mixed":
+                    _advise("Qwen specificity probe found mixed target/background evidence", 0.72)
+            elif probe_alignment in {"supports_current", "mixed"} or probe_contrast in {"background_dominated", "overlap_dominated", "mixed"}:
+                _advise("Qwen specificity probe is uncertain or conflicts with the class-change path", 0.72)
+        if expanded_by_controller and not target_identity_summary:
+            _hard(f"{decision} requires a class-neutral target_identity_summary")
+        if expanded_by_controller and target_identity_uncertainty == "high":
+            _hard(f"{decision} cannot proceed with high target identity uncertainty")
+        elif target_identity_uncertainty == "moderate":
+            _advise("target identity summary has moderate uncertainty", 0.72)
+        if target_identity_summary:
+            identity_payload = {"rationale_short": f"Target object shows {target_identity_summary}"}
+            if (
+                _class_analysis_qwen_review_text_directly_supports_label(
+                    label=current_class,
+                    payload=identity_payload,
+                )
+                and not _class_analysis_qwen_review_text_rejects_label_for_target(
+                    label=current_class,
+                    payload=identity_payload,
+                )
+            ):
+                _hard(f"{decision} conflicts with target_identity_summary supporting current class {current_class}")
+    elif decision == "confirm_current":
+        if specificity_alignment == "supports_suggested" and suggested_evidence in {"strong", "moderate"}:
+            _advise(
+                "specificity alignment supports the suggested class, so confirm_current remains human-review only",
+                0.68,
+            )
+        if target_background_contrast in {"background_dominated", "overlap_dominated"}:
+            _advise(
+                f"target/background contrast is {target_background_contrast}; confirmation evidence may be context-contaminated",
+                0.68,
+            )
+    clear_target_relabel_path = (
+        decision == "accept_suggested"
+        and backend_tier == "clear"
+        and visual_quality_value == "clear"
+        and object_visibility == "clear"
+        and current_evidence in {"weak", "none"}
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and overlap_assessment in {"none", "near_context"}
+    )
+    verified_overlap_rebuttal_relabel_path = (
+        decision == "accept_suggested"
+        and len(visible_target_cues) >= 2
+        and backend_tier == "clear"
+        and visual_quality_value == "clear"
+        and object_visibility == "clear"
+        and current_evidence in {"weak", "none"}
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and anchor_evidence_suggested == "moderate"
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and overlap_assessment == "partial_contamination"
+        and not overlap_explains_candidate_similarity
+        and overlap_adjudication_verified
+        and specificity_alignment == "supports_suggested"
+        and target_background_contrast == "target_specific"
+        and same_image_scale_evidence != "supports_current"
+        and same_image_embedding_evidence != "supports_current"
+        and (
+            same_image_scale_evidence == "questions_current"
+            or same_image_embedding_evidence == "questions_current"
+            or local_consensus_evidence == "supports_suggested"
+        )
+    )
+    verified_moderate_anchor_relabel_path = (
+        decision == "accept_suggested"
+        and len(visible_target_cues) >= 2
+        and backend_tier == "clear"
+        and visual_quality_value == "clear"
+        and object_visibility == "clear"
+        and current_evidence in {"weak", "none"}
+        and current_class_plausibility_checked
+        and not current_class_plausible
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and anchor_evidence_suggested == "moderate"
+        and anchor_adjudication_verified
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and specificity_alignment == "supports_suggested"
+        and target_background_contrast == "target_specific"
+        and local_consensus_evidence != "supports_current"
+        and same_image_scale_evidence != "supports_current"
+        and same_image_embedding_evidence != "supports_current"
+        and (
+            (
+                overlap_assessment in {"none", "near_context"}
+                and not overlap_explains_candidate_similarity
+            )
+            or (
+                overlap_assessment == "partial_contamination"
+                and overlap_adjudication_verified
+                and not overlap_explains_candidate_similarity
+            )
+        )
+    )
+    single_cue_supported_relabel_path = (
+        decision == "accept_suggested"
+        and len(visible_target_cues) == 1
+        and backend_tier == "clear"
+        and visual_quality_value == "clear"
+        and object_visibility == "clear"
+        and current_evidence in {"weak", "none"}
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and (
+            anchor_evidence_suggested == "strong"
+            or verified_overlap_rebuttal_relabel_path
+        )
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and local_consensus_evidence == "supports_suggested"
+        and overlap_assessment in {"none", "near_context"}
+        and not overlap_explains_candidate_similarity
+        and same_image_scale_evidence != "supports_current"
+        and same_image_embedding_evidence != "supports_current"
+    )
+    moderate_anchor_needs_plausibility_check = (
+        decision in {"accept_suggested", "change_to_other"}
+        and anchor_evidence_suggested == "moderate"
+        and not dual_bbox_target_switch_path
+        and not cue_verified_limited_dual_bbox_switch_path
+        and not verified_overlap_rebuttal_relabel_path
+        and not verified_moderate_anchor_relabel_path
+        and current_evidence in {"weak", "none"}
+        and target_evidence == "strong"
+        and same_image_scale_evidence in {"insufficient", "neutral", "not_applicable"}
+        and same_image_embedding_evidence in {"insufficient", "neutral", "not_applicable"}
+    )
+    confirm_current_reviewable_quality_path = (
+        decision == "confirm_current"
+        and (
+            (
+                backend_tier == "clear"
+                and visual_quality_value == "clear"
+                and object_visibility == "clear"
+            )
+            or (
+                backend_tier == "limited"
+                and visual_quality_value in {"clear", "limited"}
+                and object_visibility in {"clear", "partial"}
+            )
+        )
+    )
+    confirm_current_overlap_rebuttal_path = (
+        decision == "confirm_current"
+        and confirm_current_reviewable_quality_path
+        and current_evidence == "strong"
+        and target_evidence == "strong"
+        and anchor_evidence_current in {"strong", "moderate"}
+        and bool(visible_target_cues)
+        and overlap_explains_candidate_similarity
+        and overlap_assessment in {"partial_contamination", "near_context", "other_contains_target"}
+    )
+    confirm_probe = (
+        evidence_ledger.get("specificity_probe")
+        if isinstance(evidence_ledger, dict) and isinstance(evidence_ledger.get("specificity_probe"), dict)
+        else None
+    )
+    try:
+        confirm_probe_confidence = float(confirm_probe.get("confidence") or 0.0) if confirm_probe else 0.0
+    except Exception:
+        confirm_probe_confidence = 0.0
+    if not math.isfinite(confirm_probe_confidence):
+        confirm_probe_confidence = 0.0
+    confirm_probe_alignment = str(confirm_probe.get("specificity_alignment") or "").strip().lower() if confirm_probe else ""
+    confirm_probe_contrast = str(confirm_probe.get("target_background_contrast") or "").strip().lower() if confirm_probe else ""
+    confirm_probe_margin = str(confirm_probe.get("specificity_margin") or "").strip().lower() if confirm_probe else ""
+    confirm_probe_class_norm = _class_analysis_qwen_review_normalize_label(
+        confirm_probe.get("best_supported_class") if confirm_probe else ""
+    )
+    confirm_current_specificity_rebuttal_path = (
+        decision == "confirm_current"
+        and confirm_current_reviewable_quality_path
+        and current_evidence == "strong"
+        and target_evidence == "strong"
+        and specificity_alignment == "supports_current"
+        and target_background_contrast == "target_specific"
+        and current_class
+        and bool(visible_target_cues)
+        and confirm_probe_confidence >= 0.75
+        and confirm_probe_alignment == "supports_current"
+        and confirm_probe_contrast == "target_specific"
+        and confirm_probe_class_norm == _class_analysis_qwen_review_normalize_label(current_class)
+    )
+    confirm_current_specificity_conflict = (
+        decision == "confirm_current"
+        and bool(confirm_probe)
+        and confirm_probe.get("status") == "completed"
+        and confirm_probe_confidence >= 0.6
+        and (
+            confirm_probe_alignment in {"supports_suggested", "supports_other"}
+            or confirm_probe_contrast in {"background_dominated", "overlap_dominated"}
+            or confirm_probe_margin in {"suggested_target_favored", "other_target_favored", "background_or_overlap_favored"}
+        )
+    )
+    if (
+        confirm_current_specificity_conflict
+        and not confirm_current_overlap_rebuttal_path
+        and not confirm_current_specificity_rebuttal_path
+    ):
+        conflict_bits = [
+            f"alignment={confirm_probe_alignment or 'insufficient'}",
+            f"contrast={confirm_probe_contrast or 'insufficient'}",
+            f"margin={confirm_probe_margin or 'insufficient'}",
+        ]
+        _hard(
+            "confirm_current conflicts with Qwen specificity probe: "
+            + ", ".join(conflict_bits)
+        )
+    if decision in {"accept_suggested", "change_to_other"} and len(visible_target_cues) < 2:
+        if single_cue_supported_relabel_path:
+            _advise(
+                "accept_suggested uses one concrete visible cue plus strong independent local/anchor support",
+                0.86,
+            )
+        else:
+            _hard(f"{decision} requires at least two concrete visible target cues, got {len(visible_target_cues)}")
+    elif decision == "confirm_current" and not visible_target_cues:
+        _advise("confirm_current has no visible target cue ledger", 0.72)
+    if decision in {"accept_suggested", "change_to_other"} and not whole_target_extent_supported:
+        _hard(
+            f"{decision} requires the recommended class to explain the whole target extent"
+            + (f": {whole_target_extent_reason}" if whole_target_extent_reason else "")
+        )
+    if decision in {"accept_suggested", "change_to_other"} and isinstance(evidence_ledger, dict):
+        ledger_rows = [row for row in (evidence_ledger.get("rows") or []) if isinstance(row, dict)]
+        clean_visual_ids = {
+            str(item or "").strip()
+            for item in (evidence_ledger.get("clean_visual_evidence_ids") or [])
+            if str(item or "").strip()
+        }
+        if not clean_visual_ids and ledger_rows:
+            clean_visual_ids = {
+                str(row.get("evidence_id") or "").strip()
+                for row in ledger_rows
+                if str(row.get("use") or "").strip() == "clean_visual"
+                and str(row.get("evidence_id") or "").strip()
+            }
+        target_clean_ids = set(clean_visual_ids)
+        ledger_target_source_ids = {
+            str(item or "").strip()
+            for item in (evidence_ledger.get("clean_target_source_evidence_ids") or [])
+            if str(item or "").strip()
+        }
+        if ledger_target_source_ids:
+            target_clean_ids = ledger_target_source_ids
+        if ledger_rows:
+            target_clean_ids = {
+                str(row.get("evidence_id") or "").strip()
+                for row in ledger_rows
+                if str(row.get("use") or "").strip() == "clean_visual"
+                and str(row.get("kind") or "").strip() != "class_context_pack"
+                and str(row.get("evidence_id") or "").strip()
+            }
+        supporting_ids = set(supporting_clean_evidence_ids)
+        if not target_clean_ids:
+            _hard(f"{decision} requires controller-rendered clean target/source evidence")
+        elif not supporting_ids:
+            _hard(f"{decision} requires supporting_clean_evidence_ids from clean target/source evidence")
+        elif not supporting_ids.intersection(clean_visual_ids):
+            _hard(f"{decision} supporting_clean_evidence_ids do not reference clean visual evidence")
+        elif not supporting_ids.intersection(target_clean_ids):
+            _hard(f"{decision} must cite at least one clean target/source evidence id, not reference-only context")
+        identity_ids = set(target_identity_evidence_ids)
+        if expanded_by_controller and target_identity_summary and not identity_ids:
+            _hard(f"{decision} target_identity_summary requires target_identity_evidence_ids")
+        elif identity_ids and not identity_ids.intersection(clean_visual_ids):
+            _hard(f"{decision} target_identity_evidence_ids do not reference clean visual evidence")
+        elif identity_ids and not identity_ids.intersection(target_clean_ids):
+            _hard(f"{decision} target_identity_evidence_ids must include clean target/source evidence")
+    if decision == "accept_suggested" and current_evidence not in {"weak", "none"}:
+        if current_evidence == "strong":
+            _hard("accept_suggested cannot override current_evidence=strong")
+        else:
+            _advise(f"accept_suggested conflicts with current_evidence={current_evidence}", 0.72)
+    if decision == "accept_suggested" and suggested_evidence != "strong":
+        _hard(f"accept_suggested requires suggested_evidence strong, got {suggested_evidence}")
+    if decision in {"accept_suggested", "change_to_other"} and current_class_plausible:
+        _hard(
+            "class-change target still plausibly fits the current class"
+            + (f": {current_class_plausibility_reason}" if current_class_plausibility_reason else "")
+        )
+    elif moderate_anchor_needs_plausibility_check and not current_class_plausibility_checked:
+        _hard(
+            "moderate-anchor class change with no same-image deterministic support requires current-class plausibility verification"
+        )
+    if decision == "accept_suggested" and anchor_evidence_suggested != "strong":
+        if anchor_evidence_suggested == "moderate" and (
+            clear_target_relabel_path
+            or dual_bbox_target_switch_path
+            or cue_verified_limited_dual_bbox_switch_path
+            or verified_overlap_rebuttal_relabel_path
+            or verified_moderate_anchor_relabel_path
+            or cue_verified_limited_class_change_path
+        ):
+            _advise("accept_suggested has only moderate suggested-anchor agreement", 0.72)
+        else:
+            _hard(f"accept_suggested requires strong suggested-anchor agreement, got {anchor_evidence_suggested}")
+    if decision == "accept_suggested" and local_consensus_evidence == "supports_current" and current_evidence not in {"weak", "none"}:
+        _hard("accept_suggested conflicts with local_consensus_evidence=supports_current")
+    if decision in {"accept_suggested", "change_to_other"} and same_image_scale_evidence == "supports_current":
+        _advise("same-image scale report supports the current class", 0.68)
+    if decision in {"accept_suggested", "change_to_other"} and same_image_embedding_evidence == "supports_current":
+        _advise("same-image embedding report supports the current class", 0.68)
+    if decision == "confirm_current" and suggested_class and suggested_evidence not in {"weak", "none"}:
+        if confirm_current_overlap_rebuttal_path:
+            _advise(
+                f"confirm_current rebuts suggested_evidence={suggested_evidence} using target-visible current cues and overlap/near-context explanation",
+                0.82,
+            )
+        elif confirm_current_specificity_rebuttal_path:
+            _advise(
+                f"confirm_current rebuts suggested_evidence={suggested_evidence} using high-confidence Qwen specificity-probe support for the current class",
+                0.82,
+            )
+        elif suggested_evidence == "strong":
+            _hard("confirm_current cannot override target-contained suggested_evidence=strong without overlap/near-context rebuttal")
+        else:
+            _advise(f"confirm_current conflicts with suggested_evidence={suggested_evidence}", 0.72)
+    if decision == "confirm_current" and same_image_scale_evidence == "questions_current":
+        _advise("same-image scale report questions the current class", 0.68)
+    if decision == "confirm_current" and same_image_embedding_evidence == "questions_current":
+        _advise("same-image embedding report questions the current class", 0.68)
+    if decision == "confirm_current" and anchor_evidence_current == "none":
+        _hard("confirm_current requires some current anchor evidence")
+    elif decision == "confirm_current" and anchor_evidence_current == "weak":
+        _advise("confirm_current has only weak current anchor evidence", 0.68)
+    if decision == "confirm_current" and local_consensus_evidence == "supports_suggested" and suggested_evidence == "strong":
+        if confirm_current_overlap_rebuttal_path:
+            _advise("local consensus supports the suggested class, but overlap/near-context explains that signal", 0.78)
+        elif confirm_current_specificity_rebuttal_path:
+            _advise("local consensus supports the suggested class, but the specificity probe supports the current target", 0.78)
+        else:
+            _hard("confirm_current conflicts with local_consensus_evidence=supports_suggested")
+    if decision == "change_to_other" and (
+        current_evidence not in {"weak", "none"} or suggested_evidence not in {"weak", "none"}
+    ):
+        _hard("change_to_other requires weak/none evidence for both current and suggested classes")
+    if decision in {"accept_suggested", "change_to_other"} and overlap_explains_candidate_similarity:
+        if cue_verified_limited_class_change_path:
+            _advise("cue verifier rebuts overlap as the source of target-specific class evidence", 0.68)
+        elif cue_verified_limited_dual_bbox_switch_path:
+            _advise("cue verifier supports resolving the near-identical dual bbox to the overlapping class", 0.72)
+        elif backend_tier == "clear" and visual_quality_value == "clear" and object_visibility == "clear" and target_evidence == "strong":
+            _advise("overlap decomposition may explain candidate-class similarity", 0.68)
+        else:
+            _hard("overlap decomposition says overlapping-object pixels explain candidate-class similarity")
+    if decision != "skip_uncertain" and overlap_assessment == "unclear":
+        _advise("overlap assessment is unclear", 0.65)
+    overlap_rebuttal_text_supported = _class_analysis_qwen_review_text_rebuts_overlap_contamination(
+        payload,
+        target_class=target_class,
+        labelmap=labelmap,
+        labelmap_glossary=labelmap_glossary,
+    )
+    partial_overlap_rebutted = (
+        decision in {"accept_suggested", "change_to_other"}
+        and overlap_assessment == "partial_contamination"
+        and backend_tier == "clear"
+        and visual_quality_value == "clear"
+        and object_visibility == "clear"
+        and current_evidence in {"weak", "none"}
+        and suggested_evidence == "strong"
+        and target_evidence == "strong"
+        and local_context_evidence == "strong"
+        and global_context_evidence == "strong"
+        and (
+            overlap_rebuttal_text_supported
+            or verified_overlap_rebuttal_relabel_path
+            or verified_moderate_anchor_relabel_path
+            or cue_verified_limited_class_change_path
+        )
+        and (
+            anchor_evidence_suggested == "strong"
+            or verified_overlap_rebuttal_relabel_path
+            or verified_moderate_anchor_relabel_path
+            or cue_verified_limited_class_change_path
+        )
+    )
+    target_class_material_overlap = _class_analysis_qwen_review_target_class_material_overlap(
+        evidence_ledger,
+        target_class,
+    )
+    current_class_material_overlap = _class_analysis_qwen_review_best_class_material_overlap(
+        evidence_ledger,
+        current_class,
+    )
+    if (
+        decision in {"accept_suggested", "change_to_other"}
+        and current_class_material_overlap
+    ):
+        current_cover = float(current_class_material_overlap.get("target_area_covered") or 0.0)
+        target_cover = (
+            float(target_class_material_overlap.get("target_area_covered") or 0.0)
+            if target_class_material_overlap
+            else 0.0
+        )
+        if current_cover >= 0.50 and target_cover <= min(0.25, current_cover * 0.50):
+            overlap_relation = str(current_class_material_overlap.get("relation") or "material_overlap")
+            _hard(
+                f"{decision} conflicts with overlap decomposition: current class {current_class} "
+                f"dominates the target bbox ({overlap_relation}, current_cover={current_cover:.2f}, "
+                f"target_class_cover={target_cover:.2f})"
+            )
+    if partial_overlap_rebutted:
+        _advise("partial overlap present, but verified target-specific evidence rebuts overlap contamination", 0.68)
+    elif (
+        decision in {"accept_suggested", "change_to_other"}
+        and overlap_assessment in {
+        "duplicate_like",
+        "partial_contamination",
+        "target_contains_other",
+        "other_contains_target",
+        "unclear",
+        }
+        and not (dual_bbox_target_switch_path and overlap_assessment == "duplicate_like")
+        and not cue_verified_limited_class_change_path
+        and not (
+            cue_verified_limited_dual_bbox_switch_path
+            and overlap_assessment == "duplicate_like"
+        )
+    ):
+        _hard(f"overlap assessment {overlap_assessment} is too entangled for relabel recommendation")
+    if decision == "accept_suggested":
+        text_conflict_reason = _class_analysis_qwen_review_text_conflicts_with_accept_suggested(
+            current_class=current_class,
+            suggested_class=suggested_class,
+            payload=payload,
+            labelmap=labelmap,
+            labelmap_glossary=labelmap_glossary,
+        )
+        if text_conflict_reason:
+            _hard(text_conflict_reason)
+    guarded_recommendation: Optional[Dict[str, Any]] = None
+    if decision != "skip_uncertain" and guardrail_reasons:
+        original_decision = decision
+        original_target_class = target_class
+        original_confidence = confidence
+        payload_rationale = str(payload.get("rationale_short") or "").strip()
+        guarded_recommendation = {
+            "blocked": True,
+            "decision": original_decision,
+            "target_class": original_target_class,
+            "confidence": original_confidence,
+            "current_class": current_class,
+            "suggested_neighbor_class": suggested_class,
+            "visual_quality": visual_quality_value,
+            "object_visibility": object_visibility,
+            "backend_tier": backend_tier,
+            "backend_edge_clipped": backend_edge_clipped,
+            "current_evidence": current_evidence,
+            "suggested_evidence": suggested_evidence,
+            "target_evidence": target_evidence,
+            "anchor_evidence_current": anchor_evidence_current,
+            "anchor_evidence_suggested": anchor_evidence_suggested,
+            "same_image_scale_evidence": same_image_scale_evidence,
+            "same_image_embedding_evidence": same_image_embedding_evidence,
+            "specificity_alignment": specificity_alignment,
+            "target_background_contrast": target_background_contrast,
+            "target_identity_summary": target_identity_summary,
+            "target_identity_uncertainty": target_identity_uncertainty,
+            "target_identity_evidence_ids": list(target_identity_evidence_ids),
+            "whole_target_extent_supported": whole_target_extent_supported,
+            "whole_target_extent_reason": whole_target_extent_reason,
+            "overlap_assessment": overlap_assessment,
+            "dual_bbox_resolution": dual_bbox_resolution,
+            "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+            "overlap_adjudication_verified": overlap_adjudication_verified,
+            "anchor_adjudication_verified": anchor_adjudication_verified,
+            "anchor_adjudication_reason": anchor_adjudication_reason,
+            "visible_target_cues": list(visible_target_cues),
+            "supporting_clean_evidence_ids": list(supporting_clean_evidence_ids),
+            "guardrail_reasons": list(guardrail_reasons),
+            "advisory_reasons": list(advisory_reasons),
+            "rationale_short": payload_rationale[:1200],
+            "counter_evidence": str(payload.get("counter_evidence") or "")[:1200],
+        }
+        decision = "skip_uncertain"
+        target_class = current_class
+        confidence = min(confidence, 0.25 if backend_tier == "poor" or visual_quality_value == "poor" else 0.45)
+        forced_reason = "; ".join(guardrail_reasons)
+        rationale = f"Guardrail forced skip_uncertain from {original_decision}: {forced_reason}."
+        if payload_rationale:
+            rationale = f"{rationale} Model rationale was: {payload_rationale}"
+        human_review_needed = True
+    else:
+        rationale = str(payload.get("rationale_short") or "")[:1200]
+        human_review_needed = bool(payload.get("human_review_needed", decision == "skip_uncertain"))
+        if decision == "skip_uncertain":
+            human_review_needed = True
+            if guardrail_reasons:
+                confidence = min(confidence, 0.25 if backend_tier == "poor" or visual_quality_value == "poor" else 0.45)
+            else:
+                confidence = min(confidence, 0.5)
+        elif advisory_reasons:
+            human_review_needed = True
+            if confidence_cap is not None:
+                confidence = min(confidence, confidence_cap)
+        elif backend_tier != "clear" or visual_quality_value != "clear" or object_visibility != "clear":
+            human_review_needed = True
+        elif confidence > 0.75 and target_evidence != "strong":
+            confidence = min(confidence, 0.65)
+            human_review_needed = True
+    return {
+        "decision": decision,
+        "target_class": target_class,
+        "confidence": confidence,
+        "evidence_ids": final_evidence_ids,
+        "visual_quality": visual_quality_value,
+        "object_visibility": object_visibility,
+        "current_evidence": current_evidence,
+        "suggested_evidence": suggested_evidence,
+        "target_evidence": target_evidence,
+        "overlap_assessment": overlap_assessment,
+        "overlap_explains_candidate_similarity": overlap_explains_candidate_similarity,
+        "overlap_adjudication_verified": overlap_adjudication_verified,
+        "anchor_adjudication_verified": anchor_adjudication_verified,
+        "anchor_adjudication_reason": anchor_adjudication_reason,
+        "current_class_plausible": current_class_plausible,
+        "current_class_plausibility_reason": current_class_plausibility_reason,
+        "dual_bbox_resolution": dual_bbox_resolution,
+        "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+        "visible_target_cues": list(visible_target_cues),
+        "supporting_clean_evidence_ids": list(supporting_clean_evidence_ids),
+        "anchor_evidence_current": anchor_evidence_current,
+        "anchor_evidence_suggested": anchor_evidence_suggested,
+        "local_context_evidence": local_context_evidence,
+        "local_consensus_evidence": local_consensus_evidence,
+        "global_context_evidence": global_context_evidence,
+        "same_image_scale_evidence": same_image_scale_evidence,
+        "same_image_embedding_evidence": same_image_embedding_evidence,
+        "specificity_alignment": specificity_alignment,
+        "target_background_contrast": target_background_contrast,
+        "target_identity_summary": target_identity_summary,
+        "target_identity_uncertainty": target_identity_uncertainty,
+        "target_identity_evidence_ids": target_identity_evidence_ids,
+        "whole_target_extent_supported": whole_target_extent_supported,
+        "whole_target_extent_reason": whole_target_extent_reason,
+        "glossary_or_guidance_used": glossary_or_guidance_used,
+        "backend_visual_quality": backend_quality,
+        "guardrail_reasons": guardrail_reasons,
+        "advisory_reasons": advisory_reasons,
+        "guarded_recommendation": guarded_recommendation,
+        "rationale_short": rationale[:1200],
+        "counter_evidence": str(payload.get("counter_evidence") or "")[:1200],
+        "human_review_needed": human_review_needed,
+        "applied": False,
+    }
+
+
+def _class_analysis_qwen_review_skip_result(
+    point: Dict[str, Any],
+    reason: str,
+) -> Dict[str, Any]:
+    return {
+        "decision": "skip_uncertain",
+        "target_class": str(point.get("class_name") or ""),
+        "confidence": 0.0,
+        "evidence_ids": [],
+        "visual_quality": "poor",
+        "object_visibility": "not_visible",
+        "current_evidence": "none",
+        "suggested_evidence": "none",
+        "target_evidence": "none",
+        "overlap_assessment": "unclear",
+        "overlap_explains_candidate_similarity": False,
+        "overlap_adjudication_verified": False,
+        "anchor_adjudication_verified": False,
+        "anchor_adjudication_reason": "",
+        "specificity_alignment": "insufficient",
+        "target_background_contrast": "insufficient",
+        "target_identity_summary": "",
+        "target_identity_uncertainty": "high",
+        "target_identity_evidence_ids": [],
+        "whole_target_extent_supported": False,
+        "whole_target_extent_reason": str(reason or "Qwen review did not reach a class-change decision.")[:1200],
+        "dual_bbox_resolution": "not_applicable",
+        "dual_bbox_conflict": None,
+        "visible_target_cues": [],
+        "supporting_clean_evidence_ids": [],
+        "anchor_evidence_current": "none",
+        "anchor_evidence_suggested": "none",
+        "local_context_evidence": "none",
+        "local_consensus_evidence": "not_applicable",
+        "global_context_evidence": "none",
+        "same_image_scale_evidence": "not_applicable",
+        "same_image_embedding_evidence": "not_applicable",
+        "glossary_or_guidance_used": False,
+        "backend_visual_quality": {},
+        "guardrail_reasons": [str(reason or "Qwen review did not reach a validated final decision.")],
+        "guarded_recommendation": None,
+        "rationale_short": str(reason or "Qwen review did not reach a validated final decision."),
+        "counter_evidence": "",
+        "human_review_needed": True,
+        "applied": False,
+    }
+
+
+def _class_analysis_qwen_review_disposition(final_result: Dict[str, Any]) -> Dict[str, Any]:
+    """Classify the controller outcome separately from label mutation.
+
+    The review agent is deliberately conservative: many model opinions are
+    useful for human triage but are not safe enough for an automatic class
+    recommendation. Keeping this controller-owned disposition separate from the
+    model decision prevents benchmark summaries and the UI from collapsing
+    "guarded useful signal" into an undifferentiated skip.
+    """
+
+    result = final_result if isinstance(final_result, dict) else {}
+    decision = str(result.get("decision") or "").strip()
+    target_class = str(result.get("target_class") or "").strip()
+    current_class = str(result.get("current_class") or "").strip()
+    suggested_class = str(result.get("suggested_neighbor_class") or "").strip()
+    backend_tier = str(result.get("backend_visual_quality", {}).get("tier") if isinstance(result.get("backend_visual_quality"), dict) else result.get("backend_tier") or "").strip().lower()
+    visual_quality = str(result.get("visual_quality") or "").strip().lower()
+    object_visibility = str(result.get("object_visibility") or "").strip().lower()
+    guardrail_reasons = [str(item or "").strip() for item in (result.get("guardrail_reasons") or []) if str(item or "").strip()]
+    advisory_reasons = [str(item or "").strip() for item in (result.get("advisory_reasons") or []) if str(item or "").strip()]
+    guarded = result.get("guarded_recommendation") if isinstance(result.get("guarded_recommendation"), dict) else None
+    cue_verifier = result.get("cue_verifier") if isinstance(result.get("cue_verifier"), dict) else None
+    dual_bbox_conflict = result.get("dual_bbox_conflict") if isinstance(result.get("dual_bbox_conflict"), dict) else None
+    dual_bbox_resolution = str(result.get("dual_bbox_resolution") or "not_applicable").strip()
+    dual_other_class = _class_analysis_qwen_review_dual_bbox_other_class(dual_bbox_conflict)
+
+    def _base(
+        disposition: str,
+        *,
+        signal: str,
+        label: str,
+        priority: str = "normal",
+        advisory_decision: str = "",
+        advisory_target_class: str = "",
+        human_action: str = "",
+        primary_reason: str = "",
+        signal_strength: str = "",
+    ) -> Dict[str, Any]:
+        payload = {
+            "disposition": disposition,
+            "signal": signal,
+            "label": label,
+            "priority": priority,
+            "advisory_decision": advisory_decision,
+            "advisory_target_class": advisory_target_class,
+            "human_action": human_action,
+            "primary_reason": primary_reason,
+        }
+        if signal_strength:
+            payload["signal_strength"] = signal_strength
+        return payload
+
+    def _guarded_signal_strength(guarded_result: Dict[str, Any]) -> str:
+        guarded_decision = str(guarded_result.get("decision") or "").strip()
+        try:
+            guarded_confidence = float(guarded_result.get("confidence") or 0.0)
+        except Exception:
+            guarded_confidence = 0.0
+        if not math.isfinite(guarded_confidence):
+            guarded_confidence = 0.0
+        guarded_target_evidence = str(guarded_result.get("target_evidence") or "").strip().lower()
+        guarded_current_evidence = str(guarded_result.get("current_evidence") or "").strip().lower()
+        probe = result.get("specificity_probe") if isinstance(result.get("specificity_probe"), dict) else {}
+        probe_alignment = str(probe.get("specificity_alignment") or "").strip().lower()
+        probe_contrast = str(probe.get("target_background_contrast") or "").strip().lower()
+        probe_margin = str(probe.get("specificity_margin") or "").strip().lower()
+        probe_uncertainty = str(probe.get("target_identity_uncertainty") or "").strip().lower()
+        if guarded_decision == "confirm_current":
+            expected_alignment = "supports_current"
+            expected_margins = {"current_target_favored"}
+        elif guarded_decision == "accept_suggested":
+            expected_alignment = "supports_suggested"
+            expected_margins = {"suggested_target_favored"}
+        elif guarded_decision == "change_to_other":
+            expected_alignment = "supports_other"
+            expected_margins = {"other_target_favored"}
+        else:
+            expected_alignment = ""
+            expected_margins = set()
+        specificity_supports_target = (
+            bool(expected_alignment)
+            and probe_alignment == expected_alignment
+            and probe_contrast == "target_specific"
+            and (not expected_margins or probe_margin in expected_margins)
+            and probe_uncertainty in {"", "low", "moderate"}
+        )
+        class_change_blocked_by_current = (
+            guarded_decision in {"accept_suggested", "change_to_other"}
+            and guarded_current_evidence in {"strong", "moderate"}
+        )
+        if (
+            guarded_confidence >= 0.8
+            and guarded_target_evidence == "strong"
+            and specificity_supports_target
+            and probe_uncertainty == "low"
+            and not class_change_blocked_by_current
+        ):
+            return "strong"
+        if guarded_target_evidence in {"strong", "moderate"} and (
+            specificity_supports_target or guarded_confidence >= 0.75
+        ):
+            return "moderate"
+        return "weak"
+
+    if dual_bbox_conflict and dual_other_class and dual_bbox_resolution == "overlap_box_class" and decision in {"accept_suggested", "change_to_other"}:
+        return _base(
+            "dual_bbox_switch_overlap_class",
+            signal="actionable",
+            label=f"Resolve dual bbox: switch class to {target_class or dual_other_class}",
+            priority="high",
+            advisory_decision=decision,
+            advisory_target_class=target_class or dual_other_class,
+            human_action="Review the near-identical overlapping boxes, then apply the class switch if the target pixels match.",
+            primary_reason=(advisory_reasons[0] if advisory_reasons else "Qwen resolved the near-identical cross-class bbox to the overlapping class."),
+        )
+    if dual_bbox_conflict and dual_bbox_resolution == "current_box_class" and decision == "confirm_current":
+        return _base(
+            "dual_bbox_confirm_current",
+            signal="actionable",
+            label="Resolve dual bbox: confirm current class",
+            priority="normal",
+            advisory_decision=decision,
+            advisory_target_class=current_class or target_class,
+            human_action="Confirm the current class or inspect the overlapping box geometry.",
+            primary_reason=(advisory_reasons[0] if advisory_reasons else "Qwen resolved the near-identical cross-class bbox to the current class."),
+        )
+    if dual_bbox_conflict and dual_bbox_resolution == "both_valid_overlapping_objects":
+        return _base(
+            "dual_bbox_both_valid_overlap",
+            signal="guarded_human_triage",
+            label="Dual bbox: both classes may be valid",
+            priority="high",
+            advisory_decision="skip_uncertain",
+            advisory_target_class=current_class or target_class,
+            human_action="Inspect both boxes in source context; this may be a valid overlap with malformed geometry.",
+            primary_reason=(advisory_reasons[0] if advisory_reasons else "Qwen found evidence for two legitimate overlapping objects."),
+        )
+    if dual_bbox_conflict and dual_bbox_resolution == "uncertain_or_neither" and not guarded:
+        return _base(
+            "dual_bbox_unresolved",
+            signal="guarded_human_triage",
+            label="Dual bbox: unresolved",
+            priority="normal",
+            advisory_decision="skip_uncertain",
+            advisory_target_class=current_class or target_class,
+            human_action="Inspect manually; the model could not resolve the near-identical cross-class boxes.",
+            primary_reason=(advisory_reasons[0] if advisory_reasons else "Dual-bbox conflict remained ambiguous."),
+        )
+
+    if decision in {"accept_suggested", "change_to_other"}:
+        label = f"Switch class to {target_class}" if target_class else "Switch class"
+        return _base(
+            "actionable_class_change",
+            signal="actionable",
+            label=label,
+            priority="high",
+            advisory_decision=decision,
+            advisory_target_class=target_class,
+            human_action="Review and apply the class change if it matches the image.",
+            primary_reason=(advisory_reasons[0] if advisory_reasons else "Clear target evidence passed controller guardrails."),
+        )
+    if decision == "confirm_current":
+        return _base(
+            "actionable_confirm_current",
+            signal="actionable",
+            label="Confirm current class",
+            priority="normal",
+            advisory_decision=decision,
+            advisory_target_class=current_class or target_class,
+            human_action="Confirm or skip this vignette after checking the image.",
+            primary_reason=(advisory_reasons[0] if advisory_reasons else "Current class passed controller guardrails."),
+        )
+
+    if guarded and guarded.get("blocked"):
+        guarded_decision = str(guarded.get("decision") or "").strip()
+        guarded_target = str(guarded.get("target_class") or "").strip()
+        guarded_reasons = [
+            str(item or "").strip()
+            for item in (guarded.get("guardrail_reasons") or guardrail_reasons)
+            if str(item or "").strip()
+        ]
+        reason_text = " ".join(item.lower() for item in guarded_reasons)
+        guarded_backend = str(guarded.get("backend_tier") or backend_tier or "").strip().lower()
+        guarded_quality = str(guarded.get("visual_quality") or visual_quality or "").strip().lower()
+        guarded_visibility = str(guarded.get("object_visibility") or object_visibility or "").strip().lower()
+        guarded_current_evidence = str(guarded.get("current_evidence") or "").strip().lower()
+        guarded_target_evidence = str(guarded.get("target_evidence") or "").strip().lower()
+        current_dominates_target = "current class" in reason_text and "dominates the target bbox" in reason_text
+        specificity_probe_conflict = (
+            "specificity probe" in reason_text
+            or "background/overlap" in reason_text
+            or "background_dominated" in reason_text
+            or "overlap_dominated" in reason_text
+        )
+        if guarded_decision in {"accept_suggested", "change_to_other"} and current_dominates_target:
+            return _base(
+                "verified_current_class_overlap",
+                signal="useful_negative",
+                label="Confirm current class: overlap false alarm",
+                priority="normal",
+                advisory_decision="confirm_current",
+                advisory_target_class=current_class or target_class,
+                human_action="Confirm the current class or skip after checking the source context.",
+                primary_reason=(guarded_reasons[0] if guarded_reasons else "Current-class material dominates the target bbox."),
+            )
+        if specificity_probe_conflict:
+            signal_strength = _guarded_signal_strength(guarded)
+            if guarded_decision in {"accept_suggested", "change_to_other"}:
+                label = f"Guarded: specificity probe questions {guarded_target or 'class change'}"
+                human_action = (
+                    "Inspect manually; Qwen's final class-change opinion conflicts with its target/background specificity probe."
+                )
+            elif guarded_decision == "confirm_current":
+                label = "Guarded: specificity probe questions confirmation"
+                human_action = (
+                    "Inspect manually; Qwen's confirmation opinion conflicts with its target/background specificity probe."
+                )
+            else:
+                label = f"Guarded: specificity probe conflict for {guarded_target or 'review class'}"
+                human_action = "Inspect manually; the specificity probe and final opinion disagree."
+            return _base(
+                "guarded_specificity_conflict",
+                signal="guarded_human_triage",
+                label=label,
+                priority="high" if signal_strength in {"strong", "moderate"} else "normal",
+                advisory_decision=guarded_decision,
+                advisory_target_class=guarded_target,
+                human_action=human_action,
+                primary_reason=(guarded_reasons[0] if guarded_reasons else "Specificity probe contradicted the guarded recommendation."),
+                signal_strength=signal_strength,
+            )
+        if guarded_backend not in {"", "clear"} or guarded_quality not in {"", "clear"} or guarded_visibility not in {"", "clear"}:
+            signal_strength = _guarded_signal_strength(guarded)
+            disposition = "guarded_visual_quality"
+            cue_verified_signal = (
+                cue_verifier
+                and guarded_decision in {"accept_suggested", "change_to_other"}
+                and cue_verifier.get("verified")
+            )
+            if signal_strength == "strong":
+                label = f"Strong guarded signal: possible {guarded_target or 'class change'} from limited crop"
+                priority = "high"
+                human_action = "Inspect this one early; Qwen and the specificity probe agree, but crop quality still blocks automatic recommendation."
+            elif cue_verified_signal and signal_strength == "moderate":
+                label = f"Verified guarded signal: possible {guarded_target or 'class change'} from limited crop"
+                priority = "normal"
+                human_action = "Inspect manually; Qwen, cue verification, and target-specific evidence agree, but quality rails block automatic relabeling."
+            elif signal_strength == "moderate":
+                label = f"Guarded: possible {guarded_target or 'class change'} from limited crop"
+                priority = "normal"
+                human_action = "Inspect manually; Qwen found some visual signal, but crop quality was not safe for automatic relabeling."
+            else:
+                label = f"Guarded: weak {guarded_target or 'class-change'} signal from limited crop"
+                priority = "low"
+                human_action = "Inspect manually only if this vignette still looks suspicious."
+        elif "overlap" in reason_text or "contamination" in reason_text or "duplicate_like" in reason_text:
+            signal_strength = _guarded_signal_strength(guarded)
+            disposition = "guarded_overlap_risk"
+            label = f"Guarded: {guarded_target or 'class change'} may be overlap-driven"
+            priority = "high" if guarded_target_evidence == "strong" and guarded_current_evidence in {"weak", "none"} else "normal"
+            human_action = "Inspect source context and overlap before applying any class change."
+        elif "visible target cues" in reason_text:
+            signal_strength = _guarded_signal_strength(guarded)
+            disposition = "guarded_missing_visible_cues"
+            label = f"Guarded: insufficient target cues for {guarded_target or 'class change'}"
+            priority = "normal"
+            human_action = "Use as a triage hint, but require visible object-internal cues before relabeling."
+        elif "anchor" in reason_text:
+            signal_strength = _guarded_signal_strength(guarded)
+            disposition = "guarded_anchor_support"
+            label = f"Guarded: weak exemplar support for {guarded_target or 'class change'}"
+            priority = "normal"
+            human_action = "Compare against trusted examples before applying the class change."
+        else:
+            signal_strength = _guarded_signal_strength(guarded)
+            disposition = "guarded_policy_block"
+            label = f"Guarded suggestion: {guarded_target or 'review class'}"
+            priority = "normal"
+            human_action = "Inspect manually before changing the class."
+        return _base(
+            disposition,
+            signal="guarded_human_triage",
+            label=label,
+            priority=priority,
+            advisory_decision=guarded_decision,
+            advisory_target_class=guarded_target,
+            human_action=human_action,
+            primary_reason=(guarded_reasons[0] if guarded_reasons else "Controller guardrail blocked automatic recommendation."),
+            signal_strength=signal_strength,
+        )
+
+    if cue_verifier and not cue_verifier.get("verified"):
+        reason = str(cue_verifier.get("rejection_reason") or "").strip()
+        return _base(
+            "verified_no_class_change",
+            signal="useful_negative",
+            label="Verifier rejected class-change evidence",
+            priority="low",
+            advisory_decision="skip_uncertain",
+            advisory_target_class=target_class or current_class,
+            human_action="Review only if the vignette still looks suspicious.",
+            primary_reason=reason or "Cue verifier did not find enough positive target cues.",
+        )
+
+    if guardrail_reasons:
+        reason_text = " ".join(item.lower() for item in guardrail_reasons)
+        if "degenerate" in reason_text or "failed validation" in reason_text or "parse" in reason_text:
+            return _base(
+                "protocol_failed_skip",
+                signal="no_signal",
+                label="Qwen output failed protocol",
+                priority="normal",
+                advisory_decision="skip_uncertain",
+                advisory_target_class=target_class or current_class,
+                human_action="Retry with Qwen or review manually.",
+                primary_reason=guardrail_reasons[0],
+            )
+        if backend_tier == "poor" or visual_quality == "poor" or object_visibility in {"tiny_or_blurry", "not_visible"}:
+            return _base(
+                "target_not_reviewable",
+                signal="no_signal",
+                label="Target not reviewable by Qwen",
+                priority="low",
+                advisory_decision="skip_uncertain",
+                advisory_target_class=target_class or current_class,
+                human_action="Review manually only if this object matters.",
+                primary_reason=guardrail_reasons[0],
+            )
+
+    return _base(
+        "no_actionable_opinion",
+        signal="no_signal",
+        label="No safe Qwen recommendation",
+        priority="low",
+        advisory_decision="skip_uncertain",
+        advisory_target_class=target_class or current_class or suggested_class,
+        human_action="Continue manual review.",
+        primary_reason=(guardrail_reasons[0] if guardrail_reasons else "Qwen did not produce a useful class recommendation."),
+    )
+
+
+def _class_analysis_qwen_review_source_manifest() -> Dict[str, Any]:
+    return {
+        "purpose": "Class Split likely-wrong VLM review agent provenance",
+        "sources": [
+            {
+                "name": "Qwen-Agent function calling",
+                "url": "https://github.com/QwenLM/Qwen-Agent",
+                "use": "Structured model/tool loop inspiration; local implementation keeps only review-specific tools.",
+            },
+            {
+                "name": "Qwen3-VL visual reasoning cookbook",
+                "url": "https://github.com/QwenLM/Qwen3-VL/blob/main/cookbooks/think_with_images.ipynb",
+                "use": "Multi-image visual context for deliberate inspection before a conclusion.",
+            },
+            {
+                "name": "Hermes function-calling prompt assets",
+                "url": "https://github.com/NousResearch/Hermes-Function-Calling/blob/main/prompt_assets/sys_prompt.yml",
+                "use": "Strict JSON tool-call envelope and schema validation.",
+            },
+            {
+                "name": "OpenClaw agent loop and context engine",
+                "url": "https://docs.openclaw.ai/concepts/agent-loop",
+                "use": "Bounded observe/act loop with context accumulation and loop protection.",
+            },
+            {
+                "name": "VisHarness multi-turn visual expert routing",
+                "url": "https://arxiv.org/html/2605.29894v1",
+                "use": "Evidence-gathering visual agent framing with heterogeneous visual context before a decision.",
+            },
+            {
+                "name": "Specificity-Driven Dynamic Focusing",
+                "url": "https://arxiv.org/html/2603.26109v1",
+                "use": "Target/background region contrast and fine-grained sub-description checks for specificity probing.",
+            },
+            {
+                "name": "Flamingo visual in-context learning",
+                "url": "https://arxiv.org/abs/2204.14198",
+                "use": "Few-shot multimodal exemplars motivate clean trusted class examples as advisory context.",
+            },
+            {
+                "name": "Visual In-Context Learning for Large Vision-Language Models",
+                "url": "https://arxiv.org/abs/2402.11574",
+                "use": "Retrieved visual demonstrations, task-oriented summarization, and compact composition inform the concept-brief cache.",
+            },
+            {
+                "name": "VISCO visual self-critique and LookBack",
+                "url": "https://arxiv.org/abs/2412.02172",
+                "use": "Model-generated critique is treated cautiously; review prompts require looking back at pixels and keep controller guardrails external.",
+            },
+        ],
+    }
+
+
+def _class_analysis_qwen_review_system_prompt(
+    max_turns: int,
+    *,
+    require_overlap: bool = False,
+    allow_local_consensus: bool = False,
+) -> str:
+    # Provenance: this review flow follows the controller-owned state pattern
+    # from OpenClaw-style agent loops and the single-call JSON envelope used by
+    # Hermes/Qwen function-calling prompts. Unlike the earlier loop, model turns
+    # never receive an open toolbox. The backend renders evidence and exposes one
+    # active schema at a time: route_review or finalize_review.
+    local_consensus_policy = (
+        "- When enabled and backend policy allows it, the controller renders one local-consensus context before final review."
+        if allow_local_consensus
+        else "- Local consensus is not part of the active state unless the backend explicitly enables and routes it."
+    )
+    return f"""You are reviewing one object flagged as likely wrong class in a dataset.
+The backend controller owns the tool loop. Evidence tools do not change labels.
+
+Tool protocol:
+- The latest controller instruction defines the active JSON shape. Routing states
+  use one JSON function-call object; final states use one plain JSON arguments
+  object.
+- Your generated text must start with `{{` and contain exactly one JSON object.
+- Use only the active schema named in the latest user instruction.
+- Do not include chain-of-thought, prose, markdown, or text outside the JSON object.
+- Never request arbitrary evidence tools. The controller will render allowed evidence.
+
+	Controller evidence phases:
+	1. Required evidence is rendered before the model can finalize:
+	   inspect_target_context, inspect_target_detail, inspect_source_overlay,
+	   inspect_overlap_decomposition, inspect_class_context_pack,
+	   inspect_specificity_region_contrast, inspect_same_image_scale_report,
+	   inspect_same_image_embedding_report, and
+	   one clean zoom_source_region with draw_bbox=false.
+2. A narrow route_review state may decide whether the required evidence is enough
+   or whether the controller should render one local-consensus context.
+3. The final state accepts finalize_review only.
+
+{local_consensus_policy}
+
+Decision policy:
+- First decide inspectability from the target crop itself. If the backend
+  visual-quality tier is poor, or the object is not visible or not directly
+  identifiable, choose skip_uncertain. If the target is tiny, blurry, clipped,
+  or context-contaminated but still shows concrete class evidence in clean
+  target/source pixels, give your best advisory human-triage opinion instead
+  of suppressing it. For limited-quality or edge-clipped targets, class-changing
+  opinions are advisory only: the controller may keep them guarded, run an
+  extra verifier, or block mutation. Your job is still to state the VLM's best
+  evidence-based decision and confidence, then explain the visible target cues
+  and quality limits.
+- The suggested class is only a hypothesis from embedding-neighbor disagreement,
+  not ground truth. Do not accept it just because it is suggested.
+- The glossary defines class meaning. Review guidance is dataset/session policy
+  and may make a visually odd subtype valid for a class.
+- Trusted anchors provide local/global class context. They are statistical
+  reference examples, not ground truth certification.
+- Same-image scale and embedding reports are deterministic context modules.
+  They may support or question whether the current label is plausible inside
+  this image, but they are not visual class evidence by themselves.
+- If advisory class concept or pairwise contrast briefs are provided, use them
+  only as compressed memory from trusted exemplars. They cannot override fresh
+  target pixels, overlap evidence, or backend guardrails.
+- Pairwise switch blockers / hard negatives are traps against class changes,
+  not positive evidence for the suggested class. Use them to avoid context-only
+  switches.
+- Use an SDDF-style target/background separation: target-specific object cues
+  must be distinguished from background texture, nearby objects, overlap pixels,
+  scene context, class labels, and neighbor statistics before any class-change
+  recommendation.
+- Use the specificity region-contrast panel for that separation: panel B
+  isolates target-bbox pixels; panel C removes the target so context/background
+  support is visible; panel D isolates the strongest overlap bbox when present.
+  Panel labels are evidence routing aids, not class evidence.
+- If local consensus is rendered, the clean crop is visual evidence. The dot map
+  is annotation-distribution context only and cannot override unclear target
+  pixels.
+- Prefer the clean source image and clean class-context crops for visual class
+  recognition. Use the overlay images only to reason about bbox geometry,
+  overlap, and where the candidate sits in the source image.
+- You must inspect one clean zoomed source region before finalizing. Use it for
+  wider unboxed visual context around the candidate, not bbox geometry.
+- Use inspect_target_detail as the clean, target-centered close view for visible
+  target cues. It is deterministic interpolation of source pixels, not
+  generated super-resolution; do not invent details that are not visible there.
+- Overlapping-object pixels can explain misleading embedding similarity. If
+  candidate-class evidence comes mainly from a materially overlapping other box,
+  do not relabel to that overlapping object's class.
+- If the controller reports a near-identical cross-class dual-bbox conflict,
+  switch from generic outlier review to the narrower conflict question: current
+  box class vs overlapping box class vs both-valid overlapping objects vs
+  unresolved. Use this mode only when the final instruction says it is active.
+- For accept_suggested or change_to_other, overlap assessment should normally be
+  none or near_context. Partial_contamination is only acceptable as advisory
+  evidence when the target crop is clear, target/suggested evidence is strong,
+  current evidence is weak, and your rationale explicitly says why the visible
+  target features are not explained by the overlapping object. duplicate_like, target_contains_other,
+  other_contains_target, and unclear must stay skip_uncertain.
+- You may use target evidence, source context, anchors, and overlap logic
+  together. A non-skip decision needs these sources to agree, not merely neighbor
+  majority, scale similarity, or embedding distance.
+- If the current and suggested classes share visible attributes, context, or
+  subtypes according to the glossary, review guidance, or pairwise contrast
+  brief, choose a non-skip decision only when the target pixels and overlap
+  logic clearly favor it.
+- Do not infer dataset subtype policy from generic world meanings. Use only the
+  active labelmap, glossary, review guidance, generated class concept briefs,
+  and generated pairwise contrast briefs.
+- Do not mark current_evidence strong merely because a broad/current class is
+  compatible. Use current_evidence strong only for visible class-specific
+  features; use weak when a clean target visibly matches the suggested subclass
+  better and the current class is only broadly possible.
+- confirm_current: current class is visibly supported and the candidate class is
+  less plausible from the target crop. If suggested_evidence is moderate or
+  strong, confirm only when clean target/source pixels support the current class
+  and overlap or near-context evidence explains why the suggested class was
+  plausible. Do not confirm when local_consensus_evidence=supports_suggested and
+  suggested_evidence is strong unless overlap or near context explains that
+  signal.
+- accept_suggested: suggested class is visually clearly better and current class
+  is visibly wrong. Do not accept if current_evidence is strong; use
+  current_evidence=weak when the current class is only broad compatibility.
+  Do not accept when local_consensus_evidence=supports_current unless
+  current_evidence is weak or none.
+- change_to_other: a third class is clearly better and both current_evidence and
+  suggested_evidence are weak or none.
+- skip_uncertain: ambiguous, insufficient context, poor image, or no safe class.
+- Do not claim visual details that are not visible in the image. If you cannot
+  point to visible object evidence, choose skip_uncertain.
+- Use target_evidence=strong only when the crop clearly shows class-specific
+  features. Use confidence above 0.8 only for visually obvious clear-quality
+  cases.
+The controller budget is {max_turns} model turns, but your active state may be
+stricter."""
+
+
+def _class_analysis_qwen_review_router_instruction(
+    *,
+    evidence_ids: Set[str],
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    local_consensus_policy: Dict[str, Any],
+) -> Dict[str, Any]:
+    evidence_list = ", ".join(sorted(evidence_ids)) or "(none)"
+    quality_summary = _class_analysis_qwen_review_quality_summary(visual_quality)
+    allowed = bool(local_consensus_policy.get("allowed"))
+    reasons = ", ".join(str(item) for item in (local_consensus_policy.get("reasons") or [])) or "none"
+    action_policy = (
+        "Allowed actions: finalize_now or inspect_local_consensus_context. Choose local consensus only when same-image annotation consensus is genuinely the missing context."
+        if allowed
+        else f"Allowed action: finalize_now only. Local consensus is blocked by backend policy: {reasons}."
+    )
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "\n".join(
+                    [
+                        "Router state.",
+                        "Required evidence has been rendered by the controller.",
+                        'Expected shape: {"name":"route_review","arguments":{"action":"finalize_now","reason_code":"evidence_complete","confidence":0.0,"rationale_short":"short reason"}}',
+                        f"Available evidence ids: {evidence_list}.",
+                        f"Current class: {point.get('class_name')}",
+                        f"Suggested class: {point.get('suggested_neighbor_class') or '(none)'}",
+                        quality_summary,
+                        action_policy,
+                        "Return only route_review.",
+                        "Use reason_code=evidence_complete when final evidence is enough.",
+                        "Use reason_code=needs_same_image_consensus only when local consensus is allowed and necessary.",
+                        "Do not finalize the class here; this state only chooses the next controller action.",
+                    ]
+                ),
+            }
+        ],
+    }
+
+
+def _class_analysis_qwen_review_final_instruction(
+    *,
+    required_tools: Set[str],
+    evidence_ids: Set[str],
+    point: Dict[str, Any],
+    visual_quality: Dict[str, Any],
+    local_consensus_inspected: bool = False,
+    class_concept_brief_text: str = "",
+    dual_bbox_conflict: Optional[Dict[str, Any]] = None,
+    allow_poor_advisory: bool = False,
+    specificity_probe: Optional[Dict[str, Any]] = None,
+) -> Dict[str, Any]:
+    evidence_list = ", ".join(sorted(evidence_ids)) or "(none)"
+    required_list = ", ".join(
+        sorted(_class_analysis_qwen_review_required_tool_label(tool_key) for tool_key in required_tools)
+    )
+    quality_summary = _class_analysis_qwen_review_quality_summary(visual_quality)
+    tier = str(visual_quality.get("tier") or "unknown").strip().lower()
+    if tier == "clear":
+        quality_policy = "Because the backend visual-quality tier is clear, you may choose a class decision only if the target crop itself shows visible class evidence."
+    elif tier == "limited":
+        quality_policy = (
+            "Because the backend visual-quality tier is limited, your output is advisory-only: "
+            "the backend may preserve class-changing opinions as guarded human-triage, run an "
+            "extra verifier, or block automatic mutation. Still give your best human-triage "
+            "opinion when target/source pixels show concrete evidence. Choose "
+            "accept_suggested, change_to_other, or confirm_current if the visible target evidence "
+            "supports that opinion; choose skip_uncertain only when the target itself is genuinely "
+            "not interpretable or multiple classes remain equally plausible."
+        )
+    else:
+        if allow_poor_advisory:
+            quality_policy = (
+                "Because the backend visual-quality tier is poor or unknown, your output is advisory-only and the backend "
+                "will not allow any automatic label recommendation. Still give your best human-triage opinion when clean "
+                "target/source pixels show concrete evidence; choose skip_uncertain when the target is genuinely not "
+                "interpretable or multiple classes remain equally plausible."
+            )
+        else:
+            quality_policy = "Because the backend visual-quality tier is poor or unknown, you must choose skip_uncertain."
+    local_consensus_policy = (
+        "Local consensus evidence has been inspected. Use its clean crop as visual context and its dot map only as annotation-distribution context."
+        if local_consensus_inspected
+        else "Local consensus evidence was not inspected. Set local_consensus_evidence=not_applicable."
+    )
+    concept_brief_text = str(class_concept_brief_text or "").strip()
+    concept_lines = (
+        [
+            "Advisory class concept and pairwise contrast briefs built from trusted exemplars are available:",
+            concept_brief_text,
+            "Treat concept/contrast briefs as compressed exemplar memory only. Fresh target pixels, clean source context, overlap logic, and backend guardrails override the brief.",
+            "Pairwise 'Switch blockers / hard negatives' are negative traps for class changes, not positive evidence for the suggested class.",
+            "Dataset-specific pair contrast beats generic word meanings.",
+        ]
+        if concept_brief_text
+        else ["No class concept or pairwise contrast brief is available; rely on the rendered evidence and glossary/guidance."]
+    )
+    probe_lines: List[str] = []
+    if isinstance(specificity_probe, dict) and specificity_probe.get("status") == "completed":
+        probe_lines = [
+            "A separate Qwen specificity probe has already inspected target-vs-background evidence.",
+            (
+                f"Probe alignment={specificity_probe.get('specificity_alignment') or 'insufficient'}, "
+                f"contrast={specificity_probe.get('target_background_contrast') or 'insufficient'}, "
+                f"best_class={specificity_probe.get('best_supported_class') or '(unresolved)'}, "
+                f"confidence={float(specificity_probe.get('confidence') or 0.0):.2f}."
+            ),
+            f"Probe target identity: {specificity_probe.get('target_identity_summary') or '(none)'}",
+            f"Probe target-specific cues: {json.dumps(specificity_probe.get('target_specific_cues') or [], ensure_ascii=False)}",
+            f"Probe background/overlap cues: {json.dumps(specificity_probe.get('background_or_overlap_cues') or [], ensure_ascii=False)}",
+            f"Probe sub-description assessments: {json.dumps(specificity_probe.get('subdescription_assessments') or [], ensure_ascii=False)}",
+            f"Probe specificity margin: {specificity_probe.get('specificity_margin') or 'insufficient'}; {specificity_probe.get('margin_rationale') or ''}",
+            f"Probe reconciliation from sub-descriptions: {json.dumps(specificity_probe.get('reconciled_from_subdescription_assessments') or [], ensure_ascii=False)}",
+            (
+                "Use the probe as VLM self-critique. You may disagree only if the clean target/source pixels "
+                "show stronger target-contained cues, which you must list and cite."
+            ),
+        ]
+    elif isinstance(specificity_probe, dict) and specificity_probe.get("enabled"):
+        probe_lines = [
+            "The separate Qwen specificity probe was attempted but unavailable; rely on rendered evidence directly.",
+            f"Probe error: {str(specificity_probe.get('error') or 'unknown')[:200]}",
+        ]
+    else:
+        probe_lines = ["No separate specificity probe is available; perform target/background separation in the final JSON fields."]
+    dual_conflict_lines: List[str] = []
+    if isinstance(dual_bbox_conflict, dict) and dual_bbox_conflict.get("enabled"):
+        dual_other_class = _class_analysis_qwen_review_dual_bbox_other_class(dual_bbox_conflict)
+        dual_conflict_lines = [
+            "Dual-bbox conflict mode is active.",
+            (
+                f"The target bbox and another bbox are near-identical but have different classes: "
+                f"current={point.get('class_name')}, overlapping={dual_other_class or '(unknown)'}, "
+                f"IoU={float(dual_bbox_conflict.get('iou') or 0.0):.3f}, "
+                f"target_cover={float(dual_bbox_conflict.get('target_area_covered') or 0.0):.3f}, "
+                f"other_cover={float(dual_bbox_conflict.get('other_area_covered') or 0.0):.3f}."
+            ),
+            (
+                "Your final question is narrower than normal likely-wrong review: decide whether this target box should keep "
+                "the current class, switch to the overlapping box class, be treated as two valid overlapping objects with "
+                "bbox deformation, or remain unresolved."
+            ),
+            (
+                "Some object classes legitimately overlap in real datasets, such as rider/vehicle, carried object/person, "
+                "mounted object/support, trailer/vehicle, or other dataset-specific relationships. Do not assume one box is "
+                "wrong merely because overlap is high; use clean pixels, source context, glossary/guidance, anchors, scale, "
+                "embedding, and overlap evidence together."
+            ),
+            (
+                "Set dual_bbox_resolution exactly: current_box_class, overlap_box_class, "
+                "both_valid_overlapping_objects, or uncertain_or_neither. For overlap_box_class, final_class must be the "
+                f"overlapping class {dual_other_class or '(unknown)'} and the target pixels must visibly support it."
+            ),
+            (
+                "For a near-identical duplicate-like dual-bbox conflict, set overlap_assessment=duplicate_like. "
+                "Then use overlap_explains_candidate_similarity to state whether the duplicate geometry is merely why "
+                "the embedding was suspicious, or whether a separate overlapping object's pixels actually explain the class evidence."
+            ),
+        ]
+    else:
+        dual_conflict_lines = ["No near-identical cross-class dual-bbox conflict is active. Set dual_bbox_resolution=not_applicable."]
+    policy_lines = [
+        "Return only JSON. No markdown, prose, chain-of-thought, tool names, or outer wrapper.",
+        'Required keys: decision, final_class, confidence, visual_quality, object_visibility, current_evidence, suggested_evidence, target_evidence, overlap_assessment, overlap_explains_candidate_similarity, specificity_alignment, target_background_contrast, target_identity_summary, target_identity_uncertainty, target_identity_evidence_ids, whole_target_extent_supported, whole_target_extent_reason, dual_bbox_resolution, visible_target_cues, rationale_short.',
+        "Optional but preferred: supporting_clean_evidence_ids, local_consensus_evidence, counter_evidence, human_review_needed.",
+        'Minimal valid example: {"decision":"skip_uncertain","final_class":"'
+        + str(point.get("class_name") or "")
+        + '","confidence":0.2,"visual_quality":"limited","object_visibility":"partial","current_evidence":"weak","suggested_evidence":"weak","target_evidence":"weak","overlap_assessment":"unclear","overlap_explains_candidate_similarity":false,"specificity_alignment":"insufficient","target_background_contrast":"insufficient","target_identity_summary":"unclear partial target","target_identity_uncertainty":"high","target_identity_evidence_ids":[],"whole_target_extent_supported":false,"whole_target_extent_reason":"target extent is not clear","dual_bbox_resolution":"not_applicable","visible_target_cues":[],"supporting_clean_evidence_ids":[],"rationale_short":"target is not clear enough"}',
+        f"Required tools already inspected: {required_list}.",
+        f"Available evidence ids: {evidence_list}.",
+        f"Current class: {point.get('class_name')}",
+        f"Suggested class: {point.get('suggested_neighbor_class') or '(none)'}",
+        "final_class is the label you recommend applying, not a description of the reviewed object.",
+        "Decision-to-final_class mapping: confirm_current -> Current class; accept_suggested -> Suggested class; change_to_other -> a third labelmap class; skip_uncertain -> Current class.",
+        quality_summary,
+        quality_policy,
+        "Use clean target/source/zoom pixels for visible_target_cues. Do not use overlay boxes, dot maps, neighbor labels, deterministic reports, or class names as visible cues.",
+        "Use the specificity_region_contrast panel to compare target-only pixels against target-removed background/context and overlap-only pixels before trusting suggested-class cues.",
+        "Before choosing a class, write target_identity_summary as a class-neutral description of the whole reviewed target from clean pixels. Prefer shape, parts, material, extent, and target-touching context over class names.",
+        "Set target_identity_uncertainty=high if you cannot describe the whole target without guessing; class changes with high target identity uncertainty will be guarded.",
+        "Use target_identity_evidence_ids to cite clean target/source evidence ids for the target_identity_summary.",
+        "Use specificity_alignment to state which hypothesis is supported by target-contained object-specific cues: supports_current, supports_suggested, supports_other, mixed, insufficient, or not_applicable.",
+        "Use target_background_contrast to separate target-object evidence from context: target_specific, background_dominated, overlap_dominated, mixed, insufficient, or not_applicable.",
+        "Do not set target_background_contrast=background_dominated merely because the target touches a road, water, ground, wall, or other scene context. Use background_dominated only when the class support would mostly remain after target pixels are removed.",
+        "If target pixels contain the discriminative object cues and scene/context only explains placement, set target_background_contrast=target_specific or mixed, not background_dominated.",
+        "Keep visible_target_cues target-contained. Do not combine target features and scene context into one cue string.",
+        "If the specificity probe includes sub-description assessments, use its margin as a target-vs-context audit. Do not accept a class change when the margin is background_or_overlap_favored unless clean target/source pixels clearly contradict that probe.",
+        "Pairwise Switch blockers / hard negatives, when present, are negative traps for class changes, not positive evidence for the suggested class.",
+        "Scene, location, medium, surface, lighting, and nearby-object cues are context, not class evidence, unless the active glossary or review guidance explicitly defines the class by that target-touching context.",
+        "Do not accept a class change when the target_identity_summary and target-specific cues support the current class while suggested-class support comes from scene context, switch blockers, background, or overlap.",
+        "Set whole_target_extent_supported=true only when your recommended final class explains the whole reviewed bbox/object extent.",
+        "Set whole_target_extent_supported=false when your recommendation explains only a subcomponent or ignores a large attached/continuous structure inside the bbox.",
+        "For accept_suggested/change_to_other, include at least two concrete positive target cues and cite clean target/source evidence ids in supporting_clean_evidence_ids.",
+        "Class changes require target-contained evidence: suggested_evidence=strong, target_evidence=strong, current_evidence weak/none, target_background_contrast=target_specific, the matching specificity_alignment, and no overlap explanation for the suggested class.",
+        "Class changes also require the proposed final class to explain the whole reviewed bbox/object extent. Do not accept a change by focusing on a cab, corner, small object, texture patch, or other subcomponent while ignoring a large attached or continuous extension, compartment, appendage, support, roof, cargo body, tool, or trailer-like segment inside the same bbox.",
+        "confirm_current is valid when the clean target supports the current class. If suggested evidence is moderate/strong, explain why overlap or near context accounts for that signal.",
+        "Use same-image scale and embedding reports to guide visual attention, but do not output scale/embedding fields; the controller records those reports separately.",
+        "Local consensus is not ground truth; use its clean crop as context and its dot map only as annotation-distribution context.",
+        "If target pixels are ambiguous, tiny, blurry, clipped, or merely compatible with multiple classes, choose skip_uncertain.",
+        "Keep rationale_short and counter_evidence under 25 words each.",
+        "The first generated character must be `{` and the last generated character should be `}`.",
+    ]
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "\n".join(policy_lines + dual_conflict_lines + probe_lines + concept_lines + [local_consensus_policy]),
+            }
+        ],
+    }
+
+
+def _class_analysis_qwen_review_cue_verifier_instruction(
+    *,
+    point: Dict[str, Any],
+    guarded_recommendation: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+) -> Dict[str, Any]:
+    clean_target_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("clean_target_source_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    existing_cues = [
+        str(item or "").strip()
+        for item in (guarded_recommendation.get("visible_target_cues") or [])
+        if str(item or "").strip()
+    ]
+    target_class = str(guarded_recommendation.get("target_class") or "").strip()
+    required_fields = _class_analysis_qwen_review_cue_verifier_required_fields_text()
+    optional_fields = _class_analysis_qwen_review_cue_verifier_optional_fields_text()
+    skeleton = {
+        "verified": False,
+        "target_class": target_class,
+        "cue_confidence": 0.0,
+        "positive_visible_target_cues": [],
+        "current_class_plausibility_basis": "none",
+        "current_class_plausible": False,
+        "current_class_plausibility_reason": "",
+        "whole_target_extent_supported": False,
+        "whole_target_extent_reason": "",
+        "edge_clip_recoverable": False,
+        "edge_clip_recoverability_reason": "",
+        "overlap_rebutted": False,
+        "overlap_risk": "not_applicable",
+        "anchor_support_verified": False,
+        "anchor_support_basis": "not_applicable",
+        "supporting_clean_evidence_ids": [],
+        "rejection_reason": "",
+    }
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "\n".join(
+                    [
+                        "Cue-verifier state.",
+                        "A previous finalize_review tried to change this class, but the controller blocked it because the visible-cue, anchor, or overlap guardrails were not strong enough.",
+                        "Your job is not to re-argue the whole label decision. Verify only whether clean target/source pixels show enough positive target-object cues for the proposed target class, and whether overlap/background actually explains those cues.",
+                        "Return one complete verify_visible_cues JSON arguments object with every required key.",
+                        "Return only the arguments object, not an outer name/tool wrapper, markdown, prose, comments, or partial object.",
+                        "Output compact JSON. Do not put newlines inside string values, and do not continue any reason field into a second sentence.",
+                        "Use numeric JSON values with no spaces inside numbers, for example 0.92 not 0. 92.",
+                        "Keep current_class_plausibility_reason, whole_target_extent_reason, overlap_rebuttal, anchor_support_reason, and rejection_reason under 18 words each.",
+                        "If the evidence is ambiguous, return verified=false with the compact required schema and short reasons instead of a long explanation.",
+                        f"Required keys: {required_fields}.",
+                        f"Optional keys, use only when they add non-duplicative validation evidence: {optional_fields}.",
+                        f"Minimal JSON shape to fill: {json.dumps(skeleton, ensure_ascii=False)}",
+                        "Do not include legacy or diagnostic keys such as current_class, proposed_target_class, verified_evidence_ids, cue_counts, specificity scores, overlap ratios, or any *_confidence field other than cue_confidence.",
+                        "Use supporting_clean_evidence_ids, not verified_evidence_ids.",
+                        "current_class_plausibility_reason and rejection_reason must always be strings. If optional reason fields are present, they must also be strings.",
+                        f"Current class: {point.get('class_name')}",
+                        f"Proposed target class: {target_class or '(none)'}",
+                        f"Original model rationale: {str(guarded_recommendation.get('rationale_short') or '')[:300]}",
+                        f"Controller guardrails that blocked the recommendation: {json.dumps(guarded_recommendation.get('guardrail_reasons') or [], ensure_ascii=False)}",
+                        f"Existing normalized target cues: {json.dumps(existing_cues, ensure_ascii=False)}",
+                        f"Clean target/source evidence ids allowed for support: {', '.join(clean_target_ids) or '(none)'}",
+                        "Use only clean target_context, target_detail, clean source, and clean zoom/source-region pixels for positive_visible_target_cues.",
+                        "Use the current and target class concept briefs in the compact context, especially valid_variations, exclude_when, common_confusions, and uncertainty_triggers.",
+                        "Do not count class names, `matches class`, local-consensus dots, neighbor labels, overlay boxes, negative claims, absence claims, color-only claims, or generic overhead/parked/context claims.",
+                        "Each positive_visible_target_cue must be a concrete visible property such as shape, parts, material, structure, texture, edges, posture, or target-touching context.",
+                        "Keep each cue short, preferably under 8 words. Do not copy the same cue string into multiple arrays.",
+                        "Use target_class_defining_cues only when a one-cue target needs contrastive support; do not repeat positive_visible_target_cues.",
+                        "Use current_class_missing_or_inconsistent_cues only for visible absences or contradictions that weaken the current class hypothesis. Examples must come from the current class concept brief, glossary, or clean pixels, not from a hardcoded dataset rule.",
+                        "Absence or contradiction cues never verify a class change by themselves. They only support the decision when positive target-class cues, whole extent, overlap, anchors, and clean evidence IDs also support it.",
+                        "Judge the whole reviewed bbox/object extent, not just the most recognizable subpart. A class change is not verified if the proposed class explains only a cab, corner, small object, texture patch, or other subcomponent while ignoring a large attached or continuous structure inside the same bbox.",
+                        "Set whole_target_extent_supported=true only when the proposed target class explains the full visible target extent.",
+                        "Set whole_target_extent_supported=false when the clean target contains a large attached extension, compartment, appendage, support, tool, cargo body, trailer-like segment, roof, or continuous structure that the proposed target class does not explain.",
+                        "When whole_target_extent_supported=false, explain the issue in whole_target_extent_reason and leave verified=false.",
+                        "If the guardrails mention the source image edge, decide edge_clip_recoverable explicitly.",
+                        "Set edge_clip_recoverable=true only when the visible target still shows enough class-defining structure and the missing outside-image pixels are not necessary for class identity.",
+                        "Set edge_clip_recoverable=false when edge clipping hides class-critical parts, makes the target a partial fragment, or leaves whole-object identity ambiguous.",
+                        "For non-edge cases, omit edge_clip_recoverable or leave it false.",
+                        "Use current_class_positive_cues only when concrete, direct current-class evidence is visible in clean target/source pixels.",
+                        "Do not copy proposed-target cues into current_class_positive_cues just because they are generic shared shape, color, texture, or context cues.",
+                        "Set current_class_plausibility_basis=direct_positive_cues only when current_class_positive_cues contain independent current-class evidence.",
+                        "Set current_class_plausibility_basis=shared_generic_cues when the target pixels have generic cues that could fit both classes but are not independently current-class-specific.",
+                        "Set current_class_plausibility_basis=hypothetical_or_uncertain when the current class is only imaginable as an edge case or uncertainty-trigger without direct positive current-class pixels.",
+                        "Set current_class_plausibility_basis=none when the clean pixels do not support the current class.",
+                        "Set current_class_plausible=true only for direct_positive_cues; leave it false for shared_generic_cues or hypothetical_or_uncertain.",
+                        "Set verified=false when direct current-class cues remain. Shared generic cues or hypothetical edge cases should be reported but should not alone block verified=true when the target-class evidence is visually obvious.",
+                        "Set overlap_rebutted=true only when clean target/source pixels show that overlap/background/nearby objects do not explain the proposed target-class cues.",
+                        "Set overlap_risk=target_specific when overlap_rebutted=true and the target-class cues are visible inside the clean target/source pixels.",
+                        "Set overlap_risk=overlap_explains only when the proposed class evidence comes mainly from overlap pixels, nearby objects, background texture, or geometry overlays.",
+                        "If the original guardrails mention moderate suggested-anchor agreement, inspect the class-context anchors/examples and concept brief before deciding anchor_support_verified.",
+                        "Set anchor_support_basis=target_specific_anchors only when trusted anchors/examples share object-specific traits with the clean target cues for the proposed class.",
+                        "Set anchor_support_basis=shared_generic_anchors when the anchor match is broad shape, color, position, size, background, or context that could fit multiple classes.",
+                        "Set anchor_support_basis=conflicting_anchors when trusted anchors/examples support the current class or a third class more strongly than the proposed target class.",
+                        "Set anchor_support_basis=insufficient when the anchors/examples are too weak, too sparse, or not visible enough to judge.",
+                        "Set anchor_support_verified=true only for target_specific_anchors; otherwise leave it false and explain the uncertainty in anchor_support_reason.",
+                        "Local consensus, neighbor labels, and nearby objects are not clean target-pixel evidence. If they are the main reason the proposed class seems plausible, set verified=false.",
+                        "For moderate-anchor or overlap-entangled proposals, verified=true needs either deterministic same-image evidence that questions the current class or a clean-pixel contradiction in current_class_missing_or_inconsistent_cues.",
+                        "Set verified=true only when at least two positive target-class cues are visible, the proposed target class explains the whole target extent, target evidence is not just scene context, overlap_rebutted is true or overlap is not applicable, current_class_positive_cues is empty or clearly irrelevant, and current_class_plausible=false.",
+                        "If only one positive cue is independent and another cue is shared, verified=true is allowed only when target_class_defining_cues cite at least two target-specific traits, current_class_missing_or_inconsistent_cues cites at least one visible contradiction or absence for the current class, and anchor_support_basis=target_specific_anchors.",
+                        "Set verified=false when the evidence is context-only, negative-only, color-only, target pixels are ambiguous, or the clean crop still plausibly supports the current class.",
+                        "Set cue_confidence above 0.85 only for visually obvious positive target-object evidence.",
+                        "The controller will re-run the normal validator; this verifier cannot bypass overlap, quality, anchor, or clean-evidence guardrails.",
+                    ]
+                ),
+            }
+        ],
+    }
+
+
+def _class_analysis_qwen_review_cue_verifier_repair_instruction(
+    *,
+    previous_output: str,
+    parse_error: str,
+    guarded_recommendation: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+) -> Dict[str, Any]:
+    clean_target_ids = [
+        str(item or "").strip()
+        for item in (evidence_ledger.get("clean_target_source_evidence_ids") or [])
+        if str(item or "").strip()
+    ]
+    target_class = str(guarded_recommendation.get("target_class") or "").strip()
+    required_fields = _class_analysis_qwen_review_cue_verifier_required_fields_text()
+    optional_fields = _class_analysis_qwen_review_cue_verifier_optional_fields_text()
+    return {
+        "role": "user",
+        "content": [
+            {
+                "type": "text",
+                "text": "\n".join(
+                    [
+                        "Cue-verifier schema repair.",
+                        f"The previous verifier response failed controller parsing: {str(parse_error or 'parse_error')[:300]}",
+                        f"Previous response preview: {str(previous_output or '')[:500]}",
+                        "Return one compact JSON arguments object with every required key.",
+                        "Use compact JSON, no markdown, no prose outside JSON, no newlines inside string values.",
+                        "Use numeric JSON values with no spaces inside numbers, for example 0.92 not 0. 92.",
+                        "Keep every reason field under 18 words and one sentence. Keep cue strings under 8 words when possible.",
+                        "Do not copy the same cue string into multiple arrays. Optional cue arrays may be omitted or empty.",
+                        f"target_class must be exactly: {target_class or '(none)'}",
+                        f"Allowed supporting_clean_evidence_ids: {', '.join(clean_target_ids) or '(none)'}",
+                        f"Required keys: {required_fields}.",
+                        f"Optional keys, use only when they add non-duplicative validation evidence: {optional_fields}.",
+                        "If you cannot verify two concrete target-positive cues, still return the required compact schema with verified=false, empty arrays where appropriate, cue_confidence no higher than 0.84, and a short rejection_reason.",
+                        "If one target cue is shared but clean pixels and concept briefs show target-specific defining cues plus a missing/inconsistent current-class cue, include those fields explicitly instead of omitting them.",
+                        "If the proposed class explains only a subcomponent rather than the whole reviewed bbox/object extent, set whole_target_extent_supported=false and verified=false.",
+                        "If source-edge clipping is one of the blocking reasons, include edge_clip_recoverable and edge_clip_recoverability_reason.",
+                        "Do not return a partial object. Do not omit target_class. Do not include extra legacy keys, markdown, or prose outside JSON.",
+                    ]
+                ),
+            }
+        ],
+    }
+
+
+def _class_analysis_qwen_review_relevant_glossary(
+    labelmap: Sequence[str],
+    *,
+    labelmap_glossary: str = "",
+    point: Optional[Dict[str, Any]] = None,
+) -> str:
+    point = point if isinstance(point, dict) else {}
+    relevant: Set[str] = {
+        str(point.get("class_name") or "").strip(),
+        str(point.get("suggested_neighbor_class") or "").strip(),
+    }
+    neighbor_counts = point.get("neighbor_class_counts") if isinstance(point.get("neighbor_class_counts"), dict) else {}
+    for class_name, _count in sorted(
+        neighbor_counts.items(),
+        key=lambda item: float(item[1] or 0.0) if isinstance(item[1], (int, float)) else 0.0,
+        reverse=True,
+    )[:3]:
+        relevant.add(str(class_name or "").strip())
+    relevant = {name for name in relevant if name}
+    raw_glossary = _normalize_labelmap_glossary(labelmap_glossary) if labelmap_glossary else ""
+    if not raw_glossary and labelmap:
+        raw_glossary = _default_agent_glossary_for_labelmap(labelmap)
+    glossary_map: Dict[str, Any] = {}
+    try:
+        decoded = json.loads(raw_glossary or "{}")
+        if isinstance(decoded, dict):
+            glossary_map = decoded
+    except Exception:
+        glossary_map = {}
+    if glossary_map:
+        filtered = {
+            class_name: glossary_map.get(class_name)
+            for class_name in sorted(relevant)
+            if class_name in glossary_map
+        }
+        if filtered:
+            return json.dumps(filtered, ensure_ascii=False, sort_keys=True)[:1800]
+    fallback_lines = []
+    for class_name in sorted(relevant):
+        fallback_lines.append(f"{class_name}: dataset class")
+    return "\n".join(fallback_lines)[:1800]
+
+
+def _class_analysis_qwen_review_initial_user_message(
+    result: Dict[str, Any],
+    point: Dict[str, Any],
+    visual_quality: Optional[Dict[str, Any]] = None,
+    labelmap_glossary: str = "",
+    review_guidance: str = "",
+) -> str:
+    summary = result.get("summary") if isinstance(result.get("summary"), dict) else {}
+    labelmap = [str(name) for name in (summary.get("labelmap") or []) if str(name or "").strip()]
+    glossary_text = _class_analysis_qwen_review_relevant_glossary(
+        labelmap,
+        labelmap_glossary=labelmap_glossary,
+        point=point,
+    )
+    guidance_text = str(review_guidance or "").strip()[:3000]
+    quality_text = (
+        _class_analysis_qwen_review_quality_summary(visual_quality)
+        if isinstance(visual_quality, dict)
+        else "Backend visual-quality tier: unknown."
+    )
+    lines = [
+        "Review this likely-wrong-class candidate.",
+        f"Point id: {point.get('point_id')}",
+        f"Current class: {point.get('class_name')}",
+        f"Suggested by nearest-neighbor mix: {point.get('suggested_neighbor_class') or '(none)'}",
+        f"Wrong-class suspicion: {float(point.get('wrong_class_suspicion') or 0.0):.3f}",
+        f"Same-class neighbor ratio: {float(point.get('same_class_neighbor_ratio') or 0.0):.3f}",
+        f"Top other-class neighbor ratio: {float(point.get('top_other_neighbor_ratio') or 0.0):.3f}",
+        f"Neighbor class counts: {json.dumps(point.get('neighbor_class_counts') or {}, sort_keys=True)}",
+        f"Legacy close-overlap matches: {len(point.get('close_overlap_matches') or [])}",
+        quality_text,
+        f"Dataset classes: {', '.join(labelmap)}",
+    ]
+    dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point)
+    if dual_bbox_conflict:
+        dual_other_class = _class_analysis_qwen_review_dual_bbox_other_class(dual_bbox_conflict)
+        lines.extend(
+            [
+                "Dual-bbox conflict detected before review:",
+                (
+                    f"Near-identical cross-class bbox: current={point.get('class_name')}, "
+                    f"overlap={dual_other_class or '(unknown)'}, "
+                    f"IoU={float(dual_bbox_conflict.get('iou') or 0.0):.3f}, "
+                    f"corner_similarity={float(dual_bbox_conflict.get('corner_similarity') or 0.0):.3f}."
+                ),
+                "The final answer must explicitly resolve this as current, overlap class, both valid overlapping objects, or unresolved.",
+            ]
+        )
+    if glossary_text:
+        lines.extend(
+            [
+                "Relevant class meaning glossary:",
+                glossary_text,
+                "Use these meanings as semantic class policy, not as proof that a visible subtype exists in this crop.",
+            ]
+        )
+    if guidance_text:
+        lines.extend(
+            [
+                "Additional review guidance for this session:",
+                guidance_text,
+                "This guidance overrides generic class-name assumptions when it is relevant to visible evidence.",
+            ]
+        )
+    lines.append("The controller will render required evidence before asking you to route or finalize.")
+    return "\n".join(lines)
+
+
+def _class_analysis_qwen_review_observation_message(
+    tool_name: str,
+    observation: Dict[str, Any],
+) -> Dict[str, Any]:
+    evidence = observation.get("evidence") if isinstance(observation.get("evidence"), list) else []
+    image_paths = observation.get("image_paths") if isinstance(observation.get("image_paths"), list) else []
+    evidence_ids = [str(item.get("evidence_id") or "") for item in evidence if isinstance(item, dict)]
+    text = "\n".join(
+        [
+            f"Tool result for {tool_name}.",
+            str(observation.get("summary") or ""),
+            f"Evidence ids: {', '.join([item for item in evidence_ids if item])}",
+            "Use this observation only inside the active controller state; do not request arbitrary tools.",
+        ]
+    )
+    content: List[Dict[str, Any]] = [{"type": "text", "text": text}]
+    for path in image_paths[:3]:
+        if str(path or "").strip():
+            content.append({"type": "image", "image": _class_analysis_qwen_review_model_image_path(str(path))})
+    return {"role": "user", "content": content}
+
+
+def _class_analysis_qwen_review_compact_line(text: str, limit: int) -> str:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(compact) <= limit:
+        return compact
+    return compact[: max(0, limit - 1)].rstrip() + "…"
+
+
+def _class_analysis_qwen_review_compact_tool_result_text(text: str, tool_name: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    if not lines:
+        return ""
+    kept: List[str] = []
+    if lines:
+        kept.append(lines[0])
+    for line in lines[1:]:
+        if line.startswith("Evidence ids:"):
+            kept.append(line)
+        elif line.startswith("Use this observation"):
+            continue
+        elif len(kept) < 3:
+            kept.append(_class_analysis_qwen_review_compact_line(line, 520))
+    if tool_name in {"inspect_local_consensus_context", "inspect_class_context_pack"}:
+        return "\n".join(_class_analysis_qwen_review_compact_line(line, 420) for line in kept)
+    return "\n".join(_class_analysis_qwen_review_compact_line(line, 620) for line in kept)
+
+
+def _class_analysis_qwen_review_compact_ledger_text(text: str) -> str:
+    lines = [line.strip() for line in str(text or "").splitlines() if line.strip()]
+    keep_prefixes = (
+        "Controller evidence ledger.",
+        "Backend visual-quality tier:",
+        "Clean visual evidence ids:",
+        "Clean target/source evidence ids",
+        "Geometry/overlay evidence ids:",
+        "Local consensus evidence ids:",
+        "Deterministic context evidence ids:",
+        "visible_target_cues must come from",
+        "- target_context_",
+        "- target_detail_",
+        "- source_clean_",
+        "- zoom_region_",
+        "- specificity_region_contrast_",
+        "- overlap_decomposition_",
+        "- same_image_scale_report_",
+        "- same_image_embedding_report_",
+        "- local_consensus_context_",
+        "- class_context_pack_",
+    )
+    kept: List[str] = []
+    for line in lines:
+        if line.startswith(keep_prefixes):
+            kept.append(_class_analysis_qwen_review_compact_line(line, 360))
+    kept.extend(
+        [
+            "Use clean target/source evidence for visible cues.",
+            "Use overlays, consensus dots, and deterministic reports as context only.",
+        ]
+    )
+    return "\n".join(kept[:18])
+
+
+def _class_analysis_qwen_review_final_context_messages(
+    messages: Sequence[Dict[str, Any]],
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Build a compact final-review state from the rendered evidence.
+
+    Earlier versions preserved the whole controller transcript and merely
+    stripped some images. Local MLX Qwen benchmarks showed that the final VLM
+    call could stall on that long chat history. The controller has already
+    rendered and audited the evidence, so the final state is a fresh compact
+    prompt with clean target/source images plus short evidence summaries.
+    """
+
+    final_visual_tools = {
+        "inspect_target_detail",
+        "inspect_source_overlay",
+        "zoom_source_region",
+        "inspect_specificity_region_contrast",
+    }
+    fallback_visual_tools = {
+        "inspect_target_context",
+    }
+    text_only_tools = {
+        "inspect_class_context_pack",
+        "inspect_local_consensus_context",
+        "inspect_overlap_decomposition",
+        "inspect_same_image_scale_report",
+        "inspect_same_image_embedding_report",
+    }
+    input_images = 0
+    text_only_observations: List[str] = []
+    trimmed_text_messages = 0
+    image_candidates: Dict[str, Dict[str, Any]] = {}
+    summary_lines: List[str] = ["Rendered evidence summary for final review."]
+    ledger_text = ""
+
+    for message in messages:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        text_chunks = [
+            str(item.get("text") or "")
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "text"
+        ]
+        first_text = "\n".join(text_chunks)
+        match = re.search(r"Tool result for ([A-Za-z0-9_]+)\.", first_text)
+        tool_name = match.group(1) if match else ""
+        is_ledger = first_text.startswith("Controller evidence ledger.")
+        image_items = [
+            item
+            for item in content
+            if isinstance(item, dict) and item.get("type") == "image"
+        ]
+        input_images += len(image_items)
+        if is_ledger:
+            ledger_text = _class_analysis_qwen_review_compact_ledger_text(first_text)
+            trimmed_text_messages += 1
+        elif tool_name in text_only_tools:
+            compact_text = _class_analysis_qwen_review_compact_tool_result_text(first_text, tool_name)
+            if compact_text:
+                summary_lines.append(compact_text)
+            text_only_observations.append(tool_name)
+            trimmed_text_messages += 1
+        elif tool_name and tool_name not in final_visual_tools and tool_name not in fallback_visual_tools:
+            compact_text = _class_analysis_qwen_review_compact_tool_result_text(first_text, tool_name)
+            if compact_text:
+                summary_lines.append(compact_text)
+            text_only_observations.append(tool_name)
+            trimmed_text_messages += 1
+        elif tool_name in final_visual_tools or tool_name in fallback_visual_tools:
+            compact_text = _class_analysis_qwen_review_compact_tool_result_text(first_text, tool_name)
+            if compact_text:
+                summary_lines.append(compact_text)
+            if image_items:
+                image_candidates.setdefault(tool_name, copy.deepcopy(image_items[0]))
+            trimmed_text_messages += 1
+        elif first_text and not first_text.startswith("You are reviewing one object flagged"):
+            summary_lines.append(_class_analysis_qwen_review_compact_line(first_text, 420))
+            trimmed_text_messages += 1
+
+    if ledger_text:
+        summary_lines.append(ledger_text)
+    summary_text = "\n\n".join(line for line in summary_lines if line).strip()
+    selected_tool_images: List[Tuple[str, Dict[str, Any]]] = []
+    for tool_name in (
+        "inspect_target_detail",
+        "zoom_source_region",
+        "inspect_specificity_region_contrast",
+        "inspect_source_overlay",
+    ):
+        image_item = image_candidates.get(tool_name)
+        if image_item:
+            selected_tool_images.append((tool_name, image_item))
+    if "inspect_target_detail" not in {tool_name for tool_name, _image in selected_tool_images}:
+        image_item = image_candidates.get("inspect_target_context")
+        if image_item:
+            selected_tool_images.insert(0, ("inspect_target_context", image_item))
+    selected_tool_images = selected_tool_images[:CLASS_ANALYSIS_QWEN_REVIEW_FINAL_MAX_IMAGES]
+    selected_image_tools = [tool_name for tool_name, _image in selected_tool_images]
+    selected_images = [image_item for _tool_name, image_item in selected_tool_images]
+    final_messages = [
+        {
+            "role": "system",
+            "content": [
+                {
+                    "type": "text",
+                    "text": (
+                        "You are a visual class-review agent. Return exactly one JSON object for the latest "
+                        "final schema. Use clean target/source/zoom pixels for visible cues. Separate "
+                        "target-contained object specificity from background, overlap, scene context, labels, "
+                        "and neighbor statistics. Treat overlays, dot maps, neighbors, and deterministic reports "
+                        "as context only. Suggested class is a hypothesis. No prose."
+                    ),
+                }
+            ],
+        },
+        {
+            "role": "user",
+            "content": [{"type": "text", "text": _class_analysis_qwen_review_compact_line(summary_text, 6000)}]
+            + selected_images,
+        },
+    ]
+
+    return final_messages, {
+        "input_image_count": input_images,
+        "output_image_count": len(selected_images),
+        "text_only_observations": sorted(set(text_only_observations)),
+        "image_observations": sorted(set(selected_image_tools)),
+        "trimmed_text_messages": trimmed_text_messages,
+        "policy": (
+            "Final review keeps a compact visual core: clean target detail, clean zoom/source context, "
+            "and the target/background region-contrast panel before overlay-heavy source geometry. Composite class-context and local-consensus "
+            "panels remain rendered, logged, and summarized as text/ledger evidence, but are not attached "
+            "to the final MLX VLM call by default because earlier benchmark replays showed final-generation "
+            "Metal instability when those large composites were included. Overlay geometry, overlap "
+            "decomposition, and deterministic reports remain compact text/ledger context."
+        ),
+    }
+
+
+def _class_analysis_qwen_review_model_image_path(path: str, *, max_side: Optional[int] = None) -> str:
+    """Return a VLM-safe image path while keeping original evidence untouched."""
+
+    raw_path = str(path or "").strip()
+    if not raw_path:
+        return raw_path
+    source_path = Path(raw_path)
+    if not source_path.is_file():
+        return raw_path
+    try:
+        resolved_max_side = int(max_side if max_side is not None else CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE)
+    except Exception:
+        resolved_max_side = int(CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE)
+    resolved_max_side = max(320, min(int(CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE), resolved_max_side))
+    try:
+        with Image.open(source_path) as image:
+            width, height = image.size
+            if max(width, height) <= resolved_max_side:
+                return raw_path
+            output_dir = source_path.parent / "model_inputs"
+            output_dir.mkdir(parents=True, exist_ok=True)
+            output_path = output_dir / f"{source_path.stem}_max{resolved_max_side}.jpg"
+            if output_path.is_file() and output_path.stat().st_mtime >= source_path.stat().st_mtime:
+                return str(output_path)
+            resized = image.convert("RGB")
+            resized.thumbnail((resolved_max_side, resolved_max_side), Image.Resampling.LANCZOS)
+            resized.save(output_path, quality=88, optimize=True)
+            return str(output_path)
+    except Exception as exc:
+        logger.debug("Failed to prepare class-analysis Qwen model image %s: %s", raw_path, exc)
+    return raw_path
+
+
+def _class_analysis_qwen_review_cap_message_images(
+    messages: Sequence[Dict[str, Any]],
+    *,
+    max_images: Optional[int] = None,
+    max_side: Optional[int] = None,
+) -> Tuple[List[Dict[str, Any]], Dict[str, Any]]:
+    """Downsample and optionally cap VLM images for fragile reasoning phases.
+
+    The original evidence artifacts remain written to disk and referenced in the
+    ledger. This only rewrites the image paths attached to a specific model call.
+    Keeping the VLM visual core small follows the agent-loop principle of giving
+    a model the minimal decisive observations for a step, while preserving full
+    traceability through the controller artifacts.
+    """
+
+    capped = copy.deepcopy(list(messages))
+    limit = max(0, int(max_images)) if max_images is not None else 0
+    image_count = 0
+    kept = 0
+    dropped = 0
+    rewritten = 0
+    selected_max_side = max_side if max_side is not None else CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE
+    try:
+        selected_max_side = max(320, min(int(CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE), int(selected_max_side)))
+    except Exception:
+        selected_max_side = int(CLASS_ANALYSIS_QWEN_REVIEW_MODEL_IMAGE_MAX_SIDE)
+    for message in capped:
+        content = message.get("content") if isinstance(message, dict) else None
+        if not isinstance(content, list):
+            continue
+        new_content: List[Dict[str, Any]] = []
+        for item in content:
+            if not isinstance(item, dict) or item.get("type") != "image":
+                new_content.append(item)
+                continue
+            image_count += 1
+            if limit and kept >= limit:
+                dropped += 1
+                continue
+            original = str(item.get("image") or "")
+            prepared = _class_analysis_qwen_review_model_image_path(original, max_side=selected_max_side)
+            rewritten += int(prepared != original)
+            next_item = dict(item)
+            next_item["image"] = prepared
+            new_content.append(next_item)
+            kept += 1
+        message["content"] = new_content
+    return capped, {
+        "input_image_count": image_count,
+        "output_image_count": kept,
+        "dropped_image_count": dropped,
+        "rewritten_image_count": rewritten,
+        "max_side": selected_max_side,
+        "max_images": limit or None,
+    }
+
+
+def _class_analysis_qwen_review_should_run_cue_verifier(
+    final_result: Dict[str, Any],
+) -> bool:
+    guarded = final_result.get("guarded_recommendation") if isinstance(final_result, dict) else None
+    if not isinstance(guarded, dict) or not guarded.get("blocked"):
+        return False
+    if str(final_result.get("decision") or "").strip() != "skip_uncertain":
+        return False
+    if str(guarded.get("decision") or "").strip() not in {"accept_suggested", "change_to_other"}:
+        return False
+    backend_tier = str(guarded.get("backend_tier") or "").strip().lower()
+    visual_quality = str(guarded.get("visual_quality") or "").strip().lower()
+    object_visibility = str(guarded.get("object_visibility") or "").strip().lower()
+    clear_candidate = (
+        backend_tier == "clear"
+        and visual_quality == "clear"
+        and object_visibility == "clear"
+    )
+    limited_candidate = (
+        str(guarded.get("decision") or "").strip() == "accept_suggested"
+        and backend_tier == "limited"
+        and visual_quality in {"clear", "limited"}
+        and object_visibility in {"clear", "partial"}
+    )
+    if not clear_candidate and not limited_candidate:
+        return False
+    if str(guarded.get("current_evidence") or "").strip().lower() not in {"weak", "none"}:
+        return False
+    if str(guarded.get("target_evidence") or "").strip().lower() != "strong":
+        return False
+    if str(guarded.get("decision") or "").strip() == "accept_suggested" and str(guarded.get("suggested_evidence") or "").strip().lower() != "strong":
+        return False
+    guardrails = [str(item or "") for item in (guarded.get("guardrail_reasons") or [])]
+    if not guardrails:
+        return False
+    reason_text = " ".join(item.lower() for item in guardrails)
+    if "current class" in reason_text and "dominates the target bbox" in reason_text:
+        return False
+    if "visible target text supporting current class" in reason_text:
+        return False
+    dual_bbox = guarded.get("dual_bbox_conflict") if isinstance(guarded.get("dual_bbox_conflict"), dict) else {}
+    dual_bbox_switch_guarded_opinion = (
+        limited_candidate
+        and bool(dual_bbox.get("enabled"))
+        and str(guarded.get("dual_bbox_resolution") or "").strip().lower() == "overlap_box_class"
+    )
+    if dual_bbox_switch_guarded_opinion:
+        # Near-identical dual-bbox cases are exactly where a second VLM cue
+        # check is useful: the first final pass may correctly resolve the class
+        # but still mark the evidence as limited, partial, or context-mixed.
+        # The verifier cannot mutate labels by itself; it only supplies
+        # target-specific cue, overlap, extent, and current-class plausibility
+        # evidence for the normal validator.
+        return True
+    target_specific_guarded_opinion = (
+        str(guarded.get("specificity_alignment") or "").strip().lower()
+        in {"supports_suggested", "supports_other"}
+        and str(guarded.get("target_background_contrast") or "").strip().lower() == "target_specific"
+        and len(_class_analysis_qwen_review_normalize_visible_cues(
+            guarded.get("visible_target_cues"),
+            current_class=str(guarded.get("current_class") or ""),
+            suggested_class=str(guarded.get("suggested_neighbor_class") or ""),
+            target_class=str(guarded.get("target_class") or ""),
+        )) >= 2
+    )
+    if limited_candidate and target_specific_guarded_opinion:
+        # For limited target quality, cue verification is both a possible
+        # narrow promotion path and an evidence-enrichment path. Validation
+        # still owns mutation/actionability safety: edge-clipped targets and
+        # same-image-current-supported cases remain guarded unless the stricter
+        # non-edge, non-current-supported validator path passes.
+        return True
+    cue_guardrails = [
+        item for item in guardrails
+        if "requires at least two concrete visible target cues" in item
+    ]
+    if cue_guardrails and len(cue_guardrails) == len(guardrails):
+        return True
+    plausibility_guarded = "current-class plausibility verification" in reason_text
+    if plausibility_guarded:
+        if str(guarded.get("specificity_alignment") or "").strip().lower() not in {"supports_suggested", "supports_other"}:
+            return False
+        if str(guarded.get("target_background_contrast") or "").strip().lower() != "target_specific":
+            return False
+        return len(_class_analysis_qwen_review_normalize_visible_cues(
+            guarded.get("visible_target_cues"),
+            current_class=str(guarded.get("current_class") or ""),
+            suggested_class=str(guarded.get("suggested_neighbor_class") or ""),
+            target_class=str(guarded.get("target_class") or ""),
+        )) >= 2
+    specificity_probe_guarded = "specificity probe" in reason_text
+    if specificity_probe_guarded:
+        if str(guarded.get("specificity_alignment") or "").strip().lower() not in {"supports_suggested", "supports_other"}:
+            return False
+        if str(guarded.get("target_background_contrast") or "").strip().lower() != "target_specific":
+            return False
+        return len(_class_analysis_qwen_review_normalize_visible_cues(
+            guarded.get("visible_target_cues"),
+            current_class=str(guarded.get("current_class") or ""),
+            suggested_class=str(guarded.get("suggested_neighbor_class") or ""),
+            target_class=str(guarded.get("target_class") or ""),
+        )) >= 2
+    overlap_guarded = (
+        "overlap assessment partial_contamination is too entangled" in reason_text
+        or "overlap decomposition may explain candidate-class similarity" in reason_text
+    )
+    if not overlap_guarded:
+        return False
+    if str(guarded.get("overlap_assessment") or "").strip().lower() != "partial_contamination":
+        return False
+    if str(guarded.get("specificity_alignment") or "").strip().lower() not in {"supports_suggested", "supports_other"}:
+        return False
+    if str(guarded.get("target_background_contrast") or "").strip().lower() != "target_specific":
+        return False
+    if len(_class_analysis_qwen_review_normalize_visible_cues(
+        guarded.get("visible_target_cues"),
+        current_class=str(guarded.get("current_class") or ""),
+        suggested_class=str(guarded.get("suggested_neighbor_class") or ""),
+        target_class=str(guarded.get("target_class") or ""),
+    )) < 2:
+        return False
+    return True
+
+
+def _class_analysis_qwen_review_cue_verifier_text_rebuts_overlap(text: str) -> bool:
+    compact = re.sub(r"\s+", " ", str(text or "")).strip().lower()
+    if not compact:
+        return False
+    patterns = (
+        r"\boverlap\s+does\s+not\s+explain\b",
+        r"\bnot\s+(?:merely\s+)?(?:an?\s+)?(?:artifact|artifacts?)\s+of\s+(?:the\s+)?(?:partial\s+)?overlap\b",
+        r"\bnot\s+(?:merely\s+)?(?:from|due\s+to|caused\s+by)\s+(?:the\s+)?(?:overlap|background|nearby|adjacent)\b",
+        r"\b(?:partial\s+)?(?:overlap|contamination)\s+(?:does\s+not|doesn't)\s+(?:obscure|explain|account\s+for)\b",
+        r"\b(?:partial\s+)?(?:overlap|contamination)\s+(?:is\s+)?accounted\s+for\b",
+        r"\b(?:target|target\s+pixels?)\s+(?:clearly\s+)?show(?:s)?\b.*\b(?:distinct|intrinsic|primary|structural|defining)\b",
+        r"\b(?:target|target'?s\s+own|target\s+pixels?)\s+(?:pixels?\s+)?(?:clearly\s+)?(?:display|displays|depict|depicts|contain|contains|show|shows)\b",
+        r"\b(?:intrinsic|primary|defining|target-contained|target-specific)\s+.*\b(?:target|object|geometry|surface|features?|cues?)\b",
+        r"\b(?:visually|structurally)\s+distinct\s+from\s+(?:the\s+)?(?:partial\s+)?(?:overlap|contamination|background|nearby|adjacent)\b",
+    )
+    return any(re.search(pattern, compact) for pattern in patterns)
+
+
+def _class_analysis_qwen_review_parse_cue_verifier_payload(
+    raw_text: str,
+    *,
+    current_class: str,
+    target_class: str,
+    evidence_ids: Set[str],
+) -> Tuple[Optional[Dict[str, Any]], Optional[str]]:
+    direct_payload, direct_error = _parse_tool_call_json(str(raw_text or ""))
+    if isinstance(direct_payload, dict) and any(
+        key in direct_payload
+        for key in (
+            "verified",
+            "positive_visible_target_cues",
+            "current_class_positive_cues",
+        )
+    ):
+        payload = direct_payload
+        parse_error = direct_error
+    else:
+        payload, parse_error = _class_analysis_qwen_review_parse_payload(raw_text)
+    if not isinstance(payload, dict):
+        return None, parse_error or "cue_verifier_parse_error"
+    try:
+        args = _class_analysis_qwen_review_tool_arguments(
+            payload,
+            expected_name="verify_visible_cues",
+            aliases={"visible_cues_verified", "verify_cues", "cue_verifier"},
+        )
+    except Exception as exc:
+        return None, str(exc)
+    missing_verifier_fields = [
+        field_name
+        for field_name in (
+            "current_class_plausible",
+            "current_class_plausibility_reason",
+            "whole_target_extent_supported",
+            "whole_target_extent_reason",
+        )
+        if field_name not in args
+    ]
+    if missing_verifier_fields:
+        return None, f"cue verifier missing: {', '.join(missing_verifier_fields)}"
+    normalized_target = str(args.get("target_class") or "").strip()
+    if target_class and normalized_target != target_class:
+        return None, f"cue verifier target_class mismatch: {normalized_target or '(missing)'}"
+    target_cues = _class_analysis_qwen_review_normalize_visible_cues(
+        args.get("positive_visible_target_cues"),
+        current_class=current_class,
+        suggested_class=target_class,
+        target_class=target_class,
+    )
+    target_defining_cues = _class_analysis_qwen_review_normalize_visible_cues(
+        args.get("target_class_defining_cues")
+        if args.get("target_class_defining_cues") is not None
+        else args.get("target_defining_cues"),
+        current_class=current_class,
+        suggested_class=target_class,
+        target_class=target_class,
+    )
+    current_cues = _class_analysis_qwen_review_normalize_visible_cues(
+        args.get("current_class_positive_cues"),
+        current_class=current_class,
+        suggested_class=target_class,
+        target_class=current_class,
+    )
+    current_missing_or_inconsistent_cues = _class_analysis_qwen_review_normalize_contrast_cues(
+        args.get("current_class_missing_or_inconsistent_cues")
+        if args.get("current_class_missing_or_inconsistent_cues") is not None
+        else args.get("current_class_missing_cues"),
+        current_class=current_class,
+        target_class=target_class,
+    )
+    independent_current_cues, shared_current_cues = _class_analysis_qwen_review_split_independent_current_cues(
+        target_cues=target_cues,
+        current_cues=current_cues,
+    )
+    independent_target_cues, shared_target_cues = _class_analysis_qwen_review_split_independent_current_cues(
+        target_cues=current_cues,
+        current_cues=target_cues,
+    )
+    supporting_ids = _class_analysis_qwen_review_normalize_evidence_id_list(
+        args.get("supporting_clean_evidence_ids"),
+        allowed_ids=evidence_ids,
+        limit=6,
+    )
+    try:
+        cue_confidence = float(args.get("cue_confidence"))
+    except Exception:
+        cue_confidence = 0.0
+    if not math.isfinite(cue_confidence):
+        cue_confidence = 0.0
+    verified = _class_analysis_qwen_review_coerce_bool(args.get("verified"), default=False)
+    overlap_rebutted = _class_analysis_qwen_review_coerce_bool(args.get("overlap_rebutted"), default=False)
+    current_class_plausible = _class_analysis_qwen_review_coerce_bool(
+        args.get("current_class_plausible"),
+        default=False,
+    )
+    current_class_plausibility_basis = _class_analysis_qwen_review_coerce_choice(
+        args.get("current_class_plausibility_basis"),
+        (
+            "direct_positive_cues",
+            "shared_generic_cues",
+            "hypothetical_or_uncertain",
+            "none",
+        ),
+        "",
+    )
+    if not current_class_plausibility_basis:
+        if independent_current_cues:
+            current_class_plausibility_basis = "direct_positive_cues"
+        elif shared_current_cues:
+            current_class_plausibility_basis = "shared_generic_cues"
+        elif current_class_plausible:
+            current_class_plausibility_basis = "hypothetical_or_uncertain"
+        else:
+            current_class_plausibility_basis = "none"
+    if independent_current_cues and current_class_plausibility_basis != "direct_positive_cues":
+        current_class_plausibility_basis = "direct_positive_cues"
+    effective_current_class_plausible = bool(
+        current_class_plausible and current_class_plausibility_basis == "direct_positive_cues"
+    ) or bool(independent_current_cues)
+    current_class_plausibility_reason = str(args.get("current_class_plausibility_reason") or "")[:1200]
+    whole_target_extent_supported = _class_analysis_qwen_review_coerce_bool(
+        args.get("whole_target_extent_supported"),
+        default=False,
+    )
+    whole_target_extent_reason = str(args.get("whole_target_extent_reason") or "")[:1200]
+    edge_clip_recoverable = _class_analysis_qwen_review_coerce_bool(
+        args.get("edge_clip_recoverable"),
+        default=False,
+    )
+    edge_clip_recoverability_reason = str(args.get("edge_clip_recoverability_reason") or "")[:1200]
+    overlap_risk = _class_analysis_qwen_review_coerce_choice(
+        args.get("overlap_risk"),
+        ("target_specific", "overlap_explains", "uncertain", "not_applicable"),
+        "uncertain",
+        synonyms={
+            "target": "target_specific",
+            "target-specific": "target_specific",
+            "object_specific": "target_specific",
+            "object-specific": "target_specific",
+            "overlap": "overlap_explains",
+            "background": "overlap_explains",
+            "context": "overlap_explains",
+            "none": "not_applicable",
+            "n/a": "not_applicable",
+            "not applicable": "not_applicable",
+        },
+    )
+    overlap_rebuttal = str(args.get("overlap_rebuttal") or "")[:1200]
+    overlap_risk_reconciled = False
+    overlap_text_rebutted = _class_analysis_qwen_review_cue_verifier_text_rebuts_overlap(overlap_rebuttal)
+    if (
+        overlap_rebutted
+        and overlap_risk == "overlap_explains"
+        and not effective_current_class_plausible
+        and len(independent_target_cues) >= 2
+        and overlap_text_rebutted
+    ):
+        # Qwen sometimes uses overlap_risk as "there is overlap" while its
+        # visual rebuttal says the target cues are target-contained. Normalize
+        # only this fully specified contradiction; validation still owns the
+        # final class-change decision.
+        overlap_risk = "target_specific"
+        overlap_risk_reconciled = True
+    anchor_support_basis = _class_analysis_qwen_review_coerce_choice(
+        args.get("anchor_support_basis"),
+        CLASS_ANALYSIS_QWEN_REVIEW_ANCHOR_SUPPORT_BASIS_LEVELS,
+        "not_applicable",
+        synonyms={
+            "target_specific": "target_specific_anchors",
+            "target-specific": "target_specific_anchors",
+            "object_specific": "target_specific_anchors",
+            "object-specific": "target_specific_anchors",
+            "specific": "target_specific_anchors",
+            "shared": "shared_generic_anchors",
+            "generic": "shared_generic_anchors",
+            "shared_generic": "shared_generic_anchors",
+            "conflict": "conflicting_anchors",
+            "conflicting": "conflicting_anchors",
+            "insufficient_evidence": "insufficient",
+            "none": "not_applicable",
+            "n/a": "not_applicable",
+            "not applicable": "not_applicable",
+        },
+    )
+    anchor_support_verified = _class_analysis_qwen_review_coerce_bool(
+        args.get("anchor_support_verified"),
+        default=False,
+    )
+    if anchor_support_verified and anchor_support_basis in {"not_applicable", "insufficient"}:
+        anchor_support_basis = "target_specific_anchors"
+    if anchor_support_basis != "target_specific_anchors":
+        anchor_support_verified = False
+    anchor_support_reason = str(args.get("anchor_support_reason") or "")[:1200]
+    original_verified = bool(verified)
+    original_rejection_reason = str(args.get("rejection_reason") or "")[:1200]
+    verifier_reconciled_to_verified = False
+    target_specific_cue_count = len(independent_target_cues)
+    target_defining_cue_count = len(
+        {
+            _class_analysis_qwen_review_normalize_label(cue)
+            for cue in list(independent_target_cues) + list(target_defining_cues)
+            if str(cue or "").strip()
+        }
+    )
+    contrastively_supported_target = (
+        target_specific_cue_count >= 2
+        or (
+            target_specific_cue_count >= 1
+            and target_defining_cue_count >= 2
+            and len(current_missing_or_inconsistent_cues) >= 1
+            and anchor_support_verified
+            and anchor_support_basis == "target_specific_anchors"
+        )
+    )
+    if (
+        not verified
+        and contrastively_supported_target
+        and not effective_current_class_plausible
+        and bool(overlap_rebutted)
+        and overlap_risk in {"target_specific", "not_applicable"}
+        and len(supporting_ids) > 0
+        and max(0.0, min(1.0, cue_confidence)) >= 0.85
+    ):
+        verified = True
+        verifier_reconciled_to_verified = True
+    normalized = {
+        "verified": bool(verified),
+        "raw_verified": original_verified,
+        "reconciled_to_verified": verifier_reconciled_to_verified,
+        "target_class": normalized_target or target_class,
+        "cue_confidence": max(0.0, min(1.0, cue_confidence)),
+        "positive_visible_target_cues": target_cues,
+        "target_class_defining_cues": target_defining_cues,
+        "current_class_positive_cues": current_cues,
+        "current_class_missing_or_inconsistent_cues": current_missing_or_inconsistent_cues,
+        "independent_positive_visible_target_cues": independent_target_cues,
+        "shared_positive_visible_target_cues": shared_target_cues,
+        "target_specific_cue_count": target_specific_cue_count,
+        "target_defining_cue_count": target_defining_cue_count,
+        "contrastively_supported_target": contrastively_supported_target,
+        "independent_current_class_positive_cues": independent_current_cues,
+        "shared_current_class_positive_cues": shared_current_cues,
+        "current_class_plausible": bool(effective_current_class_plausible),
+        "raw_current_class_plausible": bool(current_class_plausible),
+        "current_class_plausibility_basis": current_class_plausibility_basis,
+        "current_class_plausibility_reason": current_class_plausibility_reason,
+        "whole_target_extent_supported": bool(whole_target_extent_supported),
+        "whole_target_extent_reason": whole_target_extent_reason,
+        "edge_clip_recoverable": bool(edge_clip_recoverable),
+        "edge_clip_recoverability_reason": edge_clip_recoverability_reason,
+        "overlap_rebutted": bool(overlap_rebutted),
+        "overlap_risk": overlap_risk,
+        "overlap_risk_reconciled": overlap_risk_reconciled,
+        "overlap_rebuttal": overlap_rebuttal,
+        "anchor_support_verified": bool(anchor_support_verified),
+        "anchor_support_basis": anchor_support_basis,
+        "anchor_support_reason": anchor_support_reason,
+        "supporting_clean_evidence_ids": supporting_ids,
+        "rejection_reason": original_rejection_reason,
+        "raw_arguments": args,
+    }
+    if not verified:
+        return normalized, None
+    if not contrastively_supported_target:
+        normalized["verified"] = False
+        normalized["rejection_reason"] = (
+            "Verifier did not provide either two independent positive target cues, "
+            "or one independent cue plus target-defining cues, target-specific anchors, "
+            "and missing/inconsistent current-class cues."
+        )
+    elif not whole_target_extent_supported:
+        normalized["verified"] = False
+        normalized["rejection_reason"] = (
+            whole_target_extent_reason
+            or "Verifier did not confirm that the proposed class explains the whole target extent."
+        )
+    elif independent_current_cues:
+        normalized["verified"] = False
+        normalized["rejection_reason"] = (
+            current_class_plausibility_reason
+            or "Verifier reported independent positive current-class cues."
+        )
+    elif effective_current_class_plausible:
+        normalized["verified"] = False
+        normalized["rejection_reason"] = (
+            current_class_plausibility_reason
+            or "Verifier reported that the clean target/source pixels still plausibly support the current class."
+        )
+    elif overlap_risk != "not_applicable" and (overlap_risk == "overlap_explains" or not overlap_rebutted):
+        normalized["verified"] = False
+        normalized["rejection_reason"] = "Verifier did not rebut overlap/background as an explanation for target-class evidence."
+    elif len(supporting_ids) == 0:
+        normalized["verified"] = False
+        normalized["rejection_reason"] = "Verifier did not cite clean target/source evidence ids."
+    elif normalized["cue_confidence"] < 0.85:
+        normalized["verified"] = False
+        normalized["rejection_reason"] = "Verifier cue confidence is below promotion threshold."
+    elif verifier_reconciled_to_verified:
+        normalized["rejection_reason"] = (
+            "Reconciled verifier contradiction: raw verified=false, but the same output provided "
+            "high-confidence target-defining cues, clean evidence IDs, and an overlap rebuttal."
+        )
+    return normalized, None
+
+
+def _class_analysis_qwen_review_try_cue_verifier(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    final_result: Dict[str, Any],
+    final_base_messages: Sequence[Dict[str, Any]],
+    point: Dict[str, Any],
+    result: Dict[str, Any],
+    evidence_ids: Set[str],
+    visual_quality: Dict[str, Any],
+    evidence_ledger: Dict[str, Any],
+    labelmap_glossary: str,
+    review_guidance: str,
+    deterministic_context: Dict[str, Any],
+    model_id: Optional[str],
+    executed_tools: Set[str],
+    labelmap: Sequence[str],
+) -> Dict[str, Any]:
+    if not _class_analysis_qwen_review_should_run_cue_verifier(final_result):
+        return final_result
+    guarded = final_result.get("guarded_recommendation")
+    if not isinstance(guarded, dict):
+        return final_result
+    verifier_messages = copy.deepcopy(list(final_base_messages))
+    verifier_messages.append(
+        _class_analysis_qwen_review_cue_verifier_instruction(
+            point=point,
+            guarded_recommendation=guarded,
+            evidence_ledger=evidence_ledger,
+        )
+    )
+    verifier_payload: Optional[Dict[str, Any]] = None
+    verifier_error: Optional[str] = None
+    raw_verifier = ""
+    verifier_attempts = 2
+    for attempt_idx in range(verifier_attempts):
+        attempt_messages = copy.deepcopy(verifier_messages)
+        if attempt_idx > 0:
+            attempt_messages.append(
+                _class_analysis_qwen_review_cue_verifier_repair_instruction(
+                    previous_output=raw_verifier,
+                    parse_error=verifier_error or "cue_verifier_parse_error",
+                    guarded_recommendation=guarded,
+                    evidence_ledger=evidence_ledger,
+                )
+            )
+        raw_verifier = _class_analysis_qwen_review_model_call(
+            job,
+            attempt_messages,
+            phase="cue_verifier" if attempt_idx == 0 else "cue_verifier_repair",
+            model_id=model_id,
+            tool_specs=_class_analysis_qwen_review_tool_specs_for_template(
+                _class_analysis_qwen_review_cue_verifier_tool_spec(labelmap)
+            ),
+            max_new_tokens=1200,
+            progress=0.78 + (0.03 * attempt_idx),
+            event_extra={
+                "attempt": attempt_idx + 1,
+                "guarded_recommendation": copy.deepcopy(guarded),
+                "assistant_prefix_strategy": "plain_json_arguments",
+                "reasoning_visual_policy": "compact_cue_verifier_core",
+            },
+            assistant_prefix=None,
+            image_max_side=CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE,
+            image_limit=CLASS_ANALYSIS_QWEN_REVIEW_CUE_VERIFIER_MAX_IMAGES,
+        )
+        verifier_payload, verifier_error = _class_analysis_qwen_review_parse_cue_verifier_payload(
+            raw_verifier,
+            current_class=str(point.get("class_name") or ""),
+            target_class=str(guarded.get("target_class") or ""),
+            evidence_ids=evidence_ids,
+        )
+        if isinstance(verifier_payload, dict):
+            break
+        _class_analysis_qwen_review_append_event(
+            job,
+            {
+                "type": "cue_verifier_parse_error",
+                "attempt": attempt_idx + 1,
+                "error": verifier_error or "cue_verifier_parse_error",
+                "output_preview": str(raw_verifier or "")[:500],
+            },
+        )
+    verifier_record = verifier_payload or {
+        "verified": False,
+        "target_class": str(guarded.get("target_class") or ""),
+        "cue_confidence": 0.0,
+        "positive_visible_target_cues": [],
+        "current_class_positive_cues": [],
+        "current_class_plausible": False,
+        "current_class_plausibility_reason": "",
+        "whole_target_extent_supported": False,
+        "whole_target_extent_reason": "",
+        "overlap_rebutted": False,
+        "overlap_risk": "uncertain",
+        "overlap_rebuttal": "",
+        "supporting_clean_evidence_ids": [],
+        "rejection_reason": verifier_error or "cue_verifier_parse_error",
+    }
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "cue_verifier_result",
+            "verified": bool(verifier_record.get("verified")),
+            "verifier": copy.deepcopy(verifier_record),
+        },
+    )
+    if not verifier_record.get("verified"):
+        final_result = dict(final_result)
+        final_result["cue_verifier"] = verifier_record
+        if verifier_record.get("current_class_plausible"):
+            final_result["current_class_plausible"] = True
+            final_result["current_class_plausibility_reason"] = str(
+                verifier_record.get("current_class_plausibility_reason") or ""
+            )[:1200]
+        return final_result
+    scale_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "scale")
+    embedding_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "embedding")
+    if str(final_result.get("same_image_scale_evidence") or "").strip().lower() == "questions_current":
+        scale_signal = "questions_current"
+    if str(final_result.get("same_image_embedding_evidence") or "").strip().lower() == "questions_current":
+        embedding_signal = "questions_current"
+    local_signal = str(final_result.get("local_consensus_evidence") or "").strip().lower()
+    if local_signal not in {"supports_current", "supports_suggested", "mixed", "absent", "not_applicable"}:
+        local_signal = "not_applicable"
+    verifier_basis = str(verifier_record.get("current_class_plausibility_basis") or "").strip().lower()
+    has_independent_current_questioning = (
+        scale_signal == "questions_current"
+        or embedding_signal == "questions_current"
+        or local_signal == "supports_suggested"
+    )
+    needs_moderate_anchor_verification = (
+        str(guarded.get("anchor_evidence_suggested") or "").strip().lower() == "moderate"
+    )
+    anchor_support_verified = bool(verifier_record.get("anchor_support_verified"))
+    anchor_support_basis = str(verifier_record.get("anchor_support_basis") or "").strip().lower()
+    if needs_moderate_anchor_verification and (
+        not anchor_support_verified
+        or anchor_support_basis != "target_specific_anchors"
+    ):
+        verifier_record = {
+            **verifier_record,
+            "verified": False,
+            "rejection_reason": (
+                "Cue verifier did not verify target-specific anchor support for the moderate "
+                "suggested-anchor recommendation."
+            ),
+        }
+        final_result = dict(final_result)
+        final_result["cue_verifier"] = verifier_record
+        return final_result
+    guarded_guardrail_reasons = [
+        str(item or "").strip().lower()
+        for item in (guarded.get("guardrail_reasons") or [])
+        if str(item or "").strip()
+    ]
+    guarded_overlap_assessment = str(guarded.get("overlap_assessment") or "").strip().lower()
+    overlap_entangled_guarded = (
+        guarded_overlap_assessment == "partial_contamination"
+        or any("overlap" in reason or "contamination" in reason for reason in guarded_guardrail_reasons)
+    )
+    verifier_current_missing_cues = [
+        str(item or "").strip()
+        for item in (verifier_record.get("current_class_missing_or_inconsistent_cues") or [])
+        if str(item or "").strip()
+    ]
+    deterministic_questions_current = scale_signal == "questions_current" or embedding_signal == "questions_current"
+    if needs_moderate_anchor_verification and overlap_entangled_guarded and not deterministic_questions_current:
+        # Local consensus and anchor examples can pull the model toward a plausible
+        # neighboring class even when the target crop contradicts that label. For
+        # moderate-anchor overlap cases, require a contrastive current-class
+        # contradiction that survived generic normalization, or independent
+        # deterministic same-image evidence questioning the current label.
+        if not verifier_current_missing_cues:
+            verifier_record = {
+                **verifier_record,
+                "verified": False,
+                "rejection_reason": (
+                    "Moderate-anchor overlap promotion needs deterministic same-image support "
+                    "or a surviving clean-pixel contradiction for the current class; local "
+                    "consensus alone is not enough."
+                ),
+            }
+            final_result = dict(final_result)
+            final_result["cue_verifier"] = verifier_record
+            return final_result
+    if verifier_basis == "shared_generic_cues" and not has_independent_current_questioning:
+        target_cues = list(verifier_record.get("independent_positive_visible_target_cues") or [])
+        target_defining_cues = list(verifier_record.get("target_class_defining_cues") or [])
+        current_missing_cues = verifier_current_missing_cues
+        current_cues = list(verifier_record.get("independent_current_class_positive_cues") or [])
+        anchor_rescues_inconsistent_shared_basis = bool(
+            needs_moderate_anchor_verification
+            and anchor_support_verified
+            and (
+                len(target_cues) >= 2
+                or (
+                    len(target_cues) >= 1
+                    and len(target_defining_cues) >= 2
+                    and len(current_missing_cues) >= 1
+                )
+            )
+            and not current_cues
+            and not verifier_record.get("current_class_plausible")
+        )
+        if not anchor_rescues_inconsistent_shared_basis:
+            verifier_record = {
+                **verifier_record,
+                "verified": False,
+                "rejection_reason": (
+                    "Cue verifier found only shared generic target/current cues and no same-image "
+                    "scale, embedding, or local-consensus signal questioning the current class."
+                ),
+            }
+            final_result = dict(final_result)
+            final_result["cue_verifier"] = verifier_record
+            return final_result
+    augmented_args = dict(guarded)
+    guarded_dual_bbox = (
+        guarded.get("dual_bbox_conflict")
+        if isinstance(guarded.get("dual_bbox_conflict"), dict)
+        else point.get("dual_bbox_conflict")
+        if isinstance(point.get("dual_bbox_conflict"), dict)
+        else evidence_ledger.get("dual_bbox_conflict")
+        if isinstance(evidence_ledger, dict) and isinstance(evidence_ledger.get("dual_bbox_conflict"), dict)
+        else None
+    )
+    guarded_dual_other_class = _class_analysis_qwen_review_dual_bbox_other_class(guarded_dual_bbox or {})
+    guarded_dual_target_norm = _class_analysis_qwen_review_normalize_label(guarded.get("target_class"))
+    guarded_dual_other_norm = _class_analysis_qwen_review_normalize_label(guarded_dual_other_class)
+    try:
+        guarded_dual_iou = float((guarded_dual_bbox or {}).get("iou") or 0.0)
+    except Exception:
+        guarded_dual_iou = 0.0
+    if not math.isfinite(guarded_dual_iou):
+        guarded_dual_iou = 0.0
+    guarded_duplicate_like_dual_switch = (
+        bool((guarded_dual_bbox or {}).get("enabled"))
+        and str(guarded.get("dual_bbox_resolution") or "").strip().lower() == "overlap_box_class"
+        and bool(guarded_dual_other_norm)
+        and guarded_dual_target_norm == guarded_dual_other_norm
+        and (
+            str((guarded_dual_bbox or {}).get("relation") or "").strip().lower() == "duplicate_like"
+            or guarded_dual_iou >= 0.90
+        )
+    )
+    overlap_rebuttal = str(verifier_record.get("overlap_rebuttal") or "").strip()
+    guarded_rationale = str(guarded.get("rationale_short") or "").strip()
+    verifier_positive_cues = [
+        str(item or "").strip()
+        for item in (verifier_record.get("positive_visible_target_cues") or [])
+        if str(item or "").strip()
+    ]
+    verifier_target_defining_cues = [
+        str(item or "").strip()
+        for item in (verifier_record.get("target_class_defining_cues") or [])
+        if str(item or "").strip()
+    ]
+    verifier_current_missing_cues = [
+        str(item or "").strip()
+        for item in (verifier_record.get("current_class_missing_or_inconsistent_cues") or [])
+        if str(item or "").strip()
+    ]
+    combined_positive_cues: List[str] = []
+    combined_seen: Set[str] = set()
+    for cue in list(verifier_positive_cues) + list(verifier_target_defining_cues):
+        cue_norm = _class_analysis_qwen_review_normalize_label(cue)
+        if not cue_norm or cue_norm in combined_seen:
+            continue
+        combined_positive_cues.append(cue)
+        combined_seen.add(cue_norm)
+        if len(combined_positive_cues) >= 6:
+            break
+    verifier_supporting_ids = list(verifier_record.get("supporting_clean_evidence_ids") or [])
+    target_identity_summary = str(guarded.get("target_identity_summary") or "").strip()
+    if not target_identity_summary and verifier_positive_cues:
+        target_identity_summary = "; ".join(verifier_positive_cues[:3])[:1200]
+    target_identity_uncertainty = str(guarded.get("target_identity_uncertainty") or "").strip().lower()
+    if target_identity_summary and target_identity_uncertainty not in CLASS_ANALYSIS_QWEN_REVIEW_TARGET_IDENTITY_UNCERTAINTY_LEVELS:
+        target_identity_uncertainty = (
+            "low"
+            if float(verifier_record.get("cue_confidence") or 0.0) >= 0.9
+            and bool(verifier_record.get("whole_target_extent_supported"))
+            else "moderate"
+        )
+    target_identity_evidence_ids = list(guarded.get("target_identity_evidence_ids") or [])
+    if not target_identity_evidence_ids and target_identity_summary:
+        target_identity_evidence_ids = verifier_supporting_ids
+    if verifier_record.get("overlap_rebutted"):
+        overlap_rebuttal = (
+            overlap_rebuttal
+            or "Overlap does not explain the target-contained visible class features."
+        )
+    if guarded_duplicate_like_dual_switch and verifier_record.get("overlap_rebutted"):
+        # The final VLM sometimes correctly chooses the overlapping class in a
+        # near-identical duplicate-bbox conflict while leaving overlap_assessment
+        # as unclear/context-mixed. Preserve the controller-rendered geometry
+        # fact for validation after the separate cue verifier confirms that the
+        # proposed class evidence is target-contained rather than background or
+        # overlap leakage.
+        augmented_args["overlap_assessment"] = "duplicate_like"
+        augmented_args["dual_bbox_resolution"] = "overlap_box_class"
+    augmented_args.update(
+        {
+            "decision": guarded.get("decision"),
+            "target_class": guarded.get("target_class"),
+            "confidence": min(float(guarded.get("confidence") or 0.0), float(verifier_record.get("cue_confidence") or 0.0)),
+            "visible_target_cues": combined_positive_cues,
+            "supporting_clean_evidence_ids": verifier_supporting_ids,
+            "target_identity_summary": target_identity_summary,
+            "target_identity_uncertainty": target_identity_uncertainty or "moderate",
+            "target_identity_evidence_ids": target_identity_evidence_ids,
+            "rationale_short": (
+                f"{guarded_rationale} {overlap_rebuttal}".strip()
+                if overlap_rebuttal
+                else guarded_rationale
+            )[:800],
+            "counter_evidence": (
+                "; ".join(verifier_current_missing_cues[:3])
+                or str(guarded.get("counter_evidence") or "Cue verifier found no positive current-class cues.")
+            )[:800],
+            "overlap_explains_candidate_similarity": False
+            if verifier_record.get("overlap_rebutted")
+            else guarded.get("overlap_explains_candidate_similarity", False),
+            "overlap_adjudication_verified": bool(verifier_record.get("overlap_rebutted")),
+            "_overlap_adjudication_verified": bool(verifier_record.get("overlap_rebutted")),
+            "overlap_adjudication_reason": overlap_rebuttal,
+            "anchor_adjudication_verified": bool(anchor_support_verified),
+            "_anchor_adjudication_verified": bool(anchor_support_verified),
+            "anchor_adjudication_reason": str(verifier_record.get("anchor_support_reason") or "")[:1200],
+            "current_class_plausible": bool(verifier_record.get("current_class_plausible")),
+            "current_class_plausibility_reason": str(
+                verifier_record.get("current_class_plausibility_reason") or ""
+            )[:1200],
+            "_cue_verifier_class_change_verified": True,
+            "_cue_verifier_confidence": float(verifier_record.get("cue_confidence") or 0.0),
+            "_cue_verifier_overlap_rebutted": bool(verifier_record.get("overlap_rebutted")),
+            "_cue_verifier_overlap_risk": str(verifier_record.get("overlap_risk") or "")[:120],
+            "_cue_verifier_edge_clip_recoverable": bool(verifier_record.get("edge_clip_recoverable")),
+            "_cue_verifier_edge_clip_recoverability_reason": str(
+                verifier_record.get("edge_clip_recoverability_reason") or ""
+            )[:1200],
+            "human_review_needed": True,
+            "specificity_alignment": "supports_suggested"
+            if str(guarded.get("decision") or "") == "accept_suggested"
+            else "supports_other"
+            if str(guarded.get("decision") or "") == "change_to_other"
+            else str(guarded.get("specificity_alignment") or "insufficient"),
+            "target_background_contrast": "target_specific",
+            "glossary_or_guidance_used": True
+            if str(labelmap_glossary or "").strip() or str(review_guidance or "").strip()
+            else False,
+        }
+    )
+    expanded_args = _class_analysis_qwen_review_expand_compact_final(
+        augmented_args,
+        point=point,
+        evidence_ids=evidence_ids,
+        visual_quality=visual_quality,
+        executed_tools=executed_tools,
+        labelmap_glossary=labelmap_glossary,
+        review_guidance=review_guidance,
+        deterministic_context=deterministic_context,
+        evidence_ledger=evidence_ledger,
+    )
+    for verifier_key in (
+        "overlap_adjudication_verified",
+        "_overlap_adjudication_verified",
+        "overlap_adjudication_reason",
+        "anchor_adjudication_verified",
+        "_anchor_adjudication_verified",
+        "anchor_adjudication_reason",
+        "current_class_plausible",
+        "current_class_plausibility_reason",
+        "_cue_verifier_class_change_verified",
+        "_cue_verifier_confidence",
+        "_cue_verifier_overlap_rebutted",
+        "_cue_verifier_overlap_risk",
+        "_cue_verifier_edge_clip_recoverable",
+        "_cue_verifier_edge_clip_recoverability_reason",
+    ):
+        if verifier_key in augmented_args:
+            expanded_args[verifier_key] = copy.deepcopy(augmented_args[verifier_key])
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "cue_verifier_expanded",
+            "verifier": copy.deepcopy(verifier_record),
+            "expanded_arguments": copy.deepcopy(expanded_args),
+        },
+    )
+    try:
+        promoted = _class_analysis_qwen_review_validate_final(
+            expanded_args,
+            result,
+            point,
+            evidence_ids,
+            visual_quality,
+            evidence_ledger,
+            labelmap_glossary,
+        )
+    except Exception as exc:
+        verifier_record = {
+            **verifier_record,
+            "verified": False,
+            "rejection_reason": f"cue verifier promotion failed validation: {exc}",
+        }
+        _class_analysis_qwen_review_append_event(
+            job,
+            {
+                "type": "cue_verifier_promotion_validation_error",
+                "verifier": copy.deepcopy(verifier_record),
+                "expanded_arguments": copy.deepcopy(expanded_args),
+                "error": str(exc),
+            },
+        )
+        final_result = dict(final_result)
+        final_result["cue_verifier"] = verifier_record
+        return final_result
+    promoted["model_compact_arguments"] = copy.deepcopy(augmented_args)
+    promoted["expanded_by_controller"] = True
+    promoted["controller_reconciliation"] = copy.deepcopy(
+        expanded_args.get("_controller_reconciliation") or {"applied": False}
+    )
+    promoted["cue_verifier"] = {
+        **verifier_record,
+        "promoted_from_guarded_recommendation": promoted.get("decision") != "skip_uncertain",
+    }
+    return promoted
+
+
+def _class_analysis_qwen_review_evidence_use(kind: str, metadata: Optional[Dict[str, Any]] = None) -> str:
+    """Controller-owned evidence-use categories for final review grounding."""
+
+    kind_norm = str(kind or "").strip().lower()
+    metadata = metadata if isinstance(metadata, dict) else {}
+    if kind_norm in {"target_context", "target_detail", "source_clean", "class_context_pack", "specificity_region_contrast"}:
+        return "clean_visual"
+    if kind_norm == "zoom_region":
+        return "clean_visual" if not bool(metadata.get("bbox_overlay")) else "geometry_overlay"
+    if kind_norm == "local_consensus_context":
+        return "mixed_clean_visual_and_consensus"
+    if kind_norm in {"source_overlay", "overlap_decomposition"}:
+        return "geometry_overlay"
+    if kind_norm in {"same_image_scale_report", "same_image_embedding_report"}:
+        return "deterministic_context"
+    if kind_norm in {"neighbors", "class_comparison"}:
+        return "clean_visual_reference"
+    return "auxiliary"
+
+
+def _class_analysis_qwen_review_evidence_ledger(job: ClassAnalysisQwenReviewJob) -> Dict[str, Any]:
+    rows: List[Dict[str, Any]] = []
+    clean_visual_ids: List[str] = []
+    clean_target_source_ids: List[str] = []
+    geometry_ids: List[str] = []
+    consensus_ids: List[str] = []
+    reference_ids: List[str] = []
+    deterministic_ids: List[str] = []
+    overlap_decomposition: Optional[Dict[str, Any]] = None
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        evidence_rows = copy.deepcopy(job.evidence)
+    for item in evidence_rows:
+        if not isinstance(item, dict):
+            continue
+        evidence_id = str(item.get("evidence_id") or "").strip()
+        if not evidence_id:
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        use = _class_analysis_qwen_review_evidence_use(str(item.get("kind") or ""), metadata)
+        if str(item.get("kind") or "").strip() == "overlap_decomposition":
+            overlap_decomposition = _class_analysis_qwen_review_overlap_ledger_entry(metadata)
+        row = {
+            "evidence_id": evidence_id,
+            "kind": str(item.get("kind") or ""),
+            "title": str(item.get("title") or ""),
+            "use": use,
+            "summary": str(item.get("summary") or "")[:900],
+        }
+        rows.append(row)
+        if use == "clean_visual":
+            clean_visual_ids.append(evidence_id)
+            if str(item.get("kind") or "").strip() != "class_context_pack":
+                clean_target_source_ids.append(evidence_id)
+        elif use == "geometry_overlay":
+            geometry_ids.append(evidence_id)
+        elif use == "mixed_clean_visual_and_consensus":
+            consensus_ids.append(evidence_id)
+        elif use == "clean_visual_reference":
+            reference_ids.append(evidence_id)
+        elif use == "deterministic_context":
+            deterministic_ids.append(evidence_id)
+    ledger = {
+        "rows": rows,
+        "clean_visual_evidence_ids": clean_visual_ids,
+        "clean_target_source_evidence_ids": clean_target_source_ids,
+        "geometry_overlay_evidence_ids": geometry_ids,
+        "local_consensus_evidence_ids": consensus_ids,
+        "clean_visual_reference_evidence_ids": reference_ids,
+        "deterministic_context_evidence_ids": deterministic_ids,
+        "policy": (
+            "visible_target_cues must come from clean visual evidence. Geometry overlays, "
+            "bbox drawings, dot maps, neighbor counts, deterministic reports, and class labels may explain context "
+            "but cannot be the sole basis for a class-change cue."
+        ),
+    }
+    if overlap_decomposition is not None:
+        ledger["overlap_decomposition"] = overlap_decomposition
+    return ledger
+
+
+def _class_analysis_qwen_review_deterministic_context(job: ClassAnalysisQwenReviewJob) -> Dict[str, Any]:
+    context: Dict[str, Any] = {}
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        evidence_rows = copy.deepcopy(job.evidence)
+    for item in evidence_rows:
+        if not isinstance(item, dict):
+            continue
+        kind = str(item.get("kind") or "").strip()
+        if kind not in {"same_image_scale_report", "same_image_embedding_report"}:
+            continue
+        metadata = item.get("metadata") if isinstance(item.get("metadata"), dict) else {}
+        key = "scale" if kind == "same_image_scale_report" else "embedding"
+        context[key] = {
+            "evidence_id": str(item.get("evidence_id") or ""),
+            "signal": str(metadata.get("signal") or "insufficient"),
+            "reason": str(metadata.get("reason") or ""),
+            "same_image_anchor_count": int(metadata.get("same_image_anchor_count") or 0),
+            "current_class": str(metadata.get("current_class") or ""),
+            "image_relpath": str(metadata.get("image_relpath") or ""),
+        }
+    return context
+
+
+def _class_analysis_qwen_review_evidence_ledger_message(
+    ledger: Dict[str, Any],
+    *,
+    visual_quality: Dict[str, Any],
+) -> Dict[str, Any]:
+    rows = [row for row in (ledger.get("rows") or []) if isinstance(row, dict)]
+    lines = [
+        "Controller evidence ledger.",
+        "This is a backend summary of rendered evidence and allowed use. It is not a model decision.",
+        _class_analysis_qwen_review_quality_summary(visual_quality),
+        f"Clean visual evidence ids: {', '.join(ledger.get('clean_visual_evidence_ids') or []) or '(none)'}.",
+        f"Clean target/source evidence ids for visible-cue attribution: {', '.join(ledger.get('clean_target_source_evidence_ids') or []) or '(none)'}.",
+        f"Clean reference evidence ids: {', '.join(ledger.get('clean_visual_reference_evidence_ids') or []) or '(none)'}.",
+        f"Geometry/overlay evidence ids: {', '.join(ledger.get('geometry_overlay_evidence_ids') or []) or '(none)'}.",
+        f"Local consensus evidence ids: {', '.join(ledger.get('local_consensus_evidence_ids') or []) or '(none)'}.",
+        f"Deterministic context evidence ids: {', '.join(ledger.get('deterministic_context_evidence_ids') or []) or '(none)'}.",
+        str(ledger.get("policy") or ""),
+        "Evidence rows:",
+    ]
+    dual_bbox_conflict = ledger.get("dual_bbox_conflict") if isinstance(ledger.get("dual_bbox_conflict"), dict) else None
+    if dual_bbox_conflict:
+        lines.insert(
+            7,
+            (
+                "Dual-bbox conflict: current={current}, overlap={other}, IoU={iou:.3f}. "
+                "Resolve via dual_bbox_resolution in the final JSON."
+            ).format(
+                current=str(dual_bbox_conflict.get("current_class") or ""),
+                other=_class_analysis_qwen_review_dual_bbox_other_class(dual_bbox_conflict),
+                iou=float(dual_bbox_conflict.get("iou") or 0.0),
+            ),
+        )
+    for row in rows[:14]:
+        lines.append(
+            "- {evidence_id} [{use}] {title}: {summary}".format(
+                evidence_id=str(row.get("evidence_id") or ""),
+                use=str(row.get("use") or ""),
+                title=str(row.get("title") or "")[:90],
+                summary=str(row.get("summary") or "").replace("\n", " ")[:320],
+            )
+        )
+    lines.extend(
+        [
+            "Final review instructions:",
+            "- Use clean target/source pixels for visible_target_cues.",
+            "- For accept_suggested/change_to_other, copy the clean target/source ids that support those cues into supporting_clean_evidence_ids.",
+            "- Use geometry/overlay evidence only for bbox location, overlap, and contamination reasoning.",
+            "- Use local consensus dots only as annotation-distribution context.",
+            "- Use deterministic scale/embedding reports only as context, not as visible target cues.",
+            "- If a class-change cue is only a class label, neighbor count, dot color, or overlay box, choose skip_uncertain.",
+        ]
+    )
+    return {"role": "user", "content": [{"type": "text", "text": "\n".join(lines)}]}
+
+
+def _class_analysis_qwen_review_request_bool(job: ClassAnalysisQwenReviewJob, key: str, default: bool = False) -> bool:
+    raw = job.request.get(key)
+    if isinstance(raw, bool):
+        return raw
+    if raw is None:
+        return default
+    return _parse_bool(str(raw))
+
+
+def _class_analysis_qwen_review_mlx_reset_every(job: ClassAnalysisQwenReviewJob) -> int:
+    return max(
+        0,
+        min(
+            1000,
+            _coerce_int(
+                job.request.get("mlx_reset_every"),
+                CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_EVERY,
+                minimum=0,
+            ),
+        ),
+    )
+
+
+def _class_analysis_qwen_review_mlx_runtime_active() -> bool:
+    """Best-effort MLX runtime detection for stability resets.
+
+    Long local review batches can keep MLX/Metal allocations alive across
+    several prompt calls. The canonical runtime flag is still preferred, but
+    benchmark crashes showed it can be stale in some direct-run paths, so this
+    helper falls back to device/model metadata without changing label logic.
+    """
+
+    if qwen_runtime_platform == QWEN_PLATFORM_MLX or qwen_device == QWEN_PLATFORM_MLX:
+        return True
+    metadata = active_qwen_metadata if isinstance(active_qwen_metadata, dict) else {}
+    for key in ("runtime_platform", "platform", "backend"):
+        if str(metadata.get(key) or "").strip() == QWEN_PLATFORM_MLX:
+            return True
+    for value in (
+        active_qwen_model_id,
+        qwen_loaded_effective_model_id,
+        metadata.get("model_id"),
+        metadata.get("effective_model_id"),
+    ):
+        try:
+            if is_qwen_mlx_model_id(str(value or "")):
+                return True
+        except Exception:
+            continue
+    return False
+
+
+def _class_analysis_qwen_review_reset_qwen_runtime(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    reason: str,
+    phase: str = "",
+    completed_calls: Optional[int] = None,
+) -> None:
+    """Unload Qwen/MLX state for long review batches.
+
+    This is a runtime-stability guard only. It deliberately avoids any label or
+    dataset semantics so the Class Split review agent stays project-agnostic.
+    """
+
+    with qwen_mlx_generation_lock:
+        _reset_qwen_runtime()
+    with CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_LOCK:
+        CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_STATE["completed_calls"] = 0
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "qwen_runtime_reset",
+            "reason": str(reason or "runtime_policy"),
+            "phase": str(phase or ""),
+            "runtime_platform": QWEN_PLATFORM_MLX,
+            "completed_calls_before_reset": completed_calls,
+        },
+    )
+
+
+def _class_analysis_qwen_review_note_model_call_completed(
+    job: ClassAnalysisQwenReviewJob,
+    *,
+    phase: str,
+) -> None:
+    if not _class_analysis_qwen_review_mlx_runtime_active():
+        return
+    reset_every = _class_analysis_qwen_review_mlx_reset_every(job)
+    if reset_every <= 0:
+        return
+    with CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_LOCK:
+        completed_calls = int(CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_STATE.get("completed_calls") or 0) + 1
+        CLASS_ANALYSIS_QWEN_REVIEW_MLX_RESET_STATE["completed_calls"] = completed_calls
+        should_reset = completed_calls >= reset_every
+    if should_reset:
+        _class_analysis_qwen_review_reset_qwen_runtime(
+            job,
+            reason=f"mlx_reset_every_{reset_every}",
+            phase=phase,
+            completed_calls=completed_calls,
+        )
+
+
+def _class_analysis_qwen_review_model_call(
+    job: ClassAnalysisQwenReviewJob,
+    messages: List[Dict[str, Any]],
+    *,
+    phase: str,
+    model_id: Optional[str],
+    tool_specs: List[Dict[str, Any]],
+    max_new_tokens: int,
+    progress: float,
+    event_extra: Optional[Dict[str, Any]] = None,
+    assistant_prefix: Optional[str] = "<tool_call>",
+    image_max_side: Optional[int] = None,
+    image_limit: Optional[int] = None,
+    enable_thinking: bool = False,
+) -> str:
+    chat_template_kwargs: Dict[str, Any] = {"enable_thinking": bool(enable_thinking)}
+    qwen_kwargs = {
+        "max_new_tokens": int(max_new_tokens),
+        "model_id_override": model_id,
+        "decode_override": {"do_sample": False, "temperature": 0.0},
+        "chat_template_kwargs": chat_template_kwargs,
+        "assistant_prefix": assistant_prefix,
+    }
+    thinking_effort = (job.request or {}).get("thinking_effort")
+    thinking_scale_factor = (job.request or {}).get("thinking_scale_factor")
+    if enable_thinking and thinking_effort is not None:
+        qwen_kwargs["thinking_effort"] = thinking_effort
+    if enable_thinking and thinking_scale_factor is not None:
+        qwen_kwargs["thinking_scale_factor"] = thinking_scale_factor
+    effective_messages, image_policy = _class_analysis_qwen_review_cap_message_images(
+        messages,
+        max_images=image_limit,
+        max_side=image_max_side,
+    )
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        _class_analysis_qwen_review_update(
+            job,
+            progress=progress,
+            message=f"Qwen review {phase} ...",
+        )
+    _class_analysis_qwen_review_append_event(
+        job,
+        {
+            "type": "model_input",
+            "phase": phase,
+            "requested_model_id": model_id or "",
+            "messages": copy.deepcopy(effective_messages),
+            "kwargs": copy.deepcopy(qwen_kwargs),
+            "tool_schema": copy.deepcopy(tool_specs),
+            "tool_schema_chat_template_disabled": True,
+            "image_policy": copy.deepcopy(image_policy),
+            **(event_extra or {}),
+        },
+    )
+    raw = _run_qwen_chat(effective_messages, **qwen_kwargs)
+    _class_analysis_qwen_review_note_model_call_completed(job, phase=phase)
+    _class_analysis_qwen_review_append_event(
+        job,
+        {"type": "model_output", "phase": phase, "text": raw},
+    )
+    messages.append({"role": "assistant", "content": [{"type": "text", "text": str(raw or "")}]})
+    return str(raw or "")
+
+
+def _run_class_analysis_qwen_review_job(job: ClassAnalysisQwenReviewJob) -> None:
+    try:
+        _class_analysis_qwen_review_dir(job, create=True)
+        _class_analysis_qwen_review_write_json(job, "prompt_sources.json", _class_analysis_qwen_review_source_manifest())
+        with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+            _class_analysis_qwen_review_update(job, status="running", progress=0.03, message="Loading analysis result ...")
+        result = _class_analysis_qwen_review_parent_result(job)
+        points_by_id = _class_analysis_qwen_points_by_id(result)
+        point = points_by_id.get(str(job.point_id or ""))
+        if point is None:
+            raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="point_not_found")
+        visual_quality = _class_analysis_qwen_review_visual_quality(job, result, point)
+        max_turns = max(
+            2,
+            min(
+                CLASS_ANALYSIS_QWEN_REVIEW_MAX_TURNS,
+                _coerce_int(job.request.get("max_turns"), CLASS_ANALYSIS_QWEN_REVIEW_MAX_TURNS),
+            ),
+        )
+        model_id = str(job.request.get("model_id") or "").strip() or None
+        labelmap_glossary = _normalize_labelmap_glossary(job.request.get("labelmap_glossary") or "")
+        review_guidance = str(job.request.get("review_guidance") or "").strip()
+        raw_local_consensus = job.request.get("enable_local_consensus_context")
+        local_consensus_enabled = (
+            bool(raw_local_consensus)
+            if isinstance(raw_local_consensus, bool)
+            else _parse_bool(str(raw_local_consensus)) if raw_local_consensus is not None else False
+        )
+        raw_concept_briefs = job.request.get("enable_class_concept_briefs")
+        concept_briefs_enabled = (
+            bool(raw_concept_briefs)
+            if isinstance(raw_concept_briefs, bool)
+            else _parse_bool(str(raw_concept_briefs)) if raw_concept_briefs is not None else False
+        )
+        raw_limited_final_review = job.request.get("allow_limited_final_review")
+        limited_final_review_enabled = (
+            bool(raw_limited_final_review)
+            if isinstance(raw_limited_final_review, bool)
+            else _parse_bool(str(raw_limited_final_review)) if raw_limited_final_review is not None else False
+        )
+        raw_poor_final_review = job.request.get("allow_poor_final_review")
+        poor_final_review_enabled = (
+            bool(raw_poor_final_review)
+            if isinstance(raw_poor_final_review, bool)
+            else _parse_bool(str(raw_poor_final_review)) if raw_poor_final_review is not None else False
+        )
+        raw_cue_verifier = job.request.get("enable_cue_verifier")
+        cue_verifier_enabled = (
+            bool(raw_cue_verifier)
+            if isinstance(raw_cue_verifier, bool)
+            else _parse_bool(str(raw_cue_verifier)) if raw_cue_verifier is not None else True
+        )
+        raw_specificity_probe = job.request.get("enable_specificity_probe")
+        specificity_probe_enabled = (
+            bool(raw_specificity_probe)
+            if isinstance(raw_specificity_probe, bool)
+            else _parse_bool(str(raw_specificity_probe)) if raw_specificity_probe is not None else True
+        )
+        thinking_scratchpad_enabled = _class_analysis_qwen_review_request_bool(job, "enable_thinking", False)
+        mlx_reset_every = _class_analysis_qwen_review_mlx_reset_every(job)
+        reset_after_review = _class_analysis_qwen_review_request_bool(job, "reset_qwen_runtime_after_review", False)
+        backend_quality_tier = str(visual_quality.get("tier") or "unknown").strip().lower()
+        non_clear_final_review_allowed = (
+            (backend_quality_tier == "limited" and limited_final_review_enabled)
+            or (backend_quality_tier == "poor" and poor_final_review_enabled)
+        )
+        _class_analysis_qwen_review_write_json(
+            job,
+            "review_context.json",
+            {
+                "labelmap_glossary": labelmap_glossary,
+                "review_guidance": review_guidance,
+                "enable_local_consensus_context": local_consensus_enabled,
+                "enable_class_concept_briefs": concept_briefs_enabled,
+                "allow_limited_final_review": limited_final_review_enabled,
+                "allow_poor_final_review": poor_final_review_enabled,
+                "enable_cue_verifier": cue_verifier_enabled,
+                "enable_specificity_probe": specificity_probe_enabled,
+                "enable_thinking_scratchpad": thinking_scratchpad_enabled,
+                "thinking_effort": job.request.get("thinking_effort"),
+                "thinking_scale_factor": job.request.get("thinking_scale_factor"),
+                "mlx_reset_every": mlx_reset_every,
+                "reset_qwen_runtime_after_review": reset_after_review,
+                "point_id": point.get("point_id"),
+                "current_class": point.get("class_name"),
+                "suggested_neighbor_class": point.get("suggested_neighbor_class") or "",
+                "dual_bbox_conflict": copy.deepcopy(point.get("dual_bbox_conflict"))
+                if isinstance(point.get("dual_bbox_conflict"), dict)
+                else None,
+            },
+        )
+        required_tools = {
+            "inspect_target_context",
+            "inspect_target_detail",
+            "inspect_source_overlay",
+            "inspect_overlap_decomposition",
+            "inspect_class_context_pack",
+            "inspect_specificity_region_contrast",
+            "zoom_source_region_clean",
+        }
+        messages: List[Dict[str, Any]] = [
+            {
+                "role": "system",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _class_analysis_qwen_review_system_prompt(
+                            max_turns,
+                            require_overlap=True,
+                            allow_local_consensus=local_consensus_enabled,
+                        ),
+                    }
+                ],
+            },
+            {
+                "role": "user",
+                "content": [
+                    {
+                        "type": "text",
+                        "text": _class_analysis_qwen_review_initial_user_message(
+                            result,
+                            point,
+                            visual_quality,
+                            labelmap_glossary=labelmap_glossary,
+                            review_guidance=review_guidance,
+                        ),
+                    }
+                ],
+            },
+        ]
+        executed_tools: Set[str] = set()
+        satisfied_tools: Set[str] = set()
+        evidence_ids: Set[str] = set()
+        invalid_outputs = 0
+        final_result: Optional[Dict[str, Any]] = None
+        for required_idx, (required_tool_name, required_args) in enumerate(
+            CLASS_ANALYSIS_QWEN_REVIEW_REQUIRED_TOOL_SEQUENCE,
+            start=1,
+        ):
+            if job.cancel_event.is_set():
+                raise RuntimeError("cancelled")
+            tool = CLASS_ANALYSIS_QWEN_REVIEW_TOOLS.get(required_tool_name)
+            if tool is None:
+                raise RuntimeError(f"required review tool missing: {required_tool_name}")
+            with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+                _class_analysis_qwen_review_update(
+                    job,
+                    progress=0.04 + (0.04 * (required_idx / max(1, len(CLASS_ANALYSIS_QWEN_REVIEW_REQUIRED_TOOL_SEQUENCE)))),
+                    message=f"Rendering required evidence {required_idx}/{len(CLASS_ANALYSIS_QWEN_REVIEW_REQUIRED_TOOL_SEQUENCE)} ...",
+                )
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "controller_tool_call",
+                    "required_phase": True,
+                    "tool": required_tool_name,
+                    "arguments": required_args,
+                    "required_step": required_idx,
+                },
+            )
+            observation = tool(job, result, point, dict(required_args))
+            executed_tools.add(required_tool_name)
+            satisfied_tools.update(_class_analysis_qwen_review_satisfied_tool_keys(required_tool_name, required_args))
+            for evidence in observation.get("evidence") or []:
+                if isinstance(evidence, dict) and str(evidence.get("evidence_id") or "").strip():
+                    evidence_ids.add(str(evidence.get("evidence_id")).strip())
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "tool_result",
+                    "turn": 0,
+                    "required_phase": True,
+                    "required_step": required_idx,
+                    "tool": required_tool_name,
+                    "arguments": required_args,
+                    "summary": observation.get("summary"),
+                    "evidence_ids": sorted(evidence_ids),
+                },
+            )
+            messages.append(_class_analysis_qwen_review_observation_message(required_tool_name, observation))
+        concept_briefs_packet: Dict[str, Any] = {
+            "enabled": False,
+            "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+            "pair_contrast_version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+            "classes": [],
+            "artifacts": [],
+            "pair_contrasts": [],
+            "prompt_text": "",
+        }
+        if concept_briefs_enabled and (backend_quality_tier == "clear" or non_clear_final_review_allowed):
+            try:
+                concept_briefs_packet = _class_analysis_qwen_review_build_concept_briefs(
+                    job,
+                    result,
+                    point,
+                    labelmap_glossary=labelmap_glossary,
+                    review_guidance=review_guidance,
+                    model_id=model_id,
+                )
+            except RuntimeError:
+                raise
+            except Exception as exc:
+                logger.debug("Class analysis Qwen concept brief generation failed: %s", exc)
+                concept_briefs_packet = {
+                    "enabled": False,
+                    "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+                    "pair_contrast_version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+                    "classes": _class_analysis_qwen_review_relevant_classes_for_concepts(point),
+                    "artifacts": [],
+                    "pair_contrasts": [],
+                    "prompt_text": "",
+                    "error": str(exc),
+                }
+                _class_analysis_qwen_review_write_json(job, "concept_briefs.json", concept_briefs_packet)
+                _class_analysis_qwen_review_append_event(
+                    job,
+                    {
+                        "type": "concept_briefs_failed",
+                        "error": str(exc),
+                        "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+                    },
+                )
+        elif concept_briefs_enabled:
+            concept_briefs_packet = {
+                "enabled": False,
+                "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+                "pair_contrast_version": CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+                "classes": _class_analysis_qwen_review_relevant_classes_for_concepts(point),
+                "artifacts": [],
+                "pair_contrasts": [],
+                "prompt_text": "",
+                    "skipped_reason": f"qwen_final_review_not_available_for_target_quality_{backend_quality_tier or 'unknown'}",
+            }
+            _class_analysis_qwen_review_write_json(job, "concept_briefs.json", concept_briefs_packet)
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "concept_briefs_skipped",
+                    "reason": "final_review_not_available_for_target_quality",
+                    "backend_tier": backend_quality_tier,
+                    "version": CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+                },
+            )
+        labelmap = [
+            str(name or "").strip()
+            for name in ((result.get("summary") or {}).get("labelmap") or [])
+            if str(name or "").strip()
+        ]
+        router_policy = _class_analysis_qwen_review_local_consensus_policy(
+            local_consensus_enabled=local_consensus_enabled,
+            visual_quality=visual_quality,
+            point=point,
+            executed_tools=executed_tools,
+        )
+        router_result = {
+            "action": "finalize_now",
+            "reason_code": "local_consensus_disabled" if not local_consensus_enabled else "policy_blocked",
+            "confidence": 1.0,
+            "rationale_short": "Controller policy skips optional local consensus.",
+            "policy_allowed_local_consensus": bool(router_policy.get("allowed")),
+            "policy_reasons": list(router_policy.get("reasons") or []),
+        }
+        if local_consensus_enabled and bool(router_policy.get("allowed")):
+            router_result = {
+                "action": "inspect_local_consensus_context",
+                "reason_code": "needs_same_image_consensus",
+                "confidence": 1.0,
+                "rationale_short": "Controller renders local consensus for reviewable candidate with a suggested class.",
+                "policy_allowed_local_consensus": True,
+                "policy_reasons": [],
+                "controller_forced": True,
+            }
+            _class_analysis_qwen_review_append_event(
+                job,
+                {"type": "router_decision", "router": router_result, "skipped_model_call": True},
+            )
+        else:
+            _class_analysis_qwen_review_append_event(
+                job,
+                {"type": "router_decision", "router": router_result, "skipped_model_call": True},
+            )
+
+        if router_result.get("action") == "inspect_local_consensus_context":
+            if job.cancel_event.is_set():
+                raise RuntimeError("cancelled")
+            tool_name = "inspect_local_consensus_context"
+            tool = CLASS_ANALYSIS_QWEN_REVIEW_TOOLS[tool_name]
+            with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+                _class_analysis_qwen_review_update(
+                    job,
+                    progress=0.20,
+                    message="Rendering routed local consensus evidence ...",
+                )
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "controller_tool_call",
+                    "phase": "routed_optional_evidence",
+                    "required_phase": False,
+                    "tool": tool_name,
+                    "arguments": {},
+                    "router": router_result,
+                },
+            )
+            observation = tool(job, result, point, {})
+            executed_tools.add(tool_name)
+            satisfied_tools.update(_class_analysis_qwen_review_satisfied_tool_keys(tool_name, {}))
+            for evidence in observation.get("evidence") or []:
+                if isinstance(evidence, dict) and str(evidence.get("evidence_id") or "").strip():
+                    evidence_ids.add(str(evidence.get("evidence_id")).strip())
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "tool_result",
+                    "phase": "routed_optional_evidence",
+                    "tool": tool_name,
+                    "arguments": {},
+                    "summary": observation.get("summary"),
+                    "evidence_ids": sorted(evidence_ids),
+                },
+            )
+            messages.append(_class_analysis_qwen_review_observation_message(tool_name, observation))
+
+        evidence_ledger = _class_analysis_qwen_review_evidence_ledger(job)
+        dual_bbox_conflict = _class_analysis_qwen_review_dual_bbox_conflict(point, evidence_ledger)
+        if dual_bbox_conflict:
+            evidence_ledger["dual_bbox_conflict"] = copy.deepcopy(dual_bbox_conflict)
+        deterministic_context = _class_analysis_qwen_review_deterministic_context(job)
+        _class_analysis_qwen_review_write_json(job, "evidence_ledger.json", evidence_ledger)
+        _class_analysis_qwen_review_append_event(
+            job,
+            {
+                "type": "evidence_ledger",
+                "clean_visual_evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+                "clean_target_source_evidence_ids": list(evidence_ledger.get("clean_target_source_evidence_ids") or []),
+                "geometry_overlay_evidence_ids": list(evidence_ledger.get("geometry_overlay_evidence_ids") or []),
+                "local_consensus_evidence_ids": list(evidence_ledger.get("local_consensus_evidence_ids") or []),
+                "clean_visual_reference_evidence_ids": list(evidence_ledger.get("clean_visual_reference_evidence_ids") or []),
+                "deterministic_context_evidence_ids": list(evidence_ledger.get("deterministic_context_evidence_ids") or []),
+                "dual_bbox_conflict": copy.deepcopy(dual_bbox_conflict) if dual_bbox_conflict else None,
+            },
+        )
+        messages.append(
+            _class_analysis_qwen_review_evidence_ledger_message(
+                evidence_ledger,
+                visual_quality=visual_quality,
+            )
+        )
+
+        final_tool_spec = _class_analysis_qwen_review_final_tool_spec(labelmap)
+        final_result = None
+        if backend_quality_tier != "clear" and not non_clear_final_review_allowed:
+            reason = f"Controller skipped Qwen final decision because backend visual-quality tier is {backend_quality_tier or 'unknown'}."
+            final_result = _class_analysis_qwen_review_skip_result(point, reason)
+            final_result["backend_visual_quality"] = visual_quality
+            final_result["visual_quality"] = backend_quality_tier if backend_quality_tier == "limited" else "poor"
+            final_result["object_visibility"] = "partial" if backend_quality_tier == "limited" else "not_visible"
+            final_result["guardrail_reasons"] = [reason]
+            final_result["rationale_short"] = reason
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "controller_final_skip",
+                    "reason": "target_quality_not_clear",
+                    "backend_tier": backend_quality_tier,
+                    "allow_limited_final_review": limited_final_review_enabled,
+                    "allow_poor_final_review": poor_final_review_enabled,
+                    "visual_quality": copy.deepcopy(visual_quality),
+                },
+            )
+        controller_only_mlx_fallback = (
+            final_result is None
+            and not CLASS_ANALYSIS_QWEN_REVIEW_ENABLE_MLX_FINAL
+            and _class_analysis_qwen_review_final_would_use_mlx(model_id)
+        )
+        if controller_only_mlx_fallback:
+            preflight_result = _class_analysis_qwen_review_current_overlap_false_alarm_result(
+                point,
+                visual_quality,
+                evidence_ledger,
+            )
+            if preflight_result is not None:
+                final_result = preflight_result
+                _class_analysis_qwen_review_append_event(
+                    job,
+                    {
+                        "type": "controller_final_preflight",
+                        "preflight": copy.deepcopy(preflight_result.get("controller_preflight") or {}),
+                        "fallback_reason": "mlx_final_disabled",
+                    },
+                )
+        if controller_only_mlx_fallback and final_result is None:
+            triage_result = _class_analysis_qwen_review_deterministic_triage_result(
+                job,
+                point,
+                visual_quality,
+                evidence_ledger,
+                deterministic_context,
+            )
+            if triage_result is not None:
+                final_result = triage_result
+                _class_analysis_qwen_review_append_event(
+                    job,
+                    {
+                        "type": "controller_final_preflight",
+                        "preflight": copy.deepcopy(triage_result.get("controller_preflight") or {}),
+                        "fallback_reason": "mlx_final_disabled",
+                    },
+                )
+        if controller_only_mlx_fallback and final_result is None:
+            final_result = _class_analysis_qwen_review_mlx_final_disabled_result(
+                point,
+                visual_quality,
+                evidence_ledger,
+            )
+            _class_analysis_qwen_review_append_event(
+                job,
+                {
+                    "type": "controller_final_skip",
+                    "reason": "mlx_final_disabled",
+                    "preflight": copy.deepcopy(final_result.get("controller_preflight") or {}),
+                },
+            )
+        final_attempts = max(1, min(3, max_turns))
+        # Do not prefill the outer tool envelope for the final state. With MLX
+        # Qwen3.6, prefixing right before the arguments object frequently makes
+        # the model emit only the hidden wrapper close (`{}}`). The controller
+        # still validates the output as finalize_review arguments below.
+        final_assistant_prefix = None
+        final_base_messages, final_context_policy = _class_analysis_qwen_review_final_context_messages(messages)
+        _class_analysis_qwen_review_append_event(
+            job,
+            {
+                "type": "final_context_compacted",
+                **copy.deepcopy(final_context_policy),
+            },
+        )
+        thinking_scratchpad: Dict[str, Any] = {
+            "enabled": bool(thinking_scratchpad_enabled),
+            "status": "not_run",
+            "version": "two_phase_thinking_scratchpad_v1",
+            "reason": "disabled" if not thinking_scratchpad_enabled else "final_review_not_available",
+        }
+        if final_result is None and thinking_scratchpad_enabled:
+            thinking_scratchpad = _class_analysis_qwen_review_run_thinking_scratchpad(
+                job,
+                final_base_messages=final_base_messages,
+                point=point,
+                visual_quality=visual_quality,
+                evidence_ledger=evidence_ledger,
+                model_id=model_id,
+            )
+            evidence_ledger["thinking_scratchpad"] = copy.deepcopy(thinking_scratchpad)
+            _class_analysis_qwen_review_write_json(job, "evidence_ledger.json", evidence_ledger)
+            final_base_messages.append(_class_analysis_qwen_review_thinking_scratchpad_message(thinking_scratchpad))
+        elif thinking_scratchpad_enabled:
+            _class_analysis_qwen_review_write_json(job, "thinking_scratchpad.json", thinking_scratchpad)
+        specificity_probe: Dict[str, Any] = {
+            "enabled": bool(specificity_probe_enabled),
+            "status": "not_run",
+            "version": CLASS_ANALYSIS_QWEN_REVIEW_SPECIFICITY_PROBE_VERSION,
+            "reason": "disabled" if not specificity_probe_enabled else "final_review_not_available",
+        }
+        if final_result is None and specificity_probe_enabled:
+            specificity_probe = _class_analysis_qwen_review_run_specificity_probe(
+                job,
+                final_base_messages=final_base_messages,
+                point=point,
+                visual_quality=visual_quality,
+                evidence_ledger=evidence_ledger,
+                evidence_ids=evidence_ids,
+                labelmap=labelmap,
+                labelmap_glossary=labelmap_glossary,
+                review_guidance=review_guidance,
+                class_concept_brief_text=str(concept_briefs_packet.get("prompt_text") or ""),
+                model_id=model_id,
+            )
+            evidence_ledger["specificity_probe"] = copy.deepcopy(specificity_probe)
+            _class_analysis_qwen_review_write_json(job, "specificity_probe.json", specificity_probe)
+            _class_analysis_qwen_review_write_json(job, "evidence_ledger.json", evidence_ledger)
+            final_base_messages.append(_class_analysis_qwen_review_specificity_probe_message(specificity_probe))
+        elif specificity_probe_enabled:
+            _class_analysis_qwen_review_write_json(job, "specificity_probe.json", specificity_probe)
+        previous_final_error = ""
+        for attempt_idx in range(final_attempts) if final_result is None else range(0):
+            if job.cancel_event.is_set():
+                raise RuntimeError("cancelled")
+            final_messages = copy.deepcopy(final_base_messages)
+            final_messages.append(
+                    _class_analysis_qwen_review_final_instruction(
+                        required_tools=required_tools,
+                        evidence_ids=evidence_ids,
+                        point=point,
+                        visual_quality=visual_quality,
+                        local_consensus_inspected="inspect_local_consensus_context" in executed_tools,
+                        class_concept_brief_text=str(concept_briefs_packet.get("prompt_text") or ""),
+                        dual_bbox_conflict=dual_bbox_conflict,
+                        allow_poor_advisory=poor_final_review_enabled,
+                        specificity_probe=specificity_probe,
+                    )
+                )
+            if attempt_idx > 0:
+                repair_reason = previous_final_error or "final_validation_error"
+                final_messages.append(
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "text",
+                                "text": (
+                                    "Your previous final response failed validation in controller checks: "
+                                    f"{repair_reason[:320]}. Return only one complete compact arguments "
+                                    "object encoded as JSON. Start with `{`; no analysis, no markdown, no prose."
+                                ),
+                            }
+                        ],
+                    }
+                )
+            raw_final = _class_analysis_qwen_review_model_call(
+                job,
+                final_messages,
+                phase=f"final_attempt_{attempt_idx + 1}",
+                model_id=model_id,
+                tool_specs=_class_analysis_qwen_review_tool_specs_for_template(final_tool_spec),
+                max_new_tokens=1000,
+                progress=0.32 + (0.34 * (attempt_idx / max(1, final_attempts))),
+                event_extra={
+                    "router": router_result,
+                    "satisfied_requirements": sorted(
+                        _class_analysis_qwen_review_required_tool_label(tool_key) for tool_key in satisfied_tools
+                    ),
+                    "executed_tools": sorted(executed_tools),
+                    "assistant_prefix_strategy": "plain_json_arguments",
+                    "reasoning_visual_policy": "compact_final_core",
+                },
+                assistant_prefix=final_assistant_prefix,
+                image_max_side=CLASS_ANALYSIS_QWEN_REVIEW_REASONING_IMAGE_MAX_SIDE,
+                image_limit=CLASS_ANALYSIS_QWEN_REVIEW_FINAL_MAX_IMAGES,
+            )
+            if _class_analysis_qwen_review_text_is_degenerate(raw_final):
+                reason = "Qwen final decision produced degenerate repeated text."
+                invalid_outputs += 1
+                previous_final_error = reason
+                _class_analysis_qwen_review_append_event(
+                    job,
+                    {
+                        "type": "final_degenerate_output",
+                        "phase": f"final_attempt_{attempt_idx + 1}",
+                        "reason": reason,
+                        "output_preview": str(raw_final or "")[:240],
+                    },
+                )
+                if attempt_idx + 1 >= final_attempts:
+                    final_result = _class_analysis_qwen_review_skip_result(
+                        point,
+                        "Qwen final decision produced degenerate repeated text after all final retries.",
+                    )
+                    final_result["backend_visual_quality"] = visual_quality
+                continue
+            payload, parse_error = _class_analysis_qwen_review_parse_payload(raw_final)
+            try:
+                if not isinstance(payload, dict):
+                    raise ValueError(parse_error or "final_parse_error")
+                args = _class_analysis_qwen_review_tool_arguments(
+                    payload,
+                    expected_name="finalize_review",
+                    aliases={"final_review", "final", "review_final", "finalize"},
+                )
+                if not str(args.get("decision") or "").strip():
+                    raise ValueError("final_missing_decision")
+                expanded_args = _class_analysis_qwen_review_expand_compact_final(
+                    args,
+                    point=point,
+                    evidence_ids=evidence_ids,
+                    visual_quality=visual_quality,
+                    executed_tools=executed_tools,
+                    labelmap_glossary=labelmap_glossary,
+                    review_guidance=review_guidance,
+                    deterministic_context=deterministic_context,
+                    evidence_ledger=evidence_ledger,
+                )
+                _class_analysis_qwen_review_append_event(
+                    job,
+                    {
+                        "type": "compact_final_expanded",
+                        "phase": f"final_attempt_{attempt_idx + 1}",
+                        "compact_arguments": copy.deepcopy(args),
+                        "expanded_arguments": copy.deepcopy(expanded_args),
+                    },
+                )
+                final_result = _class_analysis_qwen_review_validate_final(
+                    expanded_args,
+                    result,
+                    point,
+                    evidence_ids,
+                    visual_quality,
+                    evidence_ledger,
+                    labelmap_glossary,
+                )
+                final_result["model_compact_arguments"] = copy.deepcopy(args)
+                final_result["expanded_by_controller"] = True
+                final_result["controller_reconciliation"] = copy.deepcopy(
+                    expanded_args.get("_controller_reconciliation") or {"applied": False}
+                )
+                break
+            except Exception as exc:
+                invalid_outputs += 1
+                previous_final_error = str(exc)
+                _class_analysis_qwen_review_append_event(
+                    job,
+                    {
+                        "type": "final_validation_error",
+                        "phase": f"final_attempt_{attempt_idx + 1}",
+                        "error": str(exc),
+                    },
+                )
+                if attempt_idx + 1 >= final_attempts:
+                    final_result = _class_analysis_qwen_review_skip_result(
+                        point,
+                        f"Qwen final decision failed validation: {exc}",
+                    )
+        if final_result is None:
+            final_result = _class_analysis_qwen_review_skip_result(point, "Qwen review reached the turn limit without a validated final decision.")
+        if cue_verifier_enabled and final_result is not None and not job.cancel_event.is_set():
+            final_result = _class_analysis_qwen_review_try_cue_verifier(
+                job,
+                final_result=final_result,
+                final_base_messages=final_base_messages,
+                point=point,
+                result=result,
+                evidence_ids=evidence_ids,
+                visual_quality=visual_quality,
+                evidence_ledger=evidence_ledger,
+                labelmap_glossary=labelmap_glossary,
+                review_guidance=review_guidance,
+                deterministic_context=deterministic_context,
+                model_id=model_id,
+                executed_tools=executed_tools,
+                labelmap=labelmap,
+            )
+        scale_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "scale")
+        embedding_signal = _class_analysis_qwen_review_deterministic_signal(deterministic_context, "embedding")
+        if str(final_result.get("same_image_scale_evidence") or "").strip().lower() in {"", "not_applicable"}:
+            final_result["same_image_scale_evidence"] = scale_signal
+        if str(final_result.get("same_image_embedding_evidence") or "").strip().lower() in {"", "not_applicable"}:
+            final_result["same_image_embedding_evidence"] = embedding_signal
+        final_result = {
+            **final_result,
+            "point_id": point.get("point_id"),
+            "current_class": point.get("class_name"),
+            "suggested_neighbor_class": point.get("suggested_neighbor_class") or "",
+            "backend_visual_quality": final_result.get("backend_visual_quality") or visual_quality,
+            "reviewed_by_model": model_id or (active_qwen_metadata or {}).get("model_id") or active_qwen_model_id or "default",
+            "review_agent_controller": "state_machine_v2",
+            "router": router_result,
+            "dual_bbox_conflict": copy.deepcopy(final_result.get("dual_bbox_conflict") or dual_bbox_conflict)
+            if (final_result.get("dual_bbox_conflict") or dual_bbox_conflict)
+            else None,
+            "dual_bbox_resolution": str(final_result.get("dual_bbox_resolution") or "not_applicable"),
+            "deterministic_context": deterministic_context,
+            "thinking_scratchpad": {
+                "enabled": bool(thinking_scratchpad.get("enabled")),
+                "status": str(thinking_scratchpad.get("status") or "not_run"),
+                "version": str(thinking_scratchpad.get("version") or "two_phase_thinking_scratchpad_v1"),
+                "text_preview": str(thinking_scratchpad.get("text") or "")[:800],
+                "error": thinking_scratchpad.get("error"),
+            },
+            "specificity_probe": copy.deepcopy(specificity_probe),
+            "class_concept_briefs": {
+                "enabled": bool(concept_briefs_packet.get("enabled")),
+                "version": concept_briefs_packet.get("version") or CLASS_ANALYSIS_QWEN_REVIEW_CONCEPT_BRIEF_VERSION,
+                "pair_contrast_version": concept_briefs_packet.get("pair_contrast_version") or CLASS_ANALYSIS_QWEN_REVIEW_PAIR_CONTRAST_VERSION,
+                "classes": list(concept_briefs_packet.get("classes") or []),
+                "cache_keys": [
+                    str(item.get("cache_key") or "")
+                    for item in (concept_briefs_packet.get("artifacts") or [])
+                    if isinstance(item, dict)
+                ],
+                "cache_hits": [
+                    bool(item.get("cache_hit"))
+                    for item in (concept_briefs_packet.get("artifacts") or [])
+                    if isinstance(item, dict)
+                ],
+                "pair_cache_keys": [
+                    str(item.get("cache_key") or "")
+                    for item in (concept_briefs_packet.get("pair_contrasts") or [])
+                    if isinstance(item, dict)
+                ],
+                "pair_cache_hits": [
+                    bool(item.get("cache_hit"))
+                    for item in (concept_briefs_packet.get("pair_contrasts") or [])
+                    if isinstance(item, dict)
+                ],
+            },
+            "evidence_ledger": {
+                "rows": [
+                    {
+                        "evidence_id": str(row.get("evidence_id") or ""),
+                        "kind": str(row.get("kind") or ""),
+                        "use": str(row.get("use") or ""),
+                        "title": str(row.get("title") or ""),
+                    }
+                    for row in (evidence_ledger.get("rows") or [])
+                    if isinstance(row, dict)
+                ],
+                "clean_visual_evidence_ids": list(evidence_ledger.get("clean_visual_evidence_ids") or []),
+                "clean_target_source_evidence_ids": list(evidence_ledger.get("clean_target_source_evidence_ids") or []),
+                "geometry_overlay_evidence_ids": list(evidence_ledger.get("geometry_overlay_evidence_ids") or []),
+                "local_consensus_evidence_ids": list(evidence_ledger.get("local_consensus_evidence_ids") or []),
+                "clean_visual_reference_evidence_ids": list(evidence_ledger.get("clean_visual_reference_evidence_ids") or []),
+                "deterministic_context_evidence_ids": list(evidence_ledger.get("deterministic_context_evidence_ids") or []),
+                "thinking_scratchpad": copy.deepcopy(evidence_ledger.get("thinking_scratchpad"))
+                if isinstance(evidence_ledger.get("thinking_scratchpad"), dict)
+                else None,
+                "specificity_probe": copy.deepcopy(evidence_ledger.get("specificity_probe"))
+                if isinstance(evidence_ledger.get("specificity_probe"), dict)
+                else None,
+                "policy": str(evidence_ledger.get("policy") or ""),
+            },
+            "required_tools": sorted(_class_analysis_qwen_review_required_tool_label(tool_key) for tool_key in required_tools),
+            "executed_tools": sorted(executed_tools),
+            "satisfied_requirements": sorted(
+                _class_analysis_qwen_review_required_tool_label(tool_key) for tool_key in satisfied_tools
+            ),
+        }
+        final_result["review_disposition"] = _class_analysis_qwen_review_disposition(final_result)
+        _class_analysis_qwen_review_write_json(job, "final.json", final_result)
+        with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+            _class_analysis_qwen_review_update(
+                job,
+                status="completed",
+                progress=1.0,
+                message=f"Qwen review completed: {final_result.get('decision')}",
+                result=final_result,
+            )
+        if reset_after_review and _class_analysis_qwen_review_mlx_runtime_active():
+            _class_analysis_qwen_review_reset_qwen_runtime(
+                job,
+                reason="request_after_review",
+                phase="job_completed",
+            )
+    except RuntimeError as exc:
+        if str(exc) == "cancelled":
+            with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+                _class_analysis_qwen_review_update(job, status="cancelled", progress=1.0, message="Qwen review cancelled.")
+            return
+        with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+            _class_analysis_qwen_review_update(job, status="failed", progress=1.0, message=f"Qwen review failed: {exc}", error=str(exc))
+    except Exception as exc:
+        logger.exception("Class analysis Qwen review failed")
+        with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+            _class_analysis_qwen_review_update(job, status="failed", progress=1.0, message=f"Qwen review failed: {exc}", error=str(exc))
+
+
+def create_class_analysis_qwen_review(job_id: str, point_id: str, payload: Dict[str, Any]) -> Dict[str, Any]:
+    _prune_class_analysis_qwen_review_jobs()
+    result = get_class_analysis_result(job_id)
+    points_by_id = _class_analysis_qwen_points_by_id(result)
+    safe_point_id = str(point_id or "").strip()
+    if safe_point_id not in points_by_id:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="point_not_found")
+    parent_job = _get_class_analysis_job(job_id)
+    review_id = f"cqr_{uuid.uuid4().hex[:12]}"
+    request_payload = dict(payload or {})
+    request_payload.setdefault("enable_local_consensus_context", True)
+    request_payload.setdefault("allow_limited_final_review", True)
+    request_payload.setdefault("allow_poor_final_review", False)
+    request_payload.setdefault("enable_cue_verifier", True)
+    request_payload.setdefault("enable_specificity_probe", True)
+    request_payload["parent_job_id"] = parent_job.job_id
+    request_payload["point_id"] = safe_point_id
+    job = ClassAnalysisQwenReviewJob(
+        review_id=review_id,
+        parent_job_id=parent_job.job_id,
+        point_id=safe_point_id,
+        request=request_payload,
+    )
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        _class_analysis_log(job, "Qwen review queued.")
+    _register_job_and_start_thread(
+        job=job,
+        registry=CLASS_ANALYSIS_QWEN_REVIEW_JOBS,
+        lock=CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK,
+        target=_run_class_analysis_qwen_review_job,
+        args=(job,),
+        name=f"class-analysis-qwen-review-{review_id[:8]}",
+    )
+    return _serialize_class_analysis_qwen_review_job(job)
+
+
+def get_class_analysis_qwen_review(review_id: str) -> Dict[str, Any]:
+    job = _get_class_analysis_qwen_review_job(review_id)
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        job.updated_at = time.time()
+    return _serialize_class_analysis_qwen_review_job(job)
+
+
+def cancel_class_analysis_qwen_review(review_id: str) -> Dict[str, Any]:
+    job = _get_class_analysis_qwen_review_job(review_id)
+    with CLASS_ANALYSIS_QWEN_REVIEW_JOBS_LOCK:
+        if job.status in {"completed", "failed", "cancelled"}:
+            return _serialize_class_analysis_qwen_review_job(job)
+        job.cancel_event.set()
+        _class_analysis_qwen_review_update(job, status="cancelling", message="Qwen review cancellation requested ...")
+    return _serialize_class_analysis_qwen_review_job(job)
+
+
+def get_class_analysis_qwen_review_evidence(review_id: str, evidence_id: str):
+    job = _get_class_analysis_qwen_review_job(review_id)
+    safe_evidence_id = _class_analysis_safe_slug(str(evidence_id or ""), "")
+    if not safe_evidence_id:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="qwen_review_evidence_not_found")
+    review_dir = _class_analysis_qwen_review_dir(job, create=False)
+    evidence_dir = review_dir / "evidence"
+    candidate = _safe_existing_regular_file_within_root_impl(
+        evidence_dir / f"{safe_evidence_id}.jpg",
+        review_dir,
+    )
+    if candidate is None:
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="qwen_review_evidence_not_found")
+    return FileResponse(str(candidate), media_type="image/jpeg")
+
+
 def cancel_class_analysis_job(job_id: str) -> Dict[str, Any]:
     job = _get_class_analysis_job(job_id)
     with CLASS_ANALYSIS_JOBS_LOCK:
@@ -22792,6 +35337,34 @@ def _data_ingestion_validate_zip_infos(
         total_uncompressed += max(0, int(info.file_size or 0))
         if total_uncompressed > max_uncompressed_bytes:
             raise HTTPException(status_code=HTTP_413_CONTENT_TOO_LARGE, detail=f"{detail_prefix}_uncompressed_too_large")
+
+
+def _validate_created_zip(
+    zip_path: Path,
+    *,
+    required_names: Set[str],
+    detail_prefix: str,
+) -> None:
+    try:
+        with zipfile.ZipFile(zip_path, "r") as zf:
+            bad_member = zf.testzip()
+            if bad_member is not None:
+                raise HTTPException(
+                    status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                    detail=f"{detail_prefix}_zip_corrupt:{bad_member}",
+                )
+            names = set(zf.namelist())
+    except zipfile.BadZipFile as exc:
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{detail_prefix}_zip_invalid",
+        ) from exc
+    missing = sorted(required_names - names)
+    if missing:
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{detail_prefix}_zip_missing:{missing[0]}",
+        )
 
 
 def _data_ingestion_reference_fingerprint(
@@ -24080,6 +36653,11 @@ def _data_ingestion_encode_prepared_images(
         model_obj, processor_obj, resolved_model, device_name = _data_ingestion_get_dinov3(model_name)
         if encoder_norm == "local_salad":
             salad_head, salad_meta = _load_local_salad_head(salad_head_id, device_name=_dinov3_aux_torch_device(device_name))
+    if encoder_norm == "local_salad" and salad_head is None:
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail="local_salad_head_missing",
+        )
     resolved_batch = max(1, min(int(batch_size or 16), len(prepared)))
     features: List[np.ndarray] = []
     local_vendi_metrics: List[Dict[str, float]] = []
@@ -24106,7 +36684,6 @@ def _data_ingestion_encode_prepared_images(
                         raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail="dinov3_global_token_missing")
                     if return_local_vendi:
                         local_vendi_metrics.extend(_data_ingestion_patch_token_local_vendi_metrics(patch_np))
-                    assert salad_head is not None
                     if is_mlx_local_salad_head(salad_head):
                         features.append(_encode_local_salad_head_np(salad_head, patch_np, cls_np))
                     else:
@@ -24142,7 +36719,6 @@ def _data_ingestion_encode_prepared_images(
                             raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail="cradio_spatial_tokens_missing")
                         if return_local_vendi:
                             local_vendi_metrics.extend(_data_ingestion_patch_token_local_vendi_metrics(spatial_tokens))
-                        assert salad_head is not None
                         if is_mlx_local_salad_head(salad_head):
                             features.append(_encode_local_salad_head_np(salad_head, spatial_tokens, summary_tokens))
                         else:
@@ -24180,7 +36756,6 @@ def _data_ingestion_encode_prepared_images(
                                 global_token = last_hidden[:, 0, :]
                             if return_local_vendi:
                                 local_vendi_metrics.extend(_data_ingestion_patch_token_local_vendi_metrics(last_hidden[:, 1:, :]))
-                            assert salad_head is not None
                             features.append(_encode_local_salad_head_np(salad_head, last_hidden[:, 1:, :], global_token))
                         else:
                             feats = getattr(outputs, "pooler_output", None)
@@ -25860,40 +38435,53 @@ def preview_data_ingestion_accepted_export(job_id: str, payload: Dict[str, Any])
     preview_id = f"preview_{uuid.uuid4().hex[:12]}"
     preview_dir = job_dir / "accepted_exports" / preview_id
     thumb_dir = preview_dir / "thumbnails"
-    prepared_thumb_dir = _class_analysis_prepare_dir(thumb_dir, job_dir)
-    if prepared_thumb_dir is None:
-        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="accepted_export_preview_path_invalid")
-    preview_payload = {
-        "preview_id": preview_id,
-        "job_id": job_id,
-        "created_at": time.time(),
-        "config": config,
-        "offset": offset,
-        "limit": limit,
-        "total_outputs": len(outputs),
-    }
-    _class_analysis_write_json(preview_dir / "preview.json", job_dir, preview_payload)
-    returned: List[Dict[str, Any]] = []
-    for output in page_outputs:
-        thumb_path = prepared_thumb_dir / f"{output['output_id']}.jpg"
-        image = _data_ingestion_render_output_image(output, config)
+    try:
+        prepared_thumb_dir = _class_analysis_prepare_dir(thumb_dir, job_dir)
+        if prepared_thumb_dir is None:
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="accepted_export_preview_path_invalid")
+        preview_payload = {
+            "preview_id": preview_id,
+            "job_id": job_id,
+            "created_at": time.time(),
+            "config": config,
+            "offset": offset,
+            "limit": limit,
+            "total_outputs": len(outputs),
+        }
+        _class_analysis_write_json(preview_dir / "preview.json", job_dir, preview_payload)
+        returned: List[Dict[str, Any]] = []
+        for output in page_outputs:
+            thumb_path = prepared_thumb_dir / f"{output['output_id']}.jpg"
+            image = _data_ingestion_render_output_image(output, config)
+            try:
+                image.thumbnail((ACCEPTED_EXPORT_THUMB_SIZE, ACCEPTED_EXPORT_THUMB_SIZE))
+                _class_analysis_write_jpeg(thumb_path, job_dir, image, quality=82)
+            finally:
+                image.close()
+            public = _data_ingestion_public_output(output)
+            public["thumbnail_url"] = f"/data_ingestion/jobs/{job_id}/accepted_export/{preview_id}/thumbnail/{output['output_id']}"
+            returned.append(public)
+        return {
+            "preview_id": preview_id,
+            "total_outputs": len(outputs),
+            "offset": offset,
+            "limit": limit,
+            "outputs": returned,
+            "config": json_sanitize(config),
+            "warnings": _data_ingestion_accepted_export_warnings(config),
+        }
+    except Exception:
         try:
-            image.thumbnail((ACCEPTED_EXPORT_THUMB_SIZE, ACCEPTED_EXPORT_THUMB_SIZE))
-            _class_analysis_write_jpeg(thumb_path, job_dir, image, quality=82)
-        finally:
-            image.close()
-        public = _data_ingestion_public_output(output)
-        public["thumbnail_url"] = f"/data_ingestion/jobs/{job_id}/accepted_export/{preview_id}/thumbnail/{output['output_id']}"
-        returned.append(public)
-    return {
-        "preview_id": preview_id,
-        "total_outputs": len(outputs),
-        "offset": offset,
-        "limit": limit,
-        "outputs": returned,
-        "config": json_sanitize(config),
-        "warnings": _data_ingestion_accepted_export_warnings(config),
-    }
+            preview_resolved = preview_dir.resolve(strict=False)
+            if (
+                _path_is_within_root_impl(preview_resolved, job_dir)
+                and preview_dir.exists()
+                and not preview_dir.is_symlink()
+            ):
+                shutil.rmtree(preview_dir, ignore_errors=True)
+        except Exception:
+            pass
+        raise
 
 
 def get_data_ingestion_accepted_export_thumbnail(job_id: str, preview_id: str, output_id: str):
@@ -25969,6 +38557,11 @@ def download_data_ingestion_accepted_export(job_id: str, payload: Dict[str, Any]
                         image.close()
             zf.writestr("manifest.json", json.dumps(manifest, ensure_ascii=False, indent=2))
             zf.writestr("summary.json", json.dumps(summary, ensure_ascii=False, indent=2))
+        _validate_created_zip(
+            zip_path,
+            required_names=written_arcnames | {"manifest.json", "summary.json"},
+            detail_prefix="accepted_export",
+        )
         return FileResponse(
             path=str(zip_path),
             media_type="application/zip",
@@ -26467,40 +39060,69 @@ def finalize_qwen_dataset_upload(job_id: str, metadata: Dict[str, Any], run_name
         return meta
 
 
-def _cleanup_qwen_dataset_upload_root(root_dir: Path) -> None:
+def _remove_qwen_dataset_upload_root(
+    root_dir: Path,
+    *,
+    path_detail: str = "qwen_dataset_cancel_path_invalid",
+    cleanup_detail: str = "qwen_dataset_cancel_failed",
+) -> None:
     try:
         raw_root = Path(root_dir)
-        if raw_root.is_symlink():
-            raw_root.unlink(missing_ok=True)
-            return
-        if _storage_path_has_symlink_component(raw_root.parent):
-            return
         upload_root = _qwen_dataset_upload_storage_root(
-            create=False, detail="qwen_dataset_upload_path_invalid"
+            create=False, detail=path_detail
         )
-        resolved = raw_root.resolve(strict=True)
-    except Exception:
-        return
-    if (
-        not resolved.is_dir()
-        or not _path_is_within_root_impl(resolved, upload_root)
-        or resolved.parent != upload_root
-    ):
-        return
-    shutil.rmtree(resolved, ignore_errors=True)
+        if _storage_path_has_symlink_component(raw_root.parent):
+            raise ValueError("qwen dataset upload parent has a symlink component")
+        parent = raw_root.parent.resolve(strict=False)
+        if parent != upload_root or not _path_is_within_root_impl(parent, upload_root):
+            raise ValueError("qwen dataset upload root escapes staging root")
+        if raw_root.is_symlink():
+            raw_root.unlink()
+        else:
+            resolved = raw_root.resolve(strict=False)
+            if not _path_is_within_root_impl(resolved, upload_root) or resolved.parent != upload_root:
+                raise ValueError("qwen dataset upload root escapes staging root")
+            if not resolved.exists():
+                return
+            if not resolved.is_dir():
+                raise ValueError("qwen dataset upload root is not a directory")
+            shutil.rmtree(resolved)
+        if raw_root.exists() or raw_root.is_symlink():
+            raise OSError("qwen dataset upload root still exists after cleanup")
+    except HTTPException:
+        raise
+    except ValueError as exc:
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=path_detail) from exc
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"{cleanup_detail}:{exc}",
+        ) from exc
 
 
 def cancel_qwen_dataset_upload(job_id: str):
     with QWEN_DATASET_UPLOADS_LOCK:
         job = QWEN_DATASET_UPLOADS.get(job_id)
     if not job:
+        safe_job_id = _sanitize_yolo_run_id_impl(str(job_id or ""))
+        if safe_job_id:
+            root_dir = _qwen_dataset_upload_job_dir(
+                safe_job_id,
+                create=False,
+                detail="qwen_dataset_cancel_path_invalid",
+            )
+            if root_dir.exists() or root_dir.is_symlink():
+                _remove_qwen_dataset_upload_root(root_dir)
+                return {"status": "cancelled", "job_id": safe_job_id, "orphan": True}
         return {"status": "missing", "job_id": job_id}
     with job.lock:
         with QWEN_DATASET_UPLOADS_LOCK:
             if QWEN_DATASET_UPLOADS.get(job_id) is not job:
                 return {"status": "missing", "job_id": job_id}
-            QWEN_DATASET_UPLOADS.pop(job_id, None)
-        _cleanup_qwen_dataset_upload_root(job.root_dir)
+        _remove_qwen_dataset_upload_root(job.root_dir)
+        with QWEN_DATASET_UPLOADS_LOCK:
+            if QWEN_DATASET_UPLOADS.get(job_id) is job:
+                QWEN_DATASET_UPLOADS.pop(job_id, None)
         return {"status": "cancelled", "job_id": job_id}
 
 
@@ -27406,7 +40028,7 @@ def _ensure_yolo_inference_runtime_for_detector(
         sanitize_fn=_sanitize_yolo_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="yolo_run_not_found")
     best_path = run_dir / "best.pt"
     try:
@@ -27449,7 +40071,7 @@ def _ensure_rfdetr_inference_runtime_for_detector(
         sanitize_fn=_sanitize_rfdetr_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="rfdetr_run_not_found")
     best_path = _rfdetr_best_checkpoint_impl(run_dir)
     if not best_path:
@@ -27925,35 +40547,19 @@ def _auto_label_dedupe_candidates(
 def _auto_label_candidate_rank_key(item: Dict[str, Any]) -> Tuple[int, float, int, float, int, int]:
     source = str(item.get("source") or "")
     source_rank = 2 if source == "baseline" else 1
-    class_key = _normalize_class_name_for_match(item.get("class_name"))
     component_area_px = int(item.get("component_area_px") or item.get("area_px") or 0)
     area_fraction = float(
         item.get("bbox_area_fraction_crop")
         if item.get("bbox_area_fraction_crop") is not None
         else item.get("bbox_area_fraction") or 1.0
     )
-    ideal_area_fraction = {
-        _normalize_class_name_for_match("utility_pole"): 0.003,
-        _normalize_class_name_for_match("light_vehicle"): 0.025,
-        _normalize_class_name_for_match("person"): 0.01,
-        _normalize_class_name_for_match("building"): 0.12,
-    }.get(class_key)
-    if ideal_area_fraction and area_fraction > 0.0:
-        area_distance = -abs(math.log(max(area_fraction, 1e-6) / ideal_area_fraction))
-    else:
-        area_distance = 0.0
-    if class_key == _normalize_class_name_for_match("utility_pole"):
-        area_rank = -component_area_px
-    else:
-        area_rank = component_area_px
     border_touch = int(item.get("border_touch_count") or 0)
     component_count = int(item.get("component_count") or 1)
     return (
         source_rank,
         float(item.get("score") or 0.0),
-        area_distance,
-        area_rank,
-        area_fraction,
+        component_area_px,
+        -area_fraction,
         -border_touch,
         -component_count,
     )
@@ -28246,20 +40852,12 @@ def _auto_label_falcon_candidates_for_window(
     detection_strategy = str(payload.falcon_detection_strategy or "native_detection").strip().lower()
     component_mode = str(payload.falcon_component_mode or "component_split").strip().lower()
     tier_accept_score = 0.86
-    force_fallback_class_keys = {
-        _normalize_class_name_for_match("digger"),
-        _normalize_class_name_for_match("light_vehicle"),
-        _normalize_class_name_for_match("gastank"),
-        _normalize_class_name_for_match("truck"),
-        _normalize_class_name_for_match("utility_pole"),
-    }
     falcon_task = (
         "segmentation"
         if target_mode == AUTO_LABEL_TARGET_MODE_SEGMENTATION or detection_strategy == "segmentation_boxes"
         else "detection"
     )
     for class_name in class_names:
-        class_key = _normalize_class_name_for_match(class_name)
         tier_rows = query_tiers.get(str(class_name or "").strip()) or []
         if not tier_rows:
             continue
@@ -28455,10 +41053,7 @@ def _auto_label_falcon_candidates_for_window(
                 )[:64]
                 class_candidates.extend(tier_candidates)
                 class_kept = True
-                if (
-                    class_key not in force_fallback_class_keys
-                    and max(float(item.get("score") or 0.0) for item in tier_candidates) >= tier_accept_score
-                ):
+                if max(float(item.get("score") or 0.0) for item in tier_candidates) >= tier_accept_score:
                     break
         if class_candidates:
             class_candidates = _auto_label_collapse_query_candidates(
@@ -28855,14 +41450,7 @@ def _sample_negative_images(
     return _stable_sample_ids(candidates, cap=sample_size, seed=seed, salt=f"neg:{class_id}")
 
 
-_PROMPT_VARIANT_FALLBACKS: Dict[str, List[str]] = {
-    "car": ["vehicle", "automobile", "sedan"],
-    "person": ["human", "pedestrian", "individual"],
-    "truck": ["lorry", "cargo truck", "pickup truck"],
-    "bus": ["coach", "city bus", "transit bus"],
-    "motorcycle": ["motorbike", "bike rider", "two wheeler"],
-    "bicycle": ["bike", "cyclist", "two wheeler"],
-}
+_PROMPT_VARIANT_FALLBACKS: Dict[str, List[str]] = {}
 
 
 def _generate_prompt_variants_for_class(
@@ -29828,7 +42416,8 @@ def _persist_qwen_run_metadata(
     result_metadata = getattr(result, "metadata", None)
     if isinstance(result_metadata, dict):
         metadata.update(result_metadata)
-    _write_qwen_run_metadata_file(result_path, metadata)
+    if not _write_qwen_run_metadata_file(result_path, metadata):
+        raise QwenTrainingError("qwen_run_metadata_write_failed")
     return metadata
 
 
@@ -30024,6 +42613,7 @@ def _training_split_cache_purge(
     *,
     blocked_detail: str,
     invalid_detail: str,
+    purge_failed_detail: str,
 ) -> Dict[str, Any]:
     cache_root_raw = job_root / "splits"
     if _active_jobs_reference_path_root(registry, lock, cache_root_raw):
@@ -30036,7 +42626,7 @@ def _training_split_cache_purge(
     except HTTPException:
         return {"status": "ok", "deleted_bytes": 0, "deleted_entries": 0}
     deleted_bytes = _dir_size_bytes_impl(cache_root)
-    deleted_entries = _purge_directory(cache_root)
+    deleted_entries = _purge_directory(cache_root, fail_detail=purge_failed_detail)
     return {"status": "ok", "deleted_bytes": deleted_bytes, "deleted_entries": deleted_entries}
 
 
@@ -33056,16 +45646,20 @@ def agent_mining_cache_purge():
     for p in paths:
         try:
             if p.is_symlink():
-                p.unlink(missing_ok=True)
+                p.unlink()
                 deleted_files += 1
             elif p.is_file():
-                deleted += p.stat().st_size
-                deleted_files += 1
+                size = p.stat().st_size
                 p.unlink()
+                deleted += size
+                deleted_files += 1
             elif p.is_dir():
                 p.rmdir()
-        except Exception:
-            continue
+        except Exception as exc:  # noqa: BLE001
+            raise HTTPException(
+                status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+                detail=f"agent_cache_purge_failed:{exc}",
+            ) from exc
     return {"status": "ok", "deleted_bytes": deleted, "deleted_files": deleted_files}
 
 
@@ -34492,6 +47086,7 @@ def _start_segmentation_build_job(request: SegmentationBuildRequest) -> Segmenta
                 workers_list = mining_pool.workers if mining_pool is not None else sam1_workers
                 if not workers_list:
                     raise RuntimeError("segmentation_builder_no_workers")
+                worker_failures: List[str] = []
                 with ThreadPoolExecutor(max_workers=max(1, len(workers_list))) as executor:
                     futures = []
                     task_idx = 0
@@ -34506,7 +47101,14 @@ def _start_segmentation_build_job(request: SegmentationBuildRequest) -> Segmenta
                         try:
                             fut.result()
                         except Exception as exc:  # noqa: BLE001
+                            detail = str(exc) or exc.__class__.__name__
+                            worker_failures.append(detail)
                             logger.warning("Segmentation build worker failed: %s", exc)
+                    if worker_failures:
+                        first = worker_failures[0]
+                        raise RuntimeError(
+                            f"segmentation_builder_worker_failed:{len(worker_failures)}:{first}"
+                        )
             finally:
                 try:
                     if mining_pool is not None:
@@ -34581,13 +47183,31 @@ def _start_segmentation_build_job(request: SegmentationBuildRequest) -> Segmenta
 
 
 def _latest_checkpoint_in_dir(checkpoint_dir: Path) -> Optional[str]:
-    if not checkpoint_dir.exists():
+    if checkpoint_dir.is_symlink() or not checkpoint_dir.exists() or not checkpoint_dir.is_dir():
         return None
+    try:
+        checkpoint_root = checkpoint_dir.resolve(strict=True)
+    except Exception:
+        return None
+    candidates = []
+    for path in checkpoint_dir.iterdir():
+        if path.is_symlink() or path.suffix not in {".ckpt", ".pth", ".pt"}:
+            continue
+        try:
+            resolved = path.resolve(strict=True)
+            if not resolved.is_file() or not _path_is_within_root_impl(resolved, checkpoint_root):
+                continue
+            candidates.append(path)
+        except Exception:
+            continue
     candidates = sorted(
-        checkpoint_dir.glob("*.pt"),
+        candidates,
         key=lambda path: path.stat().st_mtime,
         reverse=True,
     )
+    for path in candidates:
+        if path.name == "last.ckpt":
+            return str(path)
     if candidates:
         return str(candidates[0])
     return None
@@ -34873,6 +47493,8 @@ def _start_sam3_training_worker(
             log_dir = Path(cfg.paths.experiment_log_dir)
             checkpoint_dir = log_dir / "checkpoints"
             latest_ckpt = _latest_checkpoint_in_dir(checkpoint_dir)
+            if not latest_ckpt:
+                raise RuntimeError("sam3_checkpoint_missing")
             seg_head = bool(
                 getattr(
                     cfg.scratch,
@@ -35195,6 +47817,8 @@ def _start_yolo_training_worker(job: YoloTrainingJob) -> None:
             best_path = train_dir / "weights" / "best.pt"
             if best_path.exists():
                 _copy2_if_different(best_path, run_dir / "best.pt")
+            if not (run_dir / "best.pt").is_file():
+                raise RuntimeError("yolo_best_checkpoint_missing")
             results_csv = train_dir / "results.csv"
             args_yaml = train_dir / "args.yaml"
             if results_csv.exists():
@@ -36014,19 +48638,20 @@ def _start_rfdetr_training_worker(job: RfDetrTrainingJob) -> None:
                 except Exception:
                     pass
             best_path = _rfdetr_best_checkpoint_impl(run_dir)
+            if not best_path:
+                raise RuntimeError("rfdetr_best_checkpoint_missing")
             optimized_path = None
-            if best_path:
-                try:
-                    export_kwargs = dict(model_kwargs)
-                    export_kwargs["pretrain_weights"] = best_path
-                    export_kwargs["device"] = device_resolution.get("device_arg") or "cpu"
-                    export_model = model_cls(**export_kwargs)
-                    export_model.optimize_for_inference()
-                    optimized_path = run_dir / "checkpoint_best_optimized.pt"
-                    torch.jit.save(export_model.model.inference_model, str(optimized_path))
-                    _rfdetr_job_log(job, f"Optimized export saved: {optimized_path.name}")
-                except Exception as exc:  # noqa: BLE001
-                    _rfdetr_job_log(job, f"Optimized export failed: {exc}")
+            try:
+                export_kwargs = dict(model_kwargs)
+                export_kwargs["pretrain_weights"] = best_path
+                export_kwargs["device"] = device_resolution.get("device_arg") or "cpu"
+                export_model = model_cls(**export_kwargs)
+                export_model.optimize_for_inference()
+                optimized_path = run_dir / "checkpoint_best_optimized.pt"
+                torch.jit.save(export_model.model.inference_model, str(optimized_path))
+                _rfdetr_job_log(job, f"Optimized export saved: {optimized_path.name}")
+            except Exception as exc:  # noqa: BLE001
+                _rfdetr_job_log(job, f"Optimized export failed: {exc}")
             result_payload = {
                 "run_dir": str(run_dir),
                 "best_path": best_path,
@@ -36336,24 +48961,93 @@ def _publish_clip_training_artifacts(artifacts: TrainingArtifacts) -> TrainingAr
     labelmap_dst = labelmaps_root / labelmap_src.name
     meta_dst = classifiers_root / meta_src.name
 
+    publish_id = uuid.uuid4().hex
+    publish_entries = [
+        ("classifier", model_src, model_dst),
+        ("metadata", meta_src, meta_dst),
+        ("labelmap", labelmap_src, labelmap_dst),
+    ]
+    staged_entries: List[Tuple[str, Path, Path]] = []
+    backup_paths: Dict[Path, Path] = {}
+    committed_paths: Set[Path] = set()
+
+    def _cleanup_staged_artifacts() -> None:
+        for _kind, staged_path, _dst in staged_entries:
+            try:
+                if staged_path.exists() or staged_path.is_symlink():
+                    if staged_path.is_dir() and not staged_path.is_symlink():
+                        shutil.rmtree(staged_path, ignore_errors=True)
+                    else:
+                        staged_path.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Failed to remove staged CLIP artifact %s", staged_path)
+
+    def _rollback_published_artifacts() -> None:
+        for dst, backup in reversed(list(backup_paths.items())):
+            try:
+                if dst.exists() or dst.is_symlink():
+                    if dst.is_dir() and not dst.is_symlink():
+                        shutil.rmtree(dst, ignore_errors=True)
+                    else:
+                        dst.unlink(missing_ok=True)
+                if backup.exists() or backup.is_symlink():
+                    os.replace(backup, dst)
+            except Exception:
+                logger.warning("Failed to roll back CLIP artifact publish target %s", dst)
+        for dst in list(committed_paths):
+            if dst in backup_paths:
+                continue
+            try:
+                if dst.exists() or dst.is_symlink():
+                    if dst.is_dir() and not dst.is_symlink():
+                        shutil.rmtree(dst, ignore_errors=True)
+                    else:
+                        dst.unlink(missing_ok=True)
+            except Exception:
+                logger.warning("Failed to remove newly published CLIP artifact %s", dst)
+        _cleanup_staged_artifacts()
+
     try:
-        if model_src.exists():
-            _link_or_copy_file(model_src, model_dst, overwrite=True)
-            artifacts.model_path = str(model_dst)
+        for kind, src, dst in publish_entries:
+            if not src.exists() or not src.is_file():
+                raise TrainingError(f"clip_artifact_publish_missing:{kind}:{src}")
+            staged_path = dst.with_name(f".{dst.name}.publish.{publish_id}.tmp")
+            _link_or_copy_file(src, staged_path, overwrite=True)
+            staged_entries.append((kind, staged_path, dst))
+
+        for kind, staged_path, dst in staged_entries:
+            backup_path = dst.with_name(f".{dst.name}.publish.{publish_id}.bak")
+            if backup_path.exists() or backup_path.is_symlink():
+                if backup_path.is_dir() and not backup_path.is_symlink():
+                    raise TrainingError(f"clip_artifact_publish_failed:{kind}:backup_path_is_dir")
+                backup_path.unlink(missing_ok=True)
+            if dst.exists() or dst.is_symlink():
+                if dst.is_dir() and not dst.is_symlink():
+                    raise TrainingError(f"clip_artifact_publish_failed:{kind}:target_is_dir")
+                os.replace(dst, backup_path)
+                backup_paths[dst] = backup_path
+            os.replace(staged_path, dst)
+            committed_paths.add(dst)
+    except TrainingError:
+        _rollback_published_artifacts()
+        raise
     except Exception as exc:
-        logger.warning("Failed to publish CLIP classifier %s: %s", model_src, exc)
-    try:
-        if meta_src.exists():
-            _link_or_copy_file(meta_src, meta_dst, overwrite=True)
-            artifacts.meta_path = str(meta_dst)
-    except Exception as exc:
-        logger.warning("Failed to publish CLIP meta %s: %s", meta_src, exc)
-    try:
-        if labelmap_src.exists():
-            _link_or_copy_file(labelmap_src, labelmap_dst, overwrite=True)
-            artifacts.labelmap_path = str(labelmap_dst)
-    except Exception as exc:
-        logger.warning("Failed to publish CLIP labelmap %s: %s", labelmap_src, exc)
+        _rollback_published_artifacts()
+        raise TrainingError(f"clip_artifact_publish_failed:{exc}") from exc
+
+    for backup_path in backup_paths.values():
+        try:
+            if backup_path.exists() or backup_path.is_symlink():
+                if backup_path.is_dir() and not backup_path.is_symlink():
+                    shutil.rmtree(backup_path, ignore_errors=True)
+                else:
+                    backup_path.unlink(missing_ok=True)
+        except Exception:
+            logger.warning("Failed to remove CLIP artifact publish backup %s", backup_path)
+
+    artifacts.model_path = str(model_dst)
+    artifacts.meta_path = str(meta_dst)
+    artifacts.labelmap_path = str(labelmap_dst)
 
     return artifacts
 
@@ -36677,12 +49371,46 @@ def download_clip_classifier_zip(rel_path: str = Query(...)):
     )
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         classifiers_root = (UPLOAD_ROOT / "classifiers").resolve()
-        if not _zip_write_safe_file(zf, classifier_path, classifiers_root, classifier_path.name):
+        written_arcnames: Set[str] = set()
+
+        def unique_arcname(filename: str, fallback_dir: str) -> str:
+            raw_name = Path(str(filename or "")).name or "artifact"
+            if raw_name not in written_arcnames:
+                written_arcnames.add(raw_name)
+                return raw_name
+            prefixed = str(Path(fallback_dir) / raw_name)
+            if prefixed not in written_arcnames:
+                written_arcnames.add(prefixed)
+                return prefixed
+            stem = Path(raw_name).stem or "artifact"
+            suffix = Path(raw_name).suffix
+            for idx in range(1, 1000):
+                candidate = str(Path(fallback_dir) / f"{stem}_{idx}{suffix}")
+                if candidate not in written_arcnames:
+                    written_arcnames.add(candidate)
+                    return candidate
+            raise HTTPException(
+                status_code=HTTP_409_CONFLICT,
+                detail="clip_classifier_zip_duplicate_names",
+            )
+
+        classifier_arcname = unique_arcname(classifier_path.name, "classifier")
+        if not _zip_write_safe_file(zf, classifier_path, classifiers_root, classifier_arcname):
             raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="classifier_not_found")
         if meta_path is not None:
-            _zip_write_safe_file(zf, meta_path, classifiers_root, meta_path.name)
+            meta_arcname = unique_arcname(meta_path.name, "metadata")
+            if not _zip_write_safe_file(zf, meta_path, classifiers_root, meta_arcname):
+                raise HTTPException(
+                    status_code=HTTP_412_PRECONDITION_FAILED,
+                    detail="clip_classifier_zip_meta_missing",
+                )
         if labelmap_path is not None:
-            _zip_write_safe_file(zf, labelmap_path, UPLOAD_ROOT.resolve(), labelmap_path.name)
+            labelmap_arcname = unique_arcname(labelmap_path.name, "labelmaps")
+            if not _zip_write_safe_file(zf, labelmap_path, UPLOAD_ROOT.resolve(), labelmap_arcname):
+                raise HTTPException(
+                    status_code=HTTP_412_PRECONDITION_FAILED,
+                    detail="clip_classifier_zip_labelmap_missing",
+                )
     buffer.seek(0)
     filename = f"{classifier_path.stem}_clip_head.zip"
     headers = {"Content-Disposition": f'attachment; filename="{filename}"'}
@@ -36701,18 +49429,21 @@ def delete_clip_classifier(rel_path: str = Query(...)):
     )
     if classifier_path is None:
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="classifier_not_found")
+    meta_path = Path(os.path.splitext(str(classifier_path))[0] + ".meta.pkl")
+    try:
+        if meta_path.exists() or meta_path.is_symlink():
+            meta_path.unlink()
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"classifier_meta_delete_failed:{exc}",
+        ) from exc
     try:
         classifier_path.unlink()
     except FileNotFoundError as exc:
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="classifier_not_found") from exc
     except Exception as exc:  # noqa: BLE001
         raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-    meta_path = Path(os.path.splitext(str(classifier_path))[0] + ".meta.pkl")
-    try:
-        if meta_path.exists() or meta_path.is_symlink():
-            meta_path.unlink()
-    except Exception:
-        pass
     try:
         if (
             active_classifier_path
@@ -36787,26 +49518,38 @@ def rename_clip_classifier(
         else:
             raise HTTPException(status_code=HTTP_409_CONFLICT, detail="classifier_rename_conflict")
 
-    try:
-        classifier_path.rename(target_path)
-    except FileNotFoundError as exc:
-        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="classifier_not_found") from exc
-    except Exception as exc:  # noqa: BLE001
-        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
-
     old_meta = Path(os.path.splitext(str(classifier_path))[0] + ".meta.pkl")
     new_meta = Path(os.path.splitext(str(target_path))[0] + ".meta.pkl")
+    meta_moved = False
     try:
         old_meta_safe = _safe_classifier_meta_path_impl(classifier_path)
         if old_meta_safe is not None and old_meta_safe == old_meta.resolve():
             if new_meta.exists() or new_meta.is_symlink():
-                try:
-                    new_meta.unlink()
-                except Exception:
-                    pass
+                new_meta.unlink()
             old_meta.replace(new_meta)
-    except Exception:
-        pass
+            meta_moved = True
+    except Exception as exc:  # noqa: BLE001
+        raise HTTPException(
+            status_code=HTTP_500_INTERNAL_SERVER_ERROR,
+            detail=f"classifier_meta_rename_failed:{exc}",
+        ) from exc
+
+    try:
+        classifier_path.rename(target_path)
+    except FileNotFoundError as exc:
+        if meta_moved:
+            try:
+                new_meta.replace(old_meta)
+            except Exception:
+                pass
+        raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="classifier_not_found") from exc
+    except Exception as exc:  # noqa: BLE001
+        if meta_moved:
+            try:
+                new_meta.replace(old_meta)
+            except Exception:
+                pass
+        raise HTTPException(status_code=HTTP_500_INTERNAL_SERVER_ERROR, detail=str(exc)) from exc
 
     try:
         global active_classifier_path
@@ -38041,6 +50784,7 @@ def sam3_train_cache_purge():
         SAM3_TRAINING_JOBS_LOCK,
         blocked_detail="sam3_cache_purge_blocked_active_jobs",
         invalid_detail="sam3_split_path_invalid",
+        purge_failed_detail="sam3_cache_purge_failed",
     )
 
 
@@ -38494,7 +51238,7 @@ def set_rfdetr_active(payload: RfDetrActiveRequest):
         sanitize_fn=_sanitize_rfdetr_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="rfdetr_run_not_found")
     best_path = _rfdetr_best_checkpoint_impl(run_dir)
     if not best_path:
@@ -38538,16 +51282,41 @@ def download_rfdetr_run(run_id: str):
         sanitize_fn=_sanitize_rfdetr_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="rfdetr_run_not_found")
+    best_path_str = _rfdetr_best_checkpoint_impl(run_dir)
+    missing = [
+        name
+        for name in sorted(RFDETR_DOWNLOAD_REQUIRED_FILES)
+        if not _safe_regular_file_within_root(run_dir / name, run_dir)
+    ]
+    if not best_path_str:
+        missing.append("checkpoint_best_total.pth|checkpoint_best_ema.pth|checkpoint_best_regular.pth")
+    if missing:
+        raise HTTPException(
+            status_code=HTTP_412_PRECONDITION_FAILED,
+            detail={"error": "rfdetr_run_download_incomplete", "missing": missing},
+        )
     meta = _rfdetr_load_run_meta_impl(run_dir, meta_name=RFDETR_RUN_META_NAME)
     run_name = meta.get("config", {}).get("run_name") or meta.get("job_id") or run_id
     safe_name = _sanitize_yolo_run_id_impl(run_name)
+    selected_best_path = Path(best_path_str).resolve(strict=False)
+    selected_best_name = selected_best_path.name
     buffer = io.BytesIO()
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename in sorted(RFDETR_KEEP_FILES):
             path = run_dir / filename
-            _zip_write_safe_file(zf, path, run_dir, filename)
+            if filename in RFDETR_DOWNLOAD_REQUIRED_FILES or path.resolve(strict=False) == selected_best_path:
+                _zip_write_required_safe_file(
+                    zf,
+                    path,
+                    run_dir,
+                    filename,
+                    error="rfdetr_run_download_incomplete",
+                    missing_name=filename if filename in RFDETR_DOWNLOAD_REQUIRED_FILES else selected_best_name,
+                )
+            else:
+                _zip_write_safe_file(zf, path, run_dir, filename)
     buffer.seek(0)
     headers = {"Content-Disposition": f'attachment; filename="{safe_name}.zip"'}
     return StreamingResponse(buffer, media_type="application/zip", headers=headers)
@@ -38561,7 +51330,7 @@ def yolo_run_summary(run_id: str):
         sanitize_fn=_sanitize_yolo_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="yolo_run_not_found")
     meta = _yolo_load_run_meta_impl(run_dir, meta_name=YOLO_RUN_META_NAME)
     config = meta.get("config") or {}
@@ -38591,7 +51360,7 @@ def rfdetr_run_summary(run_id: str):
         sanitize_fn=_sanitize_rfdetr_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="rfdetr_run_not_found")
     meta = _rfdetr_load_run_meta_impl(run_dir, meta_name=RFDETR_RUN_META_NAME)
     config = meta.get("config") or {}
@@ -38629,6 +51398,23 @@ def _zip_write_safe_file(zf: zipfile.ZipFile, path: Path, root: Path, arcname: s
     return True
 
 
+def _zip_write_required_safe_file(
+    zf: zipfile.ZipFile,
+    path: Path,
+    root: Path,
+    arcname: str,
+    *,
+    error: str,
+    missing_name: Optional[str] = None,
+) -> None:
+    if _zip_write_safe_file(zf, path, root, arcname):
+        return
+    raise HTTPException(
+        status_code=HTTP_412_PRECONDITION_FAILED,
+        detail={"error": error, "missing": [missing_name or arcname]},
+    )
+
+
 def delete_rfdetr_run(run_id: str):
     run_dir = _rfdetr_run_dir_impl(
         run_id,
@@ -38637,7 +51423,7 @@ def delete_rfdetr_run(run_id: str):
         sanitize_fn=_sanitize_rfdetr_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="rfdetr_run_not_found")
     blocking_registry = _active_job_registry_blocking_run_delete(
         run_id,
@@ -38688,7 +51474,7 @@ def set_yolo_active(payload: YoloActiveRequest):
         sanitize_fn=_sanitize_yolo_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="yolo_run_not_found")
     best_path = run_dir / "best.pt"
     if not _safe_regular_file_within_root(best_path, run_dir):
@@ -39260,8 +52046,18 @@ def download_yolo_run(run_id: str):
         sanitize_fn=_sanitize_yolo_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="yolo_run_not_found")
+    missing = [
+        name
+        for name in sorted(YOLO_DOWNLOAD_REQUIRED_FILES)
+        if not _safe_regular_file_within_root(run_dir / name, run_dir)
+    ]
+    if missing:
+        raise HTTPException(
+            status_code=HTTP_412_PRECONDITION_FAILED,
+            detail={"error": "yolo_run_download_incomplete", "missing": missing},
+        )
     meta = _yolo_load_run_meta_impl(run_dir, meta_name=YOLO_RUN_META_NAME)
     run_name = meta.get("config", {}).get("run_name") or meta.get("job_id") or run_id
     safe_name = _sanitize_yolo_run_id_impl(run_name)
@@ -39273,7 +52069,16 @@ def download_yolo_run(run_id: str):
                 keep_files.add(yaml_path.name)
         for filename in sorted(keep_files):
             path = run_dir / filename
-            _zip_write_safe_file(zf, path, run_dir, filename)
+            if filename in YOLO_DOWNLOAD_REQUIRED_FILES:
+                _zip_write_required_safe_file(
+                    zf,
+                    path,
+                    run_dir,
+                    filename,
+                    error="yolo_run_download_incomplete",
+                )
+            else:
+                _zip_write_safe_file(zf, path, run_dir, filename)
     buffer.seek(0)
     headers = {"Content-Disposition": f'attachment; filename="{safe_name}.zip"'}
     return StreamingResponse(buffer, media_type="application/zip", headers=headers)
@@ -39287,7 +52092,7 @@ def download_yolo_head_graft_bundle(job_id: str):
         sanitize_fn=_sanitize_yolo_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="yolo_run_not_found")
     meta = _yolo_load_run_meta_impl(run_dir, meta_name=YOLO_RUN_META_NAME)
     if not meta.get("head_graft"):
@@ -39309,7 +52114,13 @@ def download_yolo_head_graft_bundle(job_id: str):
     with zipfile.ZipFile(buffer, "w", compression=zipfile.ZIP_DEFLATED) as zf:
         for filename in sorted(required):
             path = run_dir / filename
-            _zip_write_safe_file(zf, path, run_dir, filename)
+            _zip_write_required_safe_file(
+                zf,
+                path,
+                run_dir,
+                filename,
+                error="yolo_head_graft_bundle_incomplete",
+            )
         for yaml_path in sorted(run_dir.glob("*.yaml")):
             _zip_write_safe_file(zf, yaml_path, run_dir, yaml_path.name)
     buffer.seek(0)
@@ -39325,7 +52136,7 @@ def delete_yolo_run(run_id: str):
         sanitize_fn=_sanitize_yolo_run_id_impl,
         http_exception_cls=HTTPException,
     )
-    if not run_dir.exists():
+    if not run_dir.exists() or not run_dir.is_dir():
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="yolo_run_not_found")
     blocking_registry = _active_job_registry_blocking_run_delete(
         run_id,
@@ -39674,6 +52485,7 @@ def qwen_train_cache_purge():
         QWEN_TRAINING_JOBS_LOCK,
         blocked_detail="qwen_cache_purge_blocked_active_jobs",
         invalid_detail="qwen_split_path_invalid",
+        purge_failed_detail="qwen_cache_purge_failed",
     )
 
 
@@ -39731,6 +52543,7 @@ def _builtin_qwen_model_entries() -> List[Dict[str, Any]]:
         model_id = str(entry.get("id") or entry.get("model_id") or "")
         vision_supported = entry.get("vision_inference_supported", True) is not False
         training_supported = bool(entry.get("training_supported", True)) and vision_supported
+        agent_metadata = agent_model_metadata_for_model(model_id)
         default_training_note = (
             "MLX-VLM trains LoRA adapters directly on Apple Silicon. Quantized MLX checkpoints use "
             "the same adapter path as QLoRA-style training."
@@ -39751,7 +52564,12 @@ def _builtin_qwen_model_entries() -> List[Dict[str, Any]]:
             "size": entry.get("size"),
             "vision_inference_supported": vision_supported,
             "inference_supported": vision_supported,
-            "compatibility_note": entry.get("compatibility_note"),
+            "compatibility_note": entry.get("compatibility_note") or agent_metadata.get("compatibility_note"),
+            "agent_model": bool(agent_metadata),
+            "agent_supported": bool(agent_metadata) and vision_supported,
+            "agent_backend_status": agent_metadata.get("backend_status"),
+            "agent_smoke_status": agent_metadata.get("smoke_status"),
+            "agent_compatibility_note": agent_metadata.get("compatibility_note"),
             "training_supported": training_supported,
             "training_modes": ["official_lora", "trl_qlora"] if training_supported else [],
             "training_model_id": model_id,
@@ -39769,7 +52587,55 @@ def _builtin_qwen_model_entries() -> List[Dict[str, Any]]:
                 "created_at": None,
             }
         )
-    return [default_entry, *transformers_entries, *mlx_entries]
+    agent_entries: List[Dict[str, Any]] = []
+    for entry in AGENT_MODEL_OPTIONS:
+        model_id = str(entry.get("id") or entry.get("model_id") or "")
+        if not model_id:
+            continue
+        if model_id in QWEN_MLX_MODEL_IDS:
+            continue
+        runtime_platform = str(entry.get("runtime_platform") or QWEN_PLATFORM_TRANSFORMERS)
+        vision_supported = entry.get("vision_inference_supported", True) is not False
+        metadata = {
+            "id": model_id,
+            "label": str(entry.get("label") or model_id),
+            "system_prompt": DEFAULT_SYSTEM_PROMPT,
+            "dataset_context": str(entry.get("dataset_context") or "Inference-only VLM agent model."),
+            "classes": [],
+            "model_id": model_id,
+            "model_family": str(entry.get("model_family") or "agent_vlm"),
+            "source": str(entry.get("source") or "huggingface"),
+            "runtime_platform": runtime_platform,
+            "quantization": entry.get("quantization"),
+            "quantized": bool(entry.get("quantized")),
+            "abliterated": bool(entry.get("abliterated")),
+            "variant": entry.get("variant"),
+            "size": entry.get("size"),
+            "agent_model": True,
+            "agent_supported": bool(entry.get("agent_supported", vision_supported)),
+            "vision_inference_supported": vision_supported,
+            "inference_supported": vision_supported,
+            "backend_status": entry.get("backend_status"),
+            "smoke_status": entry.get("smoke_status"),
+            "compatibility_note": entry.get("compatibility_note"),
+            "training_supported": False,
+            "training_modes": [],
+            "training_model_id": None,
+            "training_note": entry.get("training_note") or entry.get("compatibility_note"),
+            "min_pixels": QWEN_MIN_PIXELS,
+            "max_pixels": QWEN_MAX_PIXELS,
+        }
+        agent_entries.append(
+            {
+                "id": model_id,
+                "label": str(entry.get("label") or model_id),
+                "type": "builtin_agent_mlx" if runtime_platform == QWEN_PLATFORM_MLX else "builtin_agent_transformers",
+                "metadata": metadata,
+                "path": None,
+                "created_at": None,
+            }
+        )
+    return [default_entry, *transformers_entries, *mlx_entries, *agent_entries]
 
 
 def _get_builtin_qwen_model_entry(model_id: str) -> Optional[Dict[str, Any]]:
@@ -39801,7 +52667,7 @@ def list_qwen_models():
             platform_name,
             entry_path=entry.get("path"),
         )
-        if entry.get("type") == "builtin_mlx" and isinstance(metadata, dict):
+        if entry.get("type") in {"builtin_mlx", "builtin_agent_mlx"} and isinstance(metadata, dict):
             cached_incompatible = _qwen_mlx_cached_checkpoint_incompatibility_detail(
                 str(metadata.get("model_id") or entry.get("id")),
                 availability,
@@ -39846,18 +52712,29 @@ def activate_qwen_model(payload: QwenModelActivateRequest):
     model_id = (payload.model_id or "").strip()
     if not model_id:
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="model_id_required")
+    incompatible_detail = _qwen_mlx_incompatible_model_detail(model_id)
+    if incompatible_detail:
+        raise HTTPException(
+            status_code=HTTP_400_BAD_REQUEST,
+            detail=f"qwen_mlx_incompatible_checkpoint:{incompatible_detail}",
+        )
     if model_id == "default":
         _set_active_qwen_model_default()
     else:
         builtin = _get_builtin_qwen_model_entry(model_id)
-        if builtin and builtin.get("type") in {"builtin_mlx", "builtin_transformers"}:
+        if builtin and builtin.get("type") in {
+            "builtin_mlx",
+            "builtin_transformers",
+            "builtin_agent_mlx",
+            "builtin_agent_transformers",
+        }:
             fallback_metadata = (
-                qwen_mlx_metadata_for_model(model_id)
-                if builtin.get("type") == "builtin_mlx"
+                (agent_model_metadata_for_model(model_id) or qwen_mlx_metadata_for_model(model_id))
+                if builtin.get("type") in {"builtin_mlx", "builtin_agent_mlx"}
                 else qwen_transformers_metadata_for_model(model_id)
             )
             metadata = builtin.get("metadata") or fallback_metadata
-            if builtin.get("type") == "builtin_mlx" and (
+            if builtin.get("type") in {"builtin_mlx", "builtin_agent_mlx"} and (
                 metadata.get("vision_inference_supported") is False
                 or metadata.get("inference_supported") is False
             ):
@@ -40670,8 +53547,15 @@ def qwen_status():
         "memory": memory,
         "vram": memory,
         "progress": qwen_progress(),
-        "transformers_models": QWEN_TRANSFORMERS_MODEL_OPTIONS,
-        "mlx_models": QWEN_MLX_VISION_MODEL_OPTIONS,
+        "transformers_models": [*QWEN_TRANSFORMERS_MODEL_OPTIONS, *AGENT_MODEL_OPTIONS],
+        "mlx_models": [
+            *QWEN_MLX_VISION_MODEL_OPTIONS,
+            *[
+                entry
+                for entry in AGENT_MLX_MODEL_OPTIONS
+                if entry.get("vision_inference_supported", True) is not False
+            ],
+        ],
     }
 
 
@@ -40753,6 +53637,7 @@ app.include_router(
         unload_fn=lambda: (_unload_qwen_runtime() or {"status": "unloaded"}),
         settings_cls=QwenRuntimeSettings,
         update_cls=QwenRuntimeSettingsUpdate,
+        cancel_fn=cancel_qwen_request,
     )
 )
 
@@ -41496,7 +54381,11 @@ def qwen_caption(payload: QwenCaptionRequest):
         resolve_main_runtime()
         _raise_if_qwen_cancelled()
         if caption_mode == "windowed":
-            assert window_size is not None
+            if window_size is None:
+                raise HTTPException(
+                    status_code=HTTP_400_BAD_REQUEST,
+                    detail="qwen_caption_window_size_invalid",
+                )
             window_index = 0
             window_model_id = desired_model_id
             window_base_model_id = window_model_id
@@ -42585,6 +55474,9 @@ def qwen_prepass(payload: QwenPrepassRequest):
         result = _run_prepass_annotation(payload)
         _qwen_progress_finish("EDR prepass complete")
         return result
+    except QwenCancellationRequested as exc:
+        _qwen_progress_cancelled("Qwen prepass cancelled")
+        raise HTTPException(status_code=499, detail="qwen_prepass_cancelled") from exc
     except HTTPException as exc:
         detail = _http_exception_detail_text(exc)
         _qwen_progress_error(
@@ -42795,6 +55687,11 @@ def export_edr_package(package_id: str):
         zip_path = _export_edr_package_impl(EDR_PACKAGES_ROOT, package_id)
     except (FileNotFoundError, ValueError) as exc:
         raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="edr_package_not_found") from exc
+    except RuntimeError as exc:
+        raise HTTPException(
+            status_code=HTTP_412_PRECONDITION_FAILED,
+            detail=str(exc) or "edr_package_invalid",
+        ) from exc
     return FileResponse(
         path=str(zip_path),
         media_type="application/zip",
@@ -42847,7 +55744,15 @@ def export_prepass_recipe(recipe_id: str):
     config = meta.get("config") if isinstance(meta.get("config"), dict) else {}
     package_id = str(config.get("edr_package_id") or "").strip()
     if package_id:
-        zip_path = _export_edr_package_impl(EDR_PACKAGES_ROOT, package_id)
+        try:
+            zip_path = _export_edr_package_impl(EDR_PACKAGES_ROOT, package_id)
+        except (FileNotFoundError, ValueError) as exc:
+            raise HTTPException(status_code=HTTP_404_NOT_FOUND, detail="edr_package_not_found") from exc
+        except RuntimeError as exc:
+            raise HTTPException(
+                status_code=HTTP_412_PRECONDITION_FAILED,
+                detail=str(exc) or "edr_package_invalid",
+            ) from exc
         return FileResponse(
             path=str(zip_path),
             media_type="application/zip",
@@ -43295,6 +56200,10 @@ app.include_router(
         get_mobile_review_fn=get_class_analysis_mobile_review,
         mobile_review_action_fn=class_analysis_mobile_review_action,
         get_mobile_review_context_fn=get_class_analysis_mobile_review_context,
+        create_qwen_review_fn=create_class_analysis_qwen_review,
+        get_qwen_review_fn=get_class_analysis_qwen_review,
+        cancel_qwen_review_fn=cancel_class_analysis_qwen_review,
+        get_qwen_review_evidence_fn=get_class_analysis_qwen_review_evidence,
     )
 )
 
@@ -43977,6 +56886,22 @@ def _safe_crop_zip_component(value: Optional[str], fallback: str) -> str:
     return cleaned or fallback
 
 
+def _unique_crop_zip_member_name(base_name: str, used_names: Set[str]) -> str:
+    candidate = str(base_name or "crop.jpg")
+    if candidate not in used_names:
+        used_names.add(candidate)
+        return candidate
+    stem = Path(candidate).stem or "crop"
+    suffix = Path(candidate).suffix or ".jpg"
+    counter = 2
+    while True:
+        candidate_next = f"{stem}-dup{counter}{suffix}"
+        if candidate_next not in used_names:
+            used_names.add(candidate_next)
+            return candidate_next
+        counter += 1
+
+
 def crop_zip_finalize(jobId: str):
     if jobId not in job_store:
         raise HTTPException(status_code=400, detail="Invalid jobId")
@@ -43993,6 +56918,7 @@ def crop_zip_finalize(jobId: str):
                 headers={"Content-Disposition": "attachment; filename=crops.zip"},
             )
         zip_buffer = io.BytesIO()
+        used_names: Set[str] = set()
         with zipfile.ZipFile(zip_buffer, mode="w", compression=zipfile.ZIP_DEFLATED) as zf:
             for img_index, cropImage in enumerate(all_images):
                 pil_img, _ = _decode_image_base64_impl(
@@ -44018,6 +56944,7 @@ def crop_zip_finalize(jobId: str):
                     sub_img = pil_img.crop((left, top, right, bottom))
                     class_name = _safe_crop_zip_component(bbox.className, "class")
                     out_name = f"{stem}-{class_name}-{bindex}.jpg"
+                    out_name = _unique_crop_zip_member_name(out_name, used_names)
                     crop_buffer = io.BytesIO()
                     sub_img.save(crop_buffer, format="JPEG")
                     crop_buffer.seek(0)

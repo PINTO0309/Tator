@@ -273,7 +273,7 @@ def test_rfdetr_run_dir_rejects_symlinked_job_parent_before_create(tmp_path: Pat
     assert list(outside.iterdir()) == []
 
 
-def test_download_yolo_run_skips_symlink_keep_file_escape(
+def test_download_yolo_run_rejects_symlinked_required_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job_root = tmp_path / "yolo_runs"
@@ -286,13 +286,65 @@ def test_download_yolo_run_skips_symlink_keep_file_escape(
     except OSError as exc:
         pytest.skip(f"symlink unsupported: {exc}")
     (run_dir / "labelmap.txt").write_text("target\n", encoding="utf-8")
+    (run_dir / api.YOLO_RUN_META_NAME).write_text('{"job_id":"run1"}', encoding="utf-8")
+
+    monkeypatch.setattr(api, "YOLO_JOB_ROOT", job_root)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.download_yolo_run("run1")
+
+    assert exc.value.status_code == 412
+    assert exc.value.detail == {
+        "error": "yolo_run_download_incomplete",
+        "missing": ["best.pt"],
+    }
+
+
+def test_download_yolo_run_requires_core_artifacts_but_allows_missing_optional_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_root = tmp_path / "yolo_runs"
+    run_dir = job_root / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "best.pt").write_text("weights", encoding="utf-8")
+    (run_dir / "labelmap.txt").write_text("target\n", encoding="utf-8")
+    (run_dir / api.YOLO_RUN_META_NAME).write_text('{"job_id":"run1"}', encoding="utf-8")
 
     monkeypatch.setattr(api, "YOLO_JOB_ROOT", job_root)
 
     names = _zip_names(api.download_yolo_run("run1"))
 
-    assert "labelmap.txt" in names
-    assert "best.pt" not in names
+    assert {"best.pt", "labelmap.txt", api.YOLO_RUN_META_NAME}.issubset(names)
+    assert "results.csv" not in names
+
+
+def test_download_yolo_run_fails_if_required_file_disappears_during_zip_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_root = tmp_path / "yolo_runs"
+    run_dir = job_root / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "best.pt").write_text("weights", encoding="utf-8")
+    (run_dir / "labelmap.txt").write_text("target\n", encoding="utf-8")
+    (run_dir / api.YOLO_RUN_META_NAME).write_text('{"job_id":"run1"}', encoding="utf-8")
+    monkeypatch.setattr(api, "YOLO_JOB_ROOT", job_root)
+    real_zip_write = api._zip_write_safe_file
+
+    def flaky_zip_write(zf, path, root, arcname):
+        if arcname == "best.pt":
+            return False
+        return real_zip_write(zf, path, root, arcname)
+
+    monkeypatch.setattr(api, "_zip_write_safe_file", flaky_zip_write)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.download_yolo_run("run1")
+
+    assert exc.value.status_code == 412
+    assert exc.value.detail == {
+        "error": "yolo_run_download_incomplete",
+        "missing": ["best.pt"],
+    }
 
 
 def test_yolo_detector_runtime_rejects_best_symlink_escape(
@@ -360,7 +412,62 @@ def test_set_yolo_active_omits_symlinked_labelmap_escape(
     assert json.loads(active_path.read_text(encoding="utf-8"))["labelmap_path"] is None
 
 
-def test_download_rfdetr_run_skips_symlink_keep_file_escape(
+def test_yolo_run_endpoints_reject_file_at_run_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_root = tmp_path / "yolo_runs"
+    job_root.mkdir()
+    run_path = job_root / "not_a_dir"
+    run_path.write_text("not a run directory", encoding="utf-8")
+    monkeypatch.setattr(api, "YOLO_JOB_ROOT", job_root)
+    monkeypatch.setattr(api, "YOLO_ACTIVE_PATH", tmp_path / "models" / "yolo" / "active.json")
+
+    calls = [
+        lambda: api.set_yolo_active(api.YoloActiveRequest(run_id="not_a_dir")),
+        lambda: api.download_yolo_run("not_a_dir"),
+        lambda: api.download_yolo_head_graft_bundle("not_a_dir"),
+        lambda: api.yolo_run_summary("not_a_dir"),
+        lambda: api.delete_yolo_run("not_a_dir"),
+        lambda: api._ensure_yolo_inference_runtime_for_detector("not_a_dir"),
+    ]
+
+    for call in calls:
+        with pytest.raises(api.HTTPException) as exc:
+            call()
+        assert exc.value.status_code == 404
+        assert exc.value.detail == "yolo_run_not_found"
+        assert run_path.read_text(encoding="utf-8") == "not a run directory"
+
+
+def test_rfdetr_run_endpoints_reject_file_at_run_path(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_root = tmp_path / "rfdetr_runs"
+    job_root.mkdir()
+    run_path = job_root / "not_a_dir"
+    run_path.write_text("not a run directory", encoding="utf-8")
+    monkeypatch.setattr(api, "RFDETR_JOB_ROOT", job_root)
+    monkeypatch.setattr(
+        api, "RFDETR_ACTIVE_PATH", tmp_path / "models" / "rfdetr" / "active.json"
+    )
+
+    calls = [
+        lambda: api.set_rfdetr_active(api.RfDetrActiveRequest(run_id="not_a_dir")),
+        lambda: api.download_rfdetr_run("not_a_dir"),
+        lambda: api.rfdetr_run_summary("not_a_dir"),
+        lambda: api.delete_rfdetr_run("not_a_dir"),
+        lambda: api._ensure_rfdetr_inference_runtime_for_detector("not_a_dir"),
+    ]
+
+    for call in calls:
+        with pytest.raises(api.HTTPException) as exc:
+            call()
+        assert exc.value.status_code == 404
+        assert exc.value.detail == "rfdetr_run_not_found"
+        assert run_path.read_text(encoding="utf-8") == "not a run directory"
+
+
+def test_download_rfdetr_run_rejects_symlinked_required_checkpoint(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
     job_root = tmp_path / "rfdetr_runs"
@@ -373,13 +480,65 @@ def test_download_rfdetr_run_skips_symlink_keep_file_escape(
     except OSError as exc:
         pytest.skip(f"symlink unsupported: {exc}")
     (run_dir / "labelmap.txt").write_text("target\n", encoding="utf-8")
+    (run_dir / api.RFDETR_RUN_META_NAME).write_text('{"job_id":"run1"}', encoding="utf-8")
+
+    monkeypatch.setattr(api, "RFDETR_JOB_ROOT", job_root)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.download_rfdetr_run("run1")
+
+    assert exc.value.status_code == 412
+    assert exc.value.detail == {
+        "error": "rfdetr_run_download_incomplete",
+        "missing": ["checkpoint_best_total.pth|checkpoint_best_ema.pth|checkpoint_best_regular.pth"],
+    }
+
+
+def test_download_rfdetr_run_requires_core_artifacts_but_allows_missing_optional_files(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_root = tmp_path / "rfdetr_runs"
+    run_dir = job_root / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "checkpoint_best_total.pth").write_text("weights", encoding="utf-8")
+    (run_dir / "labelmap.txt").write_text("target\n", encoding="utf-8")
+    (run_dir / api.RFDETR_RUN_META_NAME).write_text('{"job_id":"run1"}', encoding="utf-8")
 
     monkeypatch.setattr(api, "RFDETR_JOB_ROOT", job_root)
 
     names = _zip_names(api.download_rfdetr_run("run1"))
 
-    assert "labelmap.txt" in names
-    assert "checkpoint_best_total.pth" not in names
+    assert {"checkpoint_best_total.pth", "labelmap.txt", api.RFDETR_RUN_META_NAME}.issubset(names)
+    assert "results.json" not in names
+
+
+def test_download_rfdetr_run_fails_if_selected_checkpoint_disappears_during_zip_write(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    job_root = tmp_path / "rfdetr_runs"
+    run_dir = job_root / "run1"
+    run_dir.mkdir(parents=True, exist_ok=True)
+    (run_dir / "checkpoint_best_total.pth").write_text("weights", encoding="utf-8")
+    (run_dir / "labelmap.txt").write_text("target\n", encoding="utf-8")
+    (run_dir / api.RFDETR_RUN_META_NAME).write_text('{"job_id":"run1"}', encoding="utf-8")
+    monkeypatch.setattr(api, "RFDETR_JOB_ROOT", job_root)
+    real_zip_write = api._zip_write_safe_file
+
+    def flaky_zip_write(zf, path, root, arcname):
+        if arcname == "checkpoint_best_total.pth":
+            return False
+        return real_zip_write(zf, path, root, arcname)
+
+    monkeypatch.setattr(api, "_zip_write_safe_file", flaky_zip_write)
+
+    with pytest.raises(api.HTTPException) as exc:
+        api.download_rfdetr_run("run1")
+
+    assert exc.value.status_code == 412
+    assert exc.value.detail == {
+        "error": "rfdetr_run_download_incomplete",
+        "missing": ["checkpoint_best_total.pth"],
+    }
 
 
 def test_rfdetr_prepare_dataset_copy_fallback_skips_symlink_escape(
@@ -918,6 +1077,76 @@ def test_yolo_training_late_cancel_skips_artifact_publish(
     assert (run_dir / "train" / "weights" / "best.pt").exists()
 
 
+def test_yolo_training_fails_when_best_checkpoint_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "missing_best_yolo"
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    labelmap_path = dataset_root / "labelmap.txt"
+    labelmap_path.write_text("target\n", encoding="utf-8")
+    yolo_root = tmp_path / "yolo_runs"
+    job = api.YoloTrainingJob(
+        job_id=run_id,
+        config={
+            "dataset": {
+                "yolo_ready": True,
+                "dataset_root": str(dataset_root),
+                "yolo_layout": "flat",
+                "yolo_labelmap_path": str(labelmap_path),
+                "task": "detect",
+            },
+            "task": "detect",
+            "variant": "yolov8n",
+            "epochs": 1,
+            "device_resolution": {
+                "device_arg": "cpu",
+                "device_label": "CPU",
+                "resolved_accelerator": "cpu",
+            },
+        },
+    )
+
+    class FakeYOLO:
+        def __init__(self, _model_source):
+            pass
+
+        def train(self, **kwargs):
+            train_weights = Path(kwargs["project"]) / "train" / "weights"
+            train_weights.mkdir(parents=True, exist_ok=True)
+            return SimpleNamespace(metrics={"mAP50": 1.0})
+
+    fake_ultralytics = ModuleType("ultralytics")
+    fake_ultralytics.YOLO = FakeYOLO
+    monkeypatch.setitem(sys.modules, "ultralytics", fake_ultralytics)
+    monkeypatch.setattr(api, "YOLO_JOB_ROOT", yolo_root)
+    monkeypatch.setattr(api.threading, "Thread", _ImmediateTrainingThread)
+    monkeypatch.setattr(api, "_prepare_for_training_impl", lambda **_kwargs: None)
+    monkeypatch.setattr(api, "_finalize_training_environment_impl", lambda **_kwargs: None)
+    monkeypatch.setattr(api, "_yolo_monitor_training_impl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(
+        api,
+        "_yolo_write_data_yaml_impl",
+        lambda run_dir, *_args, **_kwargs: run_dir / "data.yaml",
+    )
+    monkeypatch.setattr(
+        api,
+        "_yolo_resolve_model_source_impl",
+        lambda *_args, **_kwargs: ("weights", "yolov8n.pt"),
+    )
+
+    api._start_yolo_training_worker(job)
+
+    run_dir = yolo_root / run_id
+    meta = json.loads((run_dir / api.YOLO_RUN_META_NAME).read_text(encoding="utf-8"))
+    assert job.status == "failed"
+    assert job.error == "yolo_best_checkpoint_missing"
+    assert job.result is None
+    assert meta["status"] == "failed"
+    assert meta.get("result") is None
+    assert not (run_dir / "best.pt").exists()
+
+
 def test_delete_yolo_run_clears_corrupt_active_marker_inside_run(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch
 ) -> None:
@@ -1088,6 +1317,81 @@ def test_rfdetr_training_late_cancel_skips_artifact_publish(
     assert meta["status"] == "cancelled"
     assert meta.get("result") is None
     assert not (run_dir / "metrics_series.json").exists()
+
+
+def test_rfdetr_training_fails_when_best_checkpoint_missing(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+) -> None:
+    run_id = "missing_best_rfdetr"
+    dataset_root = tmp_path / "dataset"
+    dataset_root.mkdir()
+    coco_path = dataset_root / "train.json"
+    coco_path.write_text('{"images":[],"annotations":[],"categories":[]}', encoding="utf-8")
+    rfdetr_root = tmp_path / "rfdetr_runs"
+    job = api.RfDetrTrainingJob(
+        job_id=run_id,
+        config={
+            "dataset": {
+                "dataset_root": str(dataset_root),
+                "coco_train_json": str(coco_path),
+                "coco_val_json": str(coco_path),
+                "task": "detect",
+            },
+            "task": "detect",
+            "variant": "rfdetr-nano",
+            "epochs": 1,
+            "device_resolution": {
+                "device_arg": "cpu",
+                "device_label": "CPU",
+                "devices": [],
+                "resolved_accelerator": "cpu",
+            },
+        },
+    )
+
+    class FakeRfDetr:
+        def __init__(self, **_kwargs):
+            self.callbacks = {"on_fit_epoch_end": []}
+            self.model = SimpleNamespace(request_early_stop=lambda: None)
+
+        def train(self, **kwargs):
+            Path(kwargs["output_dir"]).mkdir(parents=True, exist_ok=True)
+
+    fake_rfdetr = ModuleType("rfdetr")
+    for name in (
+        "RFDETRBase",
+        "RFDETRLarge",
+        "RFDETRNano",
+        "RFDETRSmall",
+        "RFDETRMedium",
+        "RFDETRSegPreview",
+    ):
+        setattr(fake_rfdetr, name, FakeRfDetr)
+
+    monkeypatch.setitem(sys.modules, "rfdetr", fake_rfdetr)
+    monkeypatch.setattr(api, "RFDETR_JOB_ROOT", rfdetr_root)
+    monkeypatch.setattr(api.threading, "Thread", _ImmediateTrainingThread)
+    monkeypatch.setattr(api, "_prepare_for_training_impl", lambda **_kwargs: None)
+    monkeypatch.setattr(api, "_finalize_training_environment_impl", lambda **_kwargs: None)
+    monkeypatch.setattr(api, "_rfdetr_load_labelmap_impl", lambda *_args, **_kwargs: [])
+    monkeypatch.setattr(
+        api,
+        "_rfdetr_prepare_dataset_impl",
+        lambda _dataset_root, run_dir, *_args, **_kwargs: run_dir / "dataset",
+    )
+    monkeypatch.setattr(api, "_rfdetr_install_augmentations_impl", lambda *_args, **_kwargs: None)
+    monkeypatch.setattr(api, "_rfdetr_restore_augmentations_impl", lambda *_args, **_kwargs: None)
+
+    api._start_rfdetr_training_worker(job)
+
+    run_dir = rfdetr_root / run_id
+    meta = json.loads((run_dir / api.RFDETR_RUN_META_NAME).read_text(encoding="utf-8"))
+    assert job.status == "failed"
+    assert job.error == "rfdetr_best_checkpoint_missing"
+    assert job.result is None
+    assert meta["status"] == "failed"
+    assert meta.get("result") is None
+    assert not (run_dir / "checkpoint_best_total.pth").exists()
 
 
 def test_delete_rfdetr_run_clears_corrupt_active_marker_inside_run(

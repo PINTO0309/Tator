@@ -139,16 +139,66 @@ def test_qwen_model_registry_exposes_abliterated_mlx_models():
         assert by_id[model_id]["metadata"]["abliterated"] is True
         assert by_id[model_id]["metadata"]["training_supported"] is True
         assert by_id[model_id]["metadata"]["training_modes"] == ["official_lora", "trl_qlora"]
+    assert "Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit" not in by_id
+    qwen36_id = "vanch007/Huihui-Qwen3.6-35B-A3B-abliterated-mlx-4bit"
+    assert qwen36_id in by_id
+    qwen36_entry = by_id[qwen36_id]
+    assert qwen36_entry["type"] == "builtin_mlx"
+    assert qwen36_entry["metadata"]["runtime_platform"] == "mlx_vlm"
+    assert qwen36_entry["metadata"]["agent_model"] is True
+    assert qwen36_entry["metadata"]["abliterated"] is True
+    assert qwen36_entry["metadata"]["source"] == "vanch007"
+    assert qwen36_entry["metadata"]["size"] == "35B-A3B"
+    assert qwen36_entry["metadata"]["variant"] == "Abliterated"
+    assert qwen36_entry["metadata"]["vision_inference_supported"] is True
+    assert qwen36_entry["metadata"]["training_supported"] is False
+    assert qwen36_entry["metadata"]["training_modes"] == []
+    assert "smoke tests passed" in qwen36_entry["metadata"]["compatibility_note"]
     for model_id in (
         "introvoyz041/Huihui-Qwen3-VL-30B-A3B-Thinking-abliterated-qx86-hi-mlx-mlx-4Bit",
         "introvoyz041/Huihui-Qwen3-VL-32B-Thinking-abliterated-qx65-hi-mlx-mlx-4Bit",
     ):
-        assert model_id in by_id
-        assert by_id[model_id]["type"] == "builtin_mlx"
-        assert by_id[model_id]["metadata"]["abliterated"] is True
-        assert by_id[model_id]["metadata"]["vision_inference_supported"] is False
-        assert by_id[model_id]["metadata"]["training_supported"] is False
-        assert by_id[model_id]["metadata"]["training_modes"] == []
+        assert model_id not in by_id
+
+
+def test_qwen_model_registry_exposes_inference_only_agent_models():
+    models = api.list_qwen_models()["models"]
+    by_id = {entry["id"]: entry for entry in models}
+
+    expected = {
+        "mlx-community/Qwen3-VL-2B-Instruct-4bit": "builtin_mlx",
+        "mlx-community/Qwen3-VL-4B-Instruct-4bit": "builtin_mlx",
+        "mlx-community/Qwen3-VL-8B-Instruct-4bit": "builtin_mlx",
+        "mlx-community/Qwen3-VL-4B-Thinking-4bit": "builtin_mlx",
+        "mlx-community/Qwen3-VL-8B-Thinking-4bit": "builtin_mlx",
+        "EZCon/Huihui-Qwen3-VL-2B-Instruct-abliterated-4bit-mlx": "builtin_mlx",
+        "EZCon/Huihui-Qwen3-VL-4B-Instruct-abliterated-4bit-mlx": "builtin_mlx",
+        "alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx": "builtin_mlx",
+        "nightmedia/Huihui-Qwen3-VL-32B-Thinking-abliterated-qx65-hi-mlx": "builtin_mlx",
+        "mlx-community/Qwen3.6-35B-A3B-4bit": "builtin_agent_mlx",
+        "vanch007/Huihui-Qwen3.6-35B-A3B-abliterated-mlx-4bit": "builtin_mlx",
+    }
+    removed_unusable = {
+        "Jackrong/Qwopus3.6-27B-v2",
+        "prithivMLmods/Qwen3.6-35B-A3B-abliterated-MAX",
+        "nex-agi/Nex-N2-mini",
+        "huihui-ai/Huihui-gemma-4-31B-it-qat-q4_0-unquantized-abliterated",
+        "mlx-community/gemma-4-31B-it-qat-4bit",
+        "vanch007/Huihui-gemma-4-26B-A4B-it-abliterated-mlx-4bit",
+    }
+
+    for model_id, entry_type in expected.items():
+        entry = by_id[model_id]
+        assert entry["type"] == entry_type
+        assert entry["metadata"]["agent_model"] is True
+        assert entry["metadata"]["vision_inference_supported"] is True
+        if entry_type == "builtin_agent_mlx" or "Qwen3.6" in model_id:
+            assert entry["metadata"]["training_supported"] is False
+            assert entry["metadata"]["training_modes"] == []
+        else:
+            assert entry["metadata"]["training_supported"] is True
+            assert entry["metadata"]["training_modes"] == ["official_lora", "trl_qlora"]
+    assert not (removed_unusable & set(by_id))
 
 
 def test_qwen_training_config_accepts_moe_transformers_model(tmp_path, monkeypatch):
@@ -622,6 +672,40 @@ def test_qwen_training_late_cancel_skips_metadata_publish(tmp_path, monkeypatch)
     assert not (result_path / api.QWEN_METADATA_FILENAME).exists()
 
 
+def test_qwen_training_worker_fails_when_metadata_publish_fails(tmp_path, monkeypatch):
+    if api.QwenTrainingConfig is None or api.QwenTrainingResult is None:
+        pytest.skip("Qwen training dependencies are not importable in this environment")
+
+    result_path = tmp_path / "run"
+    config = api.QwenTrainingConfig(
+        dataset_root=str(tmp_path / "dataset"),
+        result_path=str(result_path),
+        model_id="Qwen/Qwen3-VL-4B-Instruct",
+        run_name="metadata-failure",
+    )
+    job = api.QwenTrainingJob(job_id="qwen_metadata_failure", config={})
+
+    def fake_train_qwen_model(_config, **_kwargs):
+        return api.QwenTrainingResult(
+            config=config,
+            checkpoints=[str(result_path / "latest")],
+            latest_checkpoint=str(result_path / "latest"),
+            epochs_ran=1,
+        )
+
+    monkeypatch.setattr(api.threading, "Thread", _ImmediateThread)
+    monkeypatch.setattr(api, "_prepare_for_qwen_training", lambda: None)
+    monkeypatch.setattr(api, "_finalize_qwen_training_environment", lambda: None)
+    monkeypatch.setattr(api, "train_qwen_model", fake_train_qwen_model)
+    monkeypatch.setattr(api, "_write_qwen_run_metadata_file", lambda *_args, **_kwargs: False)
+
+    api._start_qwen_training_worker(job, config)
+
+    assert job.status == "failed"
+    assert job.error == "qwen_run_metadata_write_failed"
+    assert job.result is None
+
+
 def test_qwen_training_config_rejects_symlinked_runs_root(tmp_path, monkeypatch):
     if api.QwenTrainingConfig is None:
         pytest.skip("Qwen training dependencies are not importable in this environment")
@@ -705,7 +789,7 @@ def test_qwen_training_metadata_replaces_symlinked_metadata_file(tmp_path):
     assert persisted["id"] == metadata["id"] == "safe-meta"
 
 
-def test_qwen_training_metadata_skips_symlinked_result_dir_without_target_write(tmp_path):
+def test_qwen_training_metadata_rejects_symlinked_result_dir_without_target_write(tmp_path):
     if api.QwenTrainingConfig is None or api.QwenTrainingResult is None:
         pytest.skip("Qwen training dependencies are not importable in this environment")
 
@@ -729,13 +813,13 @@ def test_qwen_training_metadata_skips_symlinked_result_dir_without_target_write(
         epochs_ran=1,
     )
 
-    metadata = api._persist_qwen_run_metadata(result_path, config, result)
+    with pytest.raises(api.QwenTrainingError, match="qwen_run_metadata_write_failed"):
+        api._persist_qwen_run_metadata(result_path, config, result)
 
-    assert metadata["id"] == "linked-run"
     assert not (outside_run / api.QWEN_METADATA_FILENAME).exists()
 
 
-def test_qwen_training_metadata_skips_symlinked_result_parent_without_target_write(tmp_path):
+def test_qwen_training_metadata_rejects_symlinked_result_parent_without_target_write(tmp_path):
     if api.QwenTrainingConfig is None or api.QwenTrainingResult is None:
         pytest.skip("Qwen training dependencies are not importable in this environment")
 
@@ -760,10 +844,36 @@ def test_qwen_training_metadata_skips_symlinked_result_parent_without_target_wri
         epochs_ran=1,
     )
 
-    metadata = api._persist_qwen_run_metadata(result_path, config, result)
+    with pytest.raises(api.QwenTrainingError, match="qwen_run_metadata_write_failed"):
+        api._persist_qwen_run_metadata(result_path, config, result)
 
-    assert metadata["id"] == "linked-parent-run"
     assert list(outside_run.iterdir()) == []
+
+
+def test_qwen_training_metadata_fails_when_metadata_path_is_directory(tmp_path):
+    if api.QwenTrainingConfig is None or api.QwenTrainingResult is None:
+        pytest.skip("Qwen training dependencies are not importable in this environment")
+
+    result_path = tmp_path / "run"
+    result_path.mkdir()
+    (result_path / api.QWEN_METADATA_FILENAME).mkdir()
+    config = api.QwenTrainingConfig(
+        dataset_root=str(tmp_path / "dataset"),
+        result_path=str(result_path),
+        model_id="Qwen/Qwen3-VL-4B-Instruct",
+        run_name="metadata-dir",
+    )
+    result = api.QwenTrainingResult(
+        config=config,
+        checkpoints=[str(result_path / "latest")],
+        latest_checkpoint=str(result_path / "latest"),
+        epochs_ran=1,
+    )
+
+    with pytest.raises(api.QwenTrainingError, match="qwen_run_metadata_write_failed"):
+        api._persist_qwen_run_metadata(result_path, config, result)
+
+    assert (result_path / api.QWEN_METADATA_FILENAME).is_dir()
 
 
 def test_qwen_model_registry_skips_transformers_runs_without_adapter_artifacts(tmp_path, monkeypatch):
@@ -903,6 +1013,25 @@ def test_qwen_settings_excludes_language_only_mlx_repack_options():
     assert bad_model_id not in {entry["id"] for entry in settings.mlx_models}
 
 
+def test_qwen_settings_excludes_blocked_heretic_candidate():
+    model_id = "Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit"
+
+    settings = api.qwen_settings()
+
+    assert model_id not in {entry["id"] for entry in settings.mlx_models}
+
+
+def test_qwen_settings_includes_working_qwen36_candidate():
+    model_id = "vanch007/Huihui-Qwen3.6-35B-A3B-abliterated-mlx-4bit"
+
+    settings = api.qwen_settings()
+    by_id = {entry["id"]: entry for entry in settings.mlx_models}
+
+    assert model_id in by_id
+    assert by_id[model_id]["vision_inference_supported"] is True
+    assert by_id[model_id]["training_supported"] is False
+
+
 def test_qwen_settings_mlx_options_include_cache_availability():
     settings = api.qwen_settings()
 
@@ -1038,6 +1167,27 @@ def test_qwen_activation_rejects_language_only_mlx_repack():
     assert "qwen_mlx_incompatible_checkpoint" in str(excinfo.value.detail)
 
 
+def test_qwen_mlx_runtime_rejects_blocked_heretic_candidate(monkeypatch):
+    model_id = "Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit"
+    load_called = False
+
+    def fake_load(*_args, **_kwargs):
+        nonlocal load_called
+        load_called = True
+        return object(), object()
+
+    monkeypatch.setattr(api, "MLX_VLM_LOAD", fake_load)
+    monkeypatch.setattr(api, "MLX_VLM_GENERATE", lambda *_args, **_kwargs: "")
+
+    with pytest.raises(api.HTTPException) as excinfo:
+        api._load_qwen_mlx_runtime(model_id)
+
+    assert excinfo.value.status_code == 400
+    assert "qwen_mlx_incompatible_checkpoint" in str(excinfo.value.detail)
+    assert "generated invalid text" in str(excinfo.value.detail)
+    assert load_called is False
+
+
 def test_qwen_mlx_model_id_resolution_maps_hf_to_quantized_default():
     assert (
         api._effective_qwen_model_id_for_platform(
@@ -1050,6 +1200,11 @@ def test_qwen_mlx_model_id_resolution_maps_hf_to_quantized_default():
 
 def test_qwen_mlx_model_id_resolution_keeps_explicit_abliterated_mlx_id():
     model_id = "EZCon/Huihui-Qwen3-VL-2B-Instruct-abliterated-4bit-mlx"
+    assert api._effective_qwen_model_id_for_platform(model_id, api.QWEN_PLATFORM_MLX) == model_id
+
+
+def test_qwen_mlx_model_id_resolution_keeps_explicit_heretic_mlx_id():
+    model_id = "Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit"
     assert api._effective_qwen_model_id_for_platform(model_id, api.QWEN_PLATFORM_MLX) == model_id
 
 

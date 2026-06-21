@@ -16,21 +16,10 @@
     const THEME_CLICK_DELAY_MS = 320;
     const QWEN_CAPTION_REGION_PULSE_MS = 1200;
     const SAM3_TEXT_WINDOW_PULSE_MS = 950;
-    const TOP_TAB_BASE_METRICS = Object.freeze({
-        fontSize: 12,
-        paddingX: 14,
-        paddingY: 6,
-        gap: 6,
-        minHeight: 30,
-        themeMinWidth: 96,
-    });
     let themeToggleButton = null;
     let themeToggleClickTimer = null;
     let previousClassicThemeMode = THEME_LIGHT;
     let pipboyAccentMode = PIPBOY_GREEN;
-    let adaptiveTopTabsRaf = 0;
-    let adaptiveTopTabsResizeObserver = null;
-    let adaptiveTopTabsMutationObserver = null;
 
     function normalizeThemeMode(value) {
         if (value === THEME_DARK || value === THEME_PIPBOY) {
@@ -129,82 +118,6 @@
         return THEME_LIGHT;
     }
 
-    function setAdaptiveTopTabsScale(bar, scale) {
-        const nextScale = Number.isFinite(scale) ? Math.max(0.08, Math.min(1, scale)) : 1;
-        const metrics = TOP_TAB_BASE_METRICS;
-        bar.style.setProperty("--top-tab-font-size", `${Math.max(1, metrics.fontSize * nextScale).toFixed(2)}px`);
-        bar.style.setProperty("--top-tab-padding-x", `${Math.max(1, metrics.paddingX * nextScale).toFixed(2)}px`);
-        bar.style.setProperty("--top-tab-padding-y", `${Math.max(1, metrics.paddingY * nextScale).toFixed(2)}px`);
-        bar.style.setProperty("--top-tab-gap", `${Math.max(1, metrics.gap * nextScale).toFixed(2)}px`);
-        bar.style.setProperty("--top-tab-min-height", `${Math.max(14, metrics.minHeight * nextScale).toFixed(2)}px`);
-        bar.style.setProperty("--top-theme-min-width", `${Math.max(0, metrics.themeMinWidth * nextScale).toFixed(2)}px`);
-    }
-
-    function measureAdaptiveTopTabsWidth(bar) {
-        const children = Array.from(bar.children).filter((element) => element && element.nodeType === 1);
-        if (!children.length) {
-            return 0;
-        }
-        const style = window.getComputedStyle(bar);
-        const gap = parseFloat(style.columnGap || style.gap) || 0;
-        const childWidth = children.reduce((total, element) => total + element.getBoundingClientRect().width, 0);
-        return childWidth + gap * Math.max(0, children.length - 1);
-    }
-
-    function updateAdaptiveTopTabs() {
-        adaptiveTopTabsRaf = 0;
-        const bar = document.querySelector(".tab-bar");
-        if (!bar) {
-            return;
-        }
-        setAdaptiveTopTabsScale(bar, 1);
-        const style = window.getComputedStyle(bar);
-        const paddingX = (parseFloat(style.paddingLeft) || 0) + (parseFloat(style.paddingRight) || 0);
-        const availableWidth = Math.max(1, bar.clientWidth - paddingX - 1);
-        const naturalWidth = measureAdaptiveTopTabsWidth(bar);
-        if (!naturalWidth || naturalWidth <= availableWidth) {
-            return;
-        }
-        let scale = availableWidth / naturalWidth;
-        setAdaptiveTopTabsScale(bar, scale);
-        const scaledWidth = measureAdaptiveTopTabsWidth(bar);
-        if (scaledWidth > availableWidth) {
-            scale *= (availableWidth / scaledWidth) * 0.995;
-            setAdaptiveTopTabsScale(bar, scale);
-        }
-    }
-
-    function scheduleAdaptiveTopTabsUpdate() {
-        if (adaptiveTopTabsRaf) {
-            return;
-        }
-        adaptiveTopTabsRaf = window.requestAnimationFrame(updateAdaptiveTopTabs);
-    }
-
-    function initializeAdaptiveTopTabs() {
-        const bar = document.querySelector(".tab-bar");
-        if (!bar) {
-            return;
-        }
-        if (!adaptiveTopTabsResizeObserver && "ResizeObserver" in window) {
-            adaptiveTopTabsResizeObserver = new ResizeObserver(scheduleAdaptiveTopTabsUpdate);
-            adaptiveTopTabsResizeObserver.observe(bar);
-        }
-        if (!adaptiveTopTabsMutationObserver && "MutationObserver" in window) {
-            adaptiveTopTabsMutationObserver = new MutationObserver(scheduleAdaptiveTopTabsUpdate);
-            adaptiveTopTabsMutationObserver.observe(bar, {
-                childList: true,
-                characterData: true,
-                subtree: true,
-            });
-        }
-        window.addEventListener("resize", scheduleAdaptiveTopTabsUpdate, { passive: true });
-        if (document.fonts?.ready) {
-            document.fonts.ready.then(scheduleAdaptiveTopTabsUpdate).catch(() => {});
-        }
-        scheduleAdaptiveTopTabsUpdate();
-    }
-
     function updateThemeToggleButton(mode) {
         if (!themeToggleButton) {
             return;
@@ -215,14 +128,12 @@
             themeToggleButton.textContent = `Pip ${labelAccent}`;
             themeToggleButton.setAttribute("aria-pressed", "true");
             themeToggleButton.title = `Switch Pip-Boy color to ${nextAccent}; double-click to exit Pip-Boy`;
-            scheduleAdaptiveTopTabsUpdate();
             return;
         }
         const enabled = mode === THEME_DARK;
         themeToggleButton.textContent = enabled ? "Light" : "Dark";
         themeToggleButton.setAttribute("aria-pressed", enabled ? "true" : "false");
         themeToggleButton.title = enabled ? "Switch to light mode" : "Switch to dark mode";
-        scheduleAdaptiveTopTabsUpdate();
     }
 
     function setPipboyAccent(accent, options = {}) {
@@ -1137,12 +1048,317 @@
         await loadRfDetrRunList(false);
     }
 
-    function initHelpTooltips() {
-        document.querySelectorAll(".help-icon[title]").forEach((el) => {
-            const title = el.getAttribute("title");
-            if (!title) return;
-            el.dataset.tooltip = title;
-            el.removeAttribute("title");
+    const CONTROL_TOOLTIP_OVERRIDES = Object.freeze({
+        cropImages: "Export object crops from the currently loaded labels.",
+        imageSearch: "Filter the image list by filename.",
+        imageList: "Select the active image or multi-select images for batch operations.",
+        saveBboxes: "Export the current annotations as YOLO labels, captions, and labelmap files.",
+        annotationTakeoverBtn: "Take over the active dataset edit lock when you intentionally want this browser to become the writer.",
+        annotationSaveNowBtn: "Write current annotation edits to the active dataset immediately.",
+        annotationReloadBtn: "Reload the active dataset manifest and annotation state from the backend.",
+        annotationCloseBtn: "Close the active backend dataset and return to local-file labeling mode.",
+        polygonDrawToggle: "Toggle polygon drawing in segmentation mode without changing the selected class.",
+        classList: "Choose the active class for new annotations and class reassignment.",
+        detectorRunButton: "Run the selected detector on the current image using the configured mode.",
+        detectorBatchRunButton: "Run the selected detector over the next batch of images.",
+        detectorBatchStopButton: "Stop the active detector batch job.",
+        detectorBatchAllButton: "Run the selected detector over all loaded images.",
+        qwenRunButton: "Ask the selected Qwen model to propose detections for the current image.",
+        qwenCaptionRunButton: "Generate or refresh the caption for the current image.",
+        qwenCaptionCancelButton: "Cancel the active Qwen captioning job.",
+        qwenCaptionBatchRun: "Generate captions for the next batch of images.",
+        qwenCaptionBatchRunAll: "Generate captions for all loaded images.",
+        qwenCaptionBatchCancel: "Cancel the active caption batch job.",
+        qwenCaptionDownloadJsonl: "Download generated captions as Qwen-ready JSONL.",
+        qwenCaptionGlossary: "Edit the caption glossary that maps label names to broad visual meanings.",
+        qwenCaptionPromptUser: "Edit the user request layer used by the active caption recipe.",
+        qwenCaptionSystemPrompt: "Edit the system prompt layer for captioning calls.",
+        qwenCaptionPromptContext: "Edit the context prompt layer that describes dataset and label semantics.",
+        qwenCaptionPromptWindow: "Edit the prompt layer used for local crop/window captioning.",
+        qwenCaptionPromptDraftRefine: "Edit the prompt layer used to refine draft captions.",
+        qwenCaptionPromptMerge: "Edit the prompt layer used to merge crop and full-image observations.",
+        qwenCaptionPromptCleanup: "Edit the prompt layer used to clean up final caption wording.",
+        sam3RunButton: "Run SAM3 text prompting for the current image.",
+        sam3TextCascadeRun: "Run the configured SAM3 text-prompt cascade.",
+        sam3TextCascadeStop: "Stop the active SAM3 cascade job.",
+        sam3BatchRunButton: "Run the selected SAM3 mode over the configured image batch.",
+        sam3BatchStopButton: "Stop the active SAM3 batch job.",
+        shortcutResetAll: "Restore all keyboard shortcuts to their default bindings.",
+        shortcutExportConfig: "Download this browser's shortcut map as JSON.",
+        shortcutImportConfigButton: "Load a previously exported shortcut JSON file.",
+        shortcutImportConfig: "Choose a shortcut JSON file to import.",
+        dataIngestionProfileDownload: "Download the selected reference profile archive.",
+        dataIngestionProfileUploadButton: "Upload a previously saved reference profile archive.",
+        dataIngestionBuildProfileButton: "Build a reference profile from the selected accepted dataset.",
+        dataIngestionRefreshButton: "Refresh backend datasets and available reference profiles.",
+        dataIngestionAnalyzeButton: "Score the selected candidate images and video frames against the reference profile.",
+        dataIngestionCancelButton: "Cancel the active data-ingestion job.",
+        dataIngestionDistributionButton: "Show the distribution map for the latest candidate analysis.",
+        dataIngestionOpenDatasetAnalysisButton: "Jump to Class Split dataset analysis for the active reference dataset.",
+        dataIngestionPreviewAcceptedButton: "Preview the currently accepted candidate output set.",
+        dataIngestionDownloadAcceptedButton: "Download the accepted ingestion output as a ZIP archive.",
+        classSplitRunButton: "Run the embedding cluster audit for the selected scope.",
+        classSplitCancelButton: "Cancel the active class-split analysis job.",
+        classSplitRerunButton: "Repeat the class-split analysis with the current settings.",
+        classSplitBulkClass: "Choose the class assigned when applying a lasso-selected bulk change.",
+        classSplitBulkApply: "Apply the selected class to all lasso-selected graph objects.",
+        classSplitBulkClear: "Clear the current lasso/bulk graph selection.",
+        classSplitClusterRun: "Compute subclass cluster proposals for the current class-focused graph.",
+        classSplitQwenReviewGlossaryReset: "Reset the Qwen review glossary editor from the current labelmap defaults.",
+        classSplitQwenReviewGlossarySave: "Save the edited Qwen review glossary for reuse.",
+        classSplitWrongDiscardFirst: "Skip the configured number of likely-wrong vignettes from the front of the review queue.",
+        classSplitWrongShuffle: "Show a different random page of likely-wrong vignettes.",
+        classSplitMobilePush: "Create or refresh a mobile review session for the current likely-wrong queue.",
+        classSplitMobileSync: "Sync mobile review decisions back into the current browser workspace.",
+        classSplitQwenReviewRefresh: "Refresh the list of local VLM reviewer models.",
+        classSplitDatasetAnalysisRun: "Run dataset-level value scoring after all-class class-split analysis is available.",
+        qwenAgentRecipeImportFile: "Choose a Detection Recipe ZIP archive to import.",
+        datasetUploadCurrentBtn: "Upload the currently open Label Images workspace as a backend-managed dataset.",
+        datasetUploadBtn: "Upload the selected dataset ZIP as a backend-managed dataset.",
+        datasetListRefresh: "Refresh the backend dataset list.",
+        datasetPathOpenBtn: "Open the local dataset path in Label Images without copying it into backend storage.",
+        datasetPathSaveBtn: "Save changes to this local-path dataset entry.",
+        datasetPathRegisterBtn: "Register the local path as a reusable dataset entry.",
+        datasetPathAnnotateBtn: "Open the registered dataset path in the annotation workspace.",
+        datasetListRefreshTop: "Refresh active, deleted, and staged dataset lists.",
+        datasetUploadSessionsRefresh: "Refresh resumable or cancellable staged upload sessions.",
+        datasetTrashRefresh: "Refresh deleted datasets that can be restored or permanently removed.",
+        datasetGlossaryRefresh: "Refresh glossary data for the selected dataset.",
+        datasetGlossaryLoad: "Load the selected dataset glossary into the editor.",
+        datasetGlossarySave: "Save glossary edits back to the selected dataset.",
+        datasetGlossarySaveAs: "Save the edited glossary under a reusable library name.",
+        glossaryLibraryRefresh: "Refresh saved glossary library entries.",
+        glossaryLibraryNew: "Start a new empty glossary library entry.",
+        glossaryLibrarySave: "Save the current glossary library entry.",
+        glossaryLibraryDelete: "Delete the selected glossary library entry.",
+        trainDatasetSelect: "Choose the backend YOLO-format dataset used for class-predictor training.",
+        trainDatasetRefresh: "Refresh cached datasets available to the class-predictor trainer.",
+        trainUploadCurrentDatasetBtn: "Upload the currently open annotation workspace before training a class predictor.",
+        trainOpenDatasetManagerBtn: "Open Dataset Management to inspect, upload, or clean training datasets.",
+        trainMlpHiddenSizesAuto: "Fill a recommended MLP hidden-layer shape for the current setup.",
+        startTrainingBtn: "Start class-predictor training with the current dataset and model settings.",
+        cancelTrainingBtn: "Cancel the active class-predictor training job.",
+        trainClassifierManageSelect: "Choose a saved class-predictor artifact to inspect or manage.",
+        qwenDatasetSelect: "Choose the dataset used to build Qwen training examples.",
+        qwenDatasetRefresh: "Refresh datasets available for Qwen training.",
+        qwenTrainStartBtn: "Start the Qwen fine-tuning job with the current dataset and LoRA settings.",
+        qwenTrainCancelBtn: "Cancel the active Qwen training job.",
+        qwenSampleBtn: "Generate a sample from the selected Qwen training run for inspection.",
+        qwenTrainChartSmoothing: "Smooth the displayed Qwen training curves without changing training data.",
+        sam3DatasetSelect: "Choose the dataset used for SAM3 training.",
+        sam3DatasetRefresh: "Refresh datasets available for SAM3 training.",
+        sam3DatasetConvert: "Convert the selected dataset into SAM3 training format.",
+        sam3CachePurge: "Clear generated SAM3 cache artifacts for the selected dataset/run.",
+        sam3StartBtn: "Start SAM3 training with the current dataset and schedule settings.",
+        sam3CancelBtn: "Cancel the active SAM3 training job.",
+        sam3ActivateBtn: "Activate the selected SAM3 trained model for annotation workflows.",
+        sam3StorageRefresh: "Refresh SAM3 training runs and storage state.",
+        sam3TrendSmooth: "Smooth the displayed SAM3 training trend chart without changing training data.",
+        yoloDatasetSelect: "Choose the dataset used for YOLO training.",
+        yoloDatasetRefresh: "Refresh datasets available for YOLO training.",
+        yoloTrainStartBtn: "Start YOLO training with the current dataset, model, and augmentation settings.",
+        yoloTrainCancelBtn: "Cancel the active YOLO training job.",
+        yoloTrainRefreshBtn: "Refresh YOLO training job status.",
+        yoloRunsRefresh: "Refresh saved YOLO runs.",
+        yoloRunActivate: "Activate the selected YOLO run for detector inference.",
+        yoloRunDownload: "Download the selected YOLO run artifacts.",
+        yoloRunDelete: "Delete the selected YOLO run after confirmation.",
+        yoloHeadGraftBaseRefresh: "Refresh available YOLO base runs for head grafting.",
+        rfdetrDatasetSelect: "Choose the dataset used for RF-DETR training.",
+        rfdetrDatasetRefresh: "Refresh datasets available for RF-DETR training.",
+        rfdetrTrainStartBtn: "Start RF-DETR training with the current dataset and model settings.",
+        rfdetrTrainCancelBtn: "Cancel the active RF-DETR training job.",
+        rfdetrTrainRefreshBtn: "Refresh RF-DETR training job status.",
+        rfdetrRunsRefresh: "Refresh saved RF-DETR runs.",
+        rfdetrRunActivate: "Activate the selected RF-DETR run for detector inference.",
+        rfdetrRunDownload: "Download the selected RF-DETR run artifacts.",
+        rfdetrRunDelete: "Delete the selected RF-DETR run after confirmation.",
+        detectorDefaultSave: "Set the selected detector as the default for annotation inference.",
+        detectorDefaultRefresh: "Refresh detector availability and active detector status.",
+        detectorYoloRunRefresh: "Refresh saved YOLO detector runs.",
+        detectorYoloRunActivate: "Activate the selected YOLO run for detector inference.",
+        detectorYoloRunDownload: "Download the selected YOLO detector run.",
+        detectorYoloRunDelete: "Delete the selected YOLO detector run after confirmation.",
+        detectorRfDetrRunRefresh: "Refresh saved RF-DETR detector runs.",
+        detectorRfDetrRunActivate: "Activate the selected RF-DETR run for detector inference.",
+        detectorRfDetrRunDownload: "Download the selected RF-DETR detector run.",
+        detectorRfDetrRunDelete: "Delete the selected RF-DETR detector run after confirmation.",
+        activeClassifierRefresh: "Refresh saved class-predictor artifacts.",
+        activeClassifierUse: "Use the selected class predictor for annotation and auto-class workflows.",
+        activeClassifierDownload: "Download the selected class-predictor artifact bundle.",
+        activeClassifierRename: "Rename the selected class-predictor artifact.",
+        activeClassifierDelete: "Delete the selected class-predictor artifact after confirmation.",
+        activeClassifierBrowse: "Upload a class-predictor pickle artifact from disk.",
+        activeClassifierUpload: "Choose a class-predictor pickle artifact to upload.",
+        activeLabelmapUpload: "Choose a labelmap file to upload for the active class predictor.",
+        qwenModelRefreshBtn: "Refresh local and downloadable Qwen model entries.",
+        sam3PromptRefresh: "Refresh available SAM/SAM3 predictor models.",
+        sam3PromptActivate: "Activate the selected SAM/SAM3 predictor model.",
+        settingsApply: "Apply the backend API base URL for this browser.",
+        settingsTest: "Test the configured backend API connection.",
+        runInstallCheck: "Run the backend installation and environment check.",
+        runBackendFuzzer: "Run backend endpoint fuzz checks against the configured API.",
+    });
+    const CONTROL_FIELD_LABEL_SELECTOR = [
+        ".training-field",
+        ".sam3-text-field",
+        ".data-ingestion-field",
+        ".class-split-field",
+        ".class-split-cluster-controls__field",
+        ".qwen-caption-row",
+        ".shortcut-settings-row",
+    ].join(", ");
+    let uiTooltipRefreshFrame = null;
+    let uiTooltipMutationObserver = null;
+    const uiTooltipRefreshRoots = new Set();
+
+    function tooltipElements(root, selector) {
+        if (!root) return [];
+        const elements = [];
+        if (root.nodeType === 1 && typeof root.matches === "function" && root.matches(selector)) {
+            elements.push(root);
+        }
+        if (typeof root.querySelectorAll === "function") {
+            root.querySelectorAll(selector).forEach((el) => elements.push(el));
+        }
+        return elements;
+    }
+
+    function initHelpTooltips(root = document) {
+        tooltipElements(root, ".help-icon").forEach((el) => {
+            const tooltip = String(el.getAttribute("title") || el.dataset.tooltip || "").trim();
+            if (!tooltip) return;
+            el.dataset.tooltip = tooltip;
+            if (el.hasAttribute("title")) {
+                el.removeAttribute("title");
+            }
+            if (!el.hasAttribute("tabindex")) {
+                el.tabIndex = 0;
+            }
+            if (!el.hasAttribute("aria-label")) {
+                el.setAttribute("aria-label", `Help: ${tooltip}`);
+            }
+        });
+    }
+
+    function cssEscapeIdentifier(value) {
+        const raw = String(value || "");
+        if (typeof CSS !== "undefined" && typeof CSS.escape === "function") {
+            return CSS.escape(raw);
+        }
+        return raw.replace(/[^A-Za-z0-9_-]/g, "\\$&");
+    }
+
+    function normalizeTooltipLabelText(text) {
+        return String(text || "").replace(/\?/g, " ").replace(/\s+/g, " ").trim();
+    }
+
+    function labelTextFromElement(label) {
+        return normalizeTooltipLabelText(label?.textContent || "");
+    }
+
+    function associatedControlLabelText(el) {
+        if (!el) return "";
+        const id = el.id ? String(el.id) : "";
+        if (id) {
+            const label = document.querySelector(`label[for="${cssEscapeIdentifier(id)}"]`);
+            const text = labelTextFromElement(label);
+            if (text) return text;
+        }
+        const wrappingLabel = el.closest ? el.closest("label") : null;
+        const wrappedText = labelTextFromElement(wrappingLabel);
+        if (wrappedText) return wrappedText;
+        const field = el.closest ? el.closest(CONTROL_FIELD_LABEL_SELECTOR) : null;
+        const fieldLabel = field ? Array.from(field.children || []).find((child) => child?.tagName?.toLowerCase() === "label") : null;
+        const fieldLabelText = labelTextFromElement(fieldLabel || field?.querySelector?.("label"));
+        if (fieldLabelText) return fieldLabelText;
+        const details = el.closest ? el.closest("details") : null;
+        const summaryText = normalizeTooltipLabelText(details?.querySelector("summary")?.textContent || "");
+        return summaryText;
+    }
+
+    function deriveControlTooltip(el) {
+        if (!el) return "";
+        const tag = String(el.tagName || "").toLowerCase();
+        const explicit = CONTROL_TOOLTIP_OVERRIDES[el.id || ""];
+        if (explicit) return explicit;
+        if (tag === "button") {
+            const text = String(el.textContent || "").replace(/\s+/g, " ").trim();
+            const lower = text.toLowerCase();
+            if (lower === "refresh") return "Refresh this list or status panel.";
+            if (lower === "activate") return "Activate the selected item for the relevant workflow.";
+            if (lower === "download") return "Download the selected item.";
+            if (lower === "delete") return "Delete the selected item after confirmation.";
+            if (lower === "cancel") return "Cancel the active job or close this dialog.";
+            return text ? `${text}.` : "";
+        }
+        const label = associatedControlLabelText(el);
+        if (!label) return "";
+        if (tag === "select") return `Choose ${label}.`;
+        if (tag === "textarea") return `Edit ${label}.`;
+        return `Set ${label}.`;
+    }
+
+    function initControlTooltips(root = document) {
+        tooltipElements(root, "button, input, select, textarea").forEach((el) => {
+            const inputType = String(el.getAttribute("type") || "").toLowerCase();
+            if (inputType === "hidden") return;
+            const existingTitle = String(el.getAttribute("title") || "").trim();
+            const tooltip = existingTitle || String(deriveControlTooltip(el) || "").trim();
+            if (!tooltip) return;
+            if (!existingTitle) {
+                el.setAttribute("title", tooltip);
+            }
+            if (!el.hasAttribute("aria-label") && !associatedControlLabelText(el) && String(el.textContent || "").trim() === "") {
+                el.setAttribute("aria-label", tooltip);
+            }
+        });
+    }
+
+    function refreshUiTooltips(root = document) {
+        initHelpTooltips(root);
+        initControlTooltips(root);
+    }
+
+    function scheduleUiTooltipRefresh(root = document) {
+        if (root) {
+            uiTooltipRefreshRoots.add(root);
+        }
+        if (uiTooltipRefreshFrame !== null) {
+            return;
+        }
+        uiTooltipRefreshFrame = window.requestAnimationFrame(() => {
+            uiTooltipRefreshFrame = null;
+            const roots = uiTooltipRefreshRoots.size ? Array.from(uiTooltipRefreshRoots) : [document];
+            uiTooltipRefreshRoots.clear();
+            roots.forEach((scope) => {
+                if (!scope) return;
+                refreshUiTooltips(scope);
+            });
+        });
+    }
+
+    function initializeUiTooltipObserver() {
+        if (uiTooltipMutationObserver || !document.body || !("MutationObserver" in window)) {
+            return;
+        }
+        uiTooltipMutationObserver = new MutationObserver((mutations) => {
+            mutations.forEach((mutation) => {
+                Array.from(mutation.addedNodes || []).forEach((node) => {
+                    if (node && node.nodeType === 1) {
+                        scheduleUiTooltipRefresh(node);
+                    }
+                });
+            });
+        });
+        uiTooltipMutationObserver.observe(document.body, { childList: true, subtree: true });
+    }
+
+    function preventUiOnlyFormSubmits() {
+        document.querySelectorAll("form").forEach((form) => {
+            form.addEventListener("submit", (event) => {
+                event.preventDefault();
+            });
         });
     }
 
@@ -2410,7 +2626,6 @@ const AUTOMATION_LOCKED_TABS = new Set([
         overlapClassA: null,
         overlapClassB: null,
         dragMode: null,
-        clusterOverlay: null,
         clusterSource: null,
         clusterSensitivity: null,
         clusterMaxClusters: null,
@@ -2434,6 +2649,14 @@ const AUTOMATION_LOCKED_TABS = new Set([
         mobilePush: null,
         mobileSync: null,
         mobileStatus: null,
+        qwenReviewModel: null,
+        qwenReviewRefresh: null,
+        qwenReviewStatus: null,
+        qwenReviewGlossary: null,
+        qwenReviewGuidance: null,
+        qwenReviewGlossaryReset: null,
+        qwenReviewGlossarySave: null,
+        qwenReviewContextStatus: null,
         wrongList: null,
         inspector: null,
         datasetAnalysisPanel: null,
@@ -2689,6 +2912,15 @@ const AUTOMATION_LOCKED_TABS = new Set([
         mobileReviewSessionId: "",
         mobileReviewTargetMode: "",
         mobileReviewSyncedActions: new Set(),
+        qwenReviewJobs: new Map(),
+        qwenReviewPollTimers: new Map(),
+        qwenReviewModels: [],
+        qwenReviewActiveModelId: "",
+        qwenReviewModelRefreshInFlight: false,
+        qwenReviewGlossaryLoadInFlight: false,
+        qwenReviewGlossarySaveInFlight: false,
+        qwenReviewGlossaryLoadedFor: "",
+        qwenReviewGlossaryDirty: false,
         relabelInFlight: false,
         datasetAnalysis: null,
         flashPointId: "",
@@ -2773,20 +3005,6 @@ const AUTOMATION_LOCKED_TABS = new Set([
         annotationSessionId: "",
     };
     const calibrationProgressCallbacks = new Set();
-    const DEFAULT_CAPTION_GLOSSARY_TERMS = {
-        bike: ["bike", "motorbike", "scooter", "motorcycle"],
-        boat: ["boat", "canoe", "kayak", "surfboard", "ship"],
-        building: ["building", "house", "store", "office building", "residential building", "warehouse"],
-        bus: ["bus", "coach"],
-        container: ["container", "shipping container", "truck container"],
-        digger: ["digger", "excavator", "tractor", "backhoe", "construction vehicle", "bulldozer"],
-        gastank: ["storage tank", "fuel tank", "water tank", "industrial tank", "gas tank", "silo"],
-        lightvehicle: ["small vehicle", "car", "van", "pickup truck", "personal pickup truck", "tuk-tuk", "SUV", "jeep"],
-        person: ["person", "human", "pedestrian", "individual", "cyclist", "passenger"],
-        solarpanels: ["solar panel", "solar array", "photovoltaic panel"],
-        truck: ["truck", "lorry", "commercial vehicle", "semi truck", "heavy-duty vehicle"],
-        utilitypole: ["utility pole", "power pole", "streetlight", "mast", "transmission tower", "antenna"],
-    };
     const CAPTION_PRESETS = [
         { id: "detailed", label: "Detailed scene caption", text: "Write a detailed caption describing the scene, setting, visible objects, spatial relationships, and notable details." },
         { id: "concise", label: "Concise scene caption", text: "Write a short caption (1-2 sentences) describing the scene and main objects." },
@@ -2886,6 +3104,7 @@ const AUTOMATION_LOCKED_TABS = new Set([
         timerId: null,
         pendingImage: null,
         lastSaved: new Map(),
+        lastAttempted: new Map(),
     };
 
     let settingsUiInitialized = false;
@@ -3791,6 +4010,7 @@ const sam3TrainState = {
         heartbeatTimer: null,
         saveInFlight: false,
         saveQueued: false,
+        lastFailedSnapshotSignature: "",
         loadToken: 0,
         statusMessage: "",
     };
@@ -4239,6 +4459,7 @@ const sam3TrainState = {
         annotationSourceState.dirtyRecordsByKey = new Map();
         annotationSourceState.saveInFlight = false;
         annotationSourceState.saveQueued = false;
+        annotationSourceState.lastFailedSnapshotSignature = "";
         annotationSourceState.statusMessage = "";
         updateAnnotationSourceUi();
         syncLabelingSourceControls();
@@ -4375,6 +4596,44 @@ const sam3TrainState = {
         return rows;
     }
 
+    function normalizeAnnotationLabelLines(lines) {
+        return (Array.isArray(lines) ? lines : [])
+            .map((line) => String(line || "").trim())
+            .filter(Boolean);
+    }
+
+    function getAnnotationRecordLabelLines(imageKey) {
+        if (annotationSourceState.hydratedKeys.has(imageKey)) {
+            return serializeDatasetBboxesForImage(imageKey);
+        }
+        const rawLines = annotationSourceState.rawLabelLinesByKey.get(imageKey);
+        if (Array.isArray(rawLines)) {
+            return normalizeAnnotationLabelLines(rawLines);
+        }
+        const row = annotationSourceState.imageRowsByKey.get(imageKey);
+        if (row && Array.isArray(row.label_lines)) {
+            return normalizeAnnotationLabelLines(row.label_lines);
+        }
+        return serializeDatasetBboxesForImage(imageKey);
+    }
+
+    function buildAnnotationBaselineRecord(imageKey) {
+        const row = annotationSourceState.imageRowsByKey.get(imageKey);
+        if (!row) {
+            return null;
+        }
+        const rawLines = annotationSourceState.rawLabelLinesByKey.get(imageKey);
+        const labelLines = Array.isArray(rawLines)
+            ? rawLines
+            : (Array.isArray(row.label_lines) ? row.label_lines : []);
+        return {
+            split: row.split,
+            image_relpath: row.image_relpath,
+            label_lines: normalizeAnnotationLabelLines(labelLines),
+            text_label: String(row.text_label || ""),
+        };
+    }
+
     function buildAnnotationRecord(imageKey) {
         const row = annotationSourceState.imageRowsByKey.get(imageKey);
         if (!row) {
@@ -4383,7 +4642,7 @@ const sam3TrainState = {
         return {
             split: row.split,
             image_relpath: row.image_relpath,
-            label_lines: serializeDatasetBboxesForImage(imageKey),
+            label_lines: getAnnotationRecordLabelLines(imageKey),
             text_label: String(textLabels[imageKey] || ""),
         };
     }
@@ -4407,19 +4666,16 @@ const sam3TrainState = {
             return;
         }
         const key = imageKey;
-        if (!annotationSourceState.hydratedKeys.has(key)) {
-            return;
-        }
         const record = buildAnnotationRecord(key);
         if (!record) {
             return;
         }
         const serialized = serializeAnnotationRecord(record);
-        const saved = annotationSourceState.savedSnapshotByKey.get(key);
+        let saved = annotationSourceState.savedSnapshotByKey.get(key);
         if (saved === undefined) {
-            annotationSourceState.savedSnapshotByKey.set(key, serialized);
-            annotationSourceState.dirtyRecordsByKey.delete(key);
-            return;
+            const baseline = serializeAnnotationRecord(buildAnnotationBaselineRecord(key) || record);
+            annotationSourceState.savedSnapshotByKey.set(key, baseline);
+            saved = baseline;
         }
         if (serialized !== saved) {
             annotationSourceState.dirtyRecordsByKey.set(key, record);
@@ -4499,7 +4755,7 @@ const sam3TrainState = {
         }
     }
 
-    async function flushAnnotationSnapshot({ manual = false } = {}) {
+    async function flushAnnotationSnapshot({ manual = false, background = false } = {}) {
         if (!isAnnotationDatasetModeActive()) {
             return false;
         }
@@ -4531,6 +4787,16 @@ const sam3TrainState = {
             return false;
         }
         const records = Array.from(annotationSourceState.dirtyRecordsByKey.values());
+        const dirtySignature = records
+            .map((record) => {
+                const key = annotationImageKey(record.split, record.image_relpath);
+                return `${key}\u0000${serializeAnnotationRecord(record)}`;
+            })
+            .sort()
+            .join("\u0001");
+        if (background && dirtySignature && annotationSourceState.lastFailedSnapshotSignature === dirtySignature) {
+            return false;
+        }
         const sentSnapshotByKey = new Map();
         records.forEach((record) => {
             const key = annotationImageKey(record.split, record.image_relpath);
@@ -4545,6 +4811,7 @@ const sam3TrainState = {
                 : null;
         annotationSourceState.saveInFlight = true;
         updateAnnotationSourceUi();
+        let saveSucceeded = false;
         try {
             const resp = await fetch(`${base}/snapshot`, {
                 method: "POST",
@@ -4595,9 +4862,12 @@ const sam3TrainState = {
             if (manual) {
                 setSamStatus("Annotation snapshot saved.", { variant: "success", duration: 2500 });
             }
+            annotationSourceState.lastFailedSnapshotSignature = "";
+            saveSucceeded = true;
             return true;
         } catch (error) {
             console.error("Failed to save annotation snapshot", error);
+            annotationSourceState.lastFailedSnapshotSignature = dirtySignature || annotationSourceState.lastFailedSnapshotSignature;
             if (manual) {
                 setSamStatus(`Save failed: ${error.message || error}`, {
                     variant: "error",
@@ -4607,7 +4877,8 @@ const sam3TrainState = {
             return false;
         } finally {
             const shouldFlushQueued =
-                annotationSourceState.saveQueued
+                saveSucceeded
+                && annotationSourceState.saveQueued
                 && annotationSourceState.dirtyRecordsByKey.size
                 && !annotationSourceState.readOnly
                 && !isAnnotationMutationBlocked();
@@ -4665,7 +4936,7 @@ const sam3TrainState = {
             return;
         }
         annotationSourceState.autosaveTimer = setInterval(() => {
-            flushAnnotationSnapshot({ manual: false }).catch((error) => {
+            flushAnnotationSnapshot({ manual: false, background: true }).catch((error) => {
                 console.error("Annotation autosave tick failed", error);
             });
         }, ANNOTATION_AUTOSAVE_INTERVAL_MS);
@@ -5019,16 +5290,25 @@ const sam3TrainState = {
             const rows = Array.isArray(manifest.images) ? manifest.images : [];
             rows.forEach((row, idx) => {
                 const key = annotationRowKey(row);
+                const labelLines = normalizeAnnotationLabelLines(row.label_lines);
+                const textLabel = String(row.text_label || "");
                 annotationSourceState.imageRowsByKey.set(key, {
                     split: row.split || "train",
                     image_relpath: row.image_relpath || row.image_name || "",
                     image_name: row.image_name || row.image_relpath || "",
+                    label_lines: [...labelLines],
+                    text_label: textLabel,
                 });
                 annotationSourceState.rawLabelLinesByKey.set(
                     key,
-                    Array.isArray(row.label_lines)
-                        ? row.label_lines.map((line) => String(line || "").trim()).filter(Boolean)
-                        : []
+                    [...labelLines]
+                );
+                annotationSourceState.savedSnapshotByKey.set(
+                    key,
+                    serializeAnnotationRecord({
+                        label_lines: labelLines,
+                        text_label: textLabel,
+                    })
                 );
                 images[key] = {
                     meta: {
@@ -5047,7 +5327,7 @@ const sam3TrainState = {
                     displayName: row.image_name || row.image_relpath || key,
                 };
                 bboxes[key] = {};
-                textLabels[key] = String(row.text_label || "");
+                textLabels[key] = textLabel;
                 const option = document.createElement("option");
                 option.value = key;
                 option.text = `${row.split || "train"}/${row.image_relpath || row.image_name || key}`;
@@ -9399,6 +9679,7 @@ function updateRfDetrTrainStartAvailability(entry) {
                 viewBtn.type = "button";
                 viewBtn.className = "training-button";
                 viewBtn.textContent = "View";
+                viewBtn.title = "Show this head-graft job's status, logs, and result metadata.";
                 viewBtn.addEventListener("click", () => {
                     yoloHeadGraftState.activeJobId = job.job_id;
                     pollYoloHeadGraftJob(job.job_id, { force: true }).catch((err) => console.error("Head graft poll failed", err));
@@ -9409,6 +9690,7 @@ function updateRfDetrTrainStartAvailability(entry) {
                     downloadBtn.type = "button";
                     downloadBtn.className = "training-button secondary";
                     downloadBtn.textContent = "Download bundle";
+                    downloadBtn.title = "Download the completed head-graft bundle.";
                     downloadBtn.addEventListener("click", () => {
                         downloadYoloHeadGraftBundle(job).catch((err) => console.error("Head graft bundle download failed", err));
                     });
@@ -9724,13 +10006,25 @@ function updateAutomationLockTabs() {
         const tabKey = button.getAttribute("data-tab");
         const shouldLock = automationLockState.active && AUTOMATION_LOCKED_TABS.has(tabKey || "");
         if (shouldLock) {
+            if (!button.dataset.automationUnlockedTitle) {
+                button.dataset.automationUnlockedTitle = button.getAttribute("title") || "";
+            }
             button.classList.add("tab-button--locked");
             button.disabled = true;
             button.title = "Unavailable while training, prepass encoding, or calibration is running.";
         } else {
             button.classList.remove("tab-button--locked");
             button.disabled = false;
-            button.title = "";
+            if (Object.prototype.hasOwnProperty.call(button.dataset, "automationUnlockedTitle")) {
+                const restoredTitle = button.dataset.automationUnlockedTitle || "";
+                if (restoredTitle) {
+                    button.title = restoredTitle;
+                } else {
+                    button.removeAttribute("title");
+                    refreshUiTooltips(button);
+                }
+                delete button.dataset.automationUnlockedTitle;
+            }
         }
     });
     const panels = document.querySelectorAll(".tab-panel[data-tab-panel]");
@@ -10672,7 +10966,8 @@ function ensureAutomationAvailable(actionLabel) {
                 activeElements.clipSelect.title = "Disabled for non-CLIP classifiers.";
             } else {
                 activeElements.clipSelect.disabled = false;
-                activeElements.clipSelect.title = "";
+                activeElements.clipSelect.removeAttribute("title");
+                refreshUiTooltips(activeElements.clipSelect);
                 if (entry.clip_model) {
                     activeElements.clipSelect.value = entry.clip_model;
                 }
@@ -10866,6 +11161,7 @@ function renderTrainingHistoryItem(container, job) {
     const viewBtn = document.createElement("button");
     viewBtn.type = "button";
     viewBtn.textContent = "View";
+    viewBtn.title = "Open this Qwen training job and refresh its status when it is still active.";
     viewBtn.addEventListener("click", () => {
         loadTrainingJob(job.job_id, { forcePoll: job.status === "running" || job.status === "queued" }).catch((error) => {
             console.error("Failed to load training job", error);
@@ -11314,14 +11610,14 @@ function getSelectedQwenTrainMode() {
 }
 
 const QWEN_VRAM_ESTIMATE_GB = {
-    official_lora: { "2B": 12.0, "4B": 20.0, "8B": 96.0, "32B": 192.0, "30B": 180.0, "235B": 800.0 },
-    trl_qlora: { "2B": 8.0, "4B": 10.0, "8B": 16.0, "32B": 48.0, "30B": 64.0, "235B": 260.0 },
+    official_lora: { "2B": 12.0, "4B": 20.0, "8B": 96.0, "32B": 192.0, "35B": 192.0, "30B": 180.0, "235B": 800.0 },
+    trl_qlora: { "2B": 8.0, "4B": 10.0, "8B": 16.0, "32B": 48.0, "35B": 56.0, "30B": 64.0, "235B": 260.0 },
 };
 const QWEN_VRAM_THINKING_SCALE = 1.08;
 const QWEN_VRAM_PIXEL_BASE = 451584;
 const QWEN_VRAM_PIXEL_SCALE_MIN = 0.6;
 const QWEN_VRAM_PIXEL_SCALE_MAX = 1.6;
-const QWEN_MLX_MEMORY_ESTIMATE_GB = { "2B": 5.5, "4B": 8.0, "8B": 14.0, "30B": 42.0, "32B": 46.0, "235B": 180.0 };
+const QWEN_MLX_MEMORY_ESTIMATE_GB = { "2B": 5.5, "4B": 8.0, "8B": 14.0, "30B": 42.0, "32B": 46.0, "35B": 32.0, "235B": 180.0 };
 function qwenTrainingFallback(id, label, metadata = {}) {
     return {
         id,
@@ -11394,7 +11690,7 @@ const QWEN_TRAINING_MODEL_FALLBACKS = [
 ];
 
 function inferQwenModelSize(modelId) {
-    const sizes = ["235B", "30B", "32B", "8B", "4B", "2B"];
+    const sizes = ["235B", "35B", "30B", "32B", "8B", "4B", "2B"];
     for (const size of sizes) {
         if (modelId.includes(size)) return size;
     }
@@ -11679,7 +11975,7 @@ function updateQwenPlatformControlState() {
     if (qwenTrainElements.accumulateInput) {
         qwenTrainElements.accumulateInput.disabled = isMlx;
         qwenTrainElements.accumulateInput.title = isMlx
-            ? "MLX-VLM 0.3.9 does not expose gradient accumulation through this backend path."
+            ? "MLX-VLM training does not expose gradient accumulation through this backend path."
             : "";
     }
     if (qwenTrainElements.loraTargetsInput) {
@@ -15965,6 +16261,7 @@ function renderQwenTrainingHistoryItem(container, job) {
     viewBtn.type = "button";
     viewBtn.className = "training-button";
     viewBtn.textContent = "View";
+    viewBtn.title = "Show this Qwen training job's status, logs, and result metadata.";
     viewBtn.addEventListener("click", () => {
         qwenTrainState.activeJobId = job.job_id;
         pollQwenTrainingJob(job.job_id, { force: true }).catch((error) => console.error("Poll Qwen job failed", error));
@@ -16197,6 +16494,7 @@ function initQwenTrainingTab() {
         viewBtn.type = "button";
         viewBtn.className = "training-button";
         viewBtn.textContent = "View";
+        viewBtn.title = "Show this YOLO training job's status, logs, and result metadata.";
         viewBtn.addEventListener("click", () => {
             yoloTrainState.activeJobId = job.job_id;
             pollYoloTrainingJob(job.job_id, { force: true }).catch((error) => console.error("Poll YOLO job failed", error));
@@ -16748,6 +17046,7 @@ async function cancelYoloTrainingJobRequest() {
         viewBtn.type = "button";
         viewBtn.className = "training-button";
         viewBtn.textContent = "View";
+        viewBtn.title = "Show this RF-DETR training job's status, logs, and result metadata.";
         viewBtn.addEventListener("click", () => {
             rfdetrTrainState.activeJobId = job.job_id;
             pollRfDetrTrainingJob(job.job_id, { force: true }).catch((error) => console.error("Poll RF-DETR job failed", error));
@@ -20532,24 +20831,30 @@ async function cancelRfDetrTrainingJobRequest() {
         qwenSettingsElements.status.className = variant ? `settings-status ${variant}` : "settings-status";
     }
 
-    function normalizeQwenMlxModelOptions(models) {
+    function normalizeQwenRuntimeModelOptions(models) {
         const items = Array.isArray(models) ? models : [];
         const seen = new Set();
         const normalized = [];
         items.forEach((entry) => {
-            const modelId = String(entry?.id || entry?.model_id || "").trim();
+            const metadata = entry?.metadata || entry || {};
+            const modelId = String(metadata.model_id || entry?.model_id || entry?.id || "").trim();
             if (!modelId || seen.has(modelId)) {
                 return;
             }
-            if (entry?.vision_inference_supported === false || entry?.inference_supported === false) {
+            if (modelId === "default" || entry?.type === "finetune") {
+                return;
+            }
+            if (metadata.vision_inference_supported === false || metadata.inference_supported === false) {
                 return;
             }
             seen.add(modelId);
             normalized.push({
-                ...entry,
+                ...metadata,
+                availability: entry?.availability || metadata.availability || entry?.availability,
                 id: modelId,
                 model_id: modelId,
-                label: entry?.label || modelId,
+                label: metadata.label || entry?.label || modelId,
+                type: entry?.type || metadata.type || "",
             });
         });
         return normalized;
@@ -20573,7 +20878,7 @@ async function cancelRfDetrTrainingJobRequest() {
     }
 
     function qwenModelOptionLabel(entry) {
-        const label = entry?.label || entry?.id || entry?.model_id || "Qwen model";
+        const label = entry?.label || entry?.id || entry?.model_id || "VLM model";
         return `${label} [${qwenModelAvailabilityLabel(entry)}]`;
     }
 
@@ -20594,10 +20899,10 @@ async function cancelRfDetrTrainingJobRequest() {
         if (!select) {
             return;
         }
-        Array.from(select.querySelectorAll('optgroup[data-runtime-platform="mlx_vlm"]')).forEach((group) => {
+        Array.from(select.querySelectorAll('optgroup[data-agent-runtime-models="true"]')).forEach((group) => {
             group.remove();
         });
-        Array.from(select.querySelectorAll('option[data-runtime-platform="mlx_vlm"]')).forEach((option) => {
+        Array.from(select.querySelectorAll('option[data-agent-runtime-model="true"]')).forEach((option) => {
             option.remove();
         });
     }
@@ -20610,8 +20915,8 @@ async function cancelRfDetrTrainingJobRequest() {
         removeGeneratedQwenMlxOptions(select);
         const existingValues = new Set(Array.from(select.options).map((option) => option.value));
         const group = document.createElement("optgroup");
-        group.label = "MLX quantized Qwen3-VL";
-        group.dataset.runtimePlatform = "mlx_vlm";
+        group.label = "Available VLM / agent models";
+        group.dataset.agentRuntimeModels = "true";
         (Array.isArray(models) ? models : []).forEach((entry) => {
             const modelId = String(entry?.id || entry?.model_id || "").trim();
             if (!modelId || existingValues.has(modelId)) {
@@ -20621,7 +20926,8 @@ async function cancelRfDetrTrainingJobRequest() {
             option.value = modelId;
             option.textContent = qwenModelOptionLabel(entry);
             option.title = qwenModelOptionTitle(entry);
-            option.dataset.runtimePlatform = "mlx_vlm";
+            option.dataset.agentRuntimeModel = "true";
+            option.dataset.runtimePlatform = entry?.runtime_platform || inferQwenRuntimePlatform(modelId);
             option.dataset.cacheState = qwenModelAvailabilityLabel(entry);
             group.appendChild(option);
             existingValues.add(modelId);
@@ -20673,7 +20979,7 @@ async function cancelRfDetrTrainingJobRequest() {
     }
 
     function populateQwenRuntimeModelSelects(models) {
-        const items = normalizeQwenMlxModelOptions(models);
+        const items = normalizeQwenRuntimeModelOptions(models);
         [
             qwenElements.captionModel,
             qwenElements.captionRefinementModel,
@@ -20686,7 +20992,7 @@ async function cancelRfDetrTrainingJobRequest() {
 
     function populateQwenMlxModelSelect(models, selectedId) {
         const select = qwenSettingsElements.mlxModel;
-        const items = normalizeQwenMlxModelOptions(models);
+        const items = normalizeQwenRuntimeModelOptions(models);
         qwenMlxModelOptions = items;
         populateQwenRuntimeModelSelects(items);
         if (!select) {
@@ -21399,20 +21705,6 @@ async function cancelRfDetrTrainingJobRequest() {
         qwenElements.calibrationReportBoundary = document.getElementById("qwenCalibrationReportBoundary");
         qwenElements.calibrationReportUncertainty = document.getElementById("qwenCalibrationReportUncertainty");
         qwenElements.calibrationReportDiagnostics = document.getElementById("qwenCalibrationReportDiagnostics");
-        qwenElements.autoLabelStatus = document.getElementById("qwenAutoLabelStatus");
-        qwenElements.autoLabelModeSummary = document.getElementById("qwenAutoLabelModeSummary");
-        qwenElements.autoLabelMaxImages = document.getElementById("qwenAutoLabelMaxImages");
-        qwenElements.autoLabelSplit = document.getElementById("qwenAutoLabelSplit");
-        qwenElements.autoLabelUnlabeledOnly = document.getElementById("qwenAutoLabelUnlabeledOnly");
-        qwenElements.autoLabelClassNames = document.getElementById("qwenAutoLabelClassNames");
-        qwenElements.autoLabelWindowMode = document.getElementById("qwenAutoLabelWindowMode");
-        qwenElements.autoLabelOverlap = document.getElementById("qwenAutoLabelOverlap");
-        qwenElements.autoLabelUsePlannerCaption = document.getElementById("qwenAutoLabelUsePlannerCaption");
-        qwenElements.autoLabelRun = document.getElementById("qwenAutoLabelRun");
-        qwenElements.autoLabelCancel = document.getElementById("qwenAutoLabelCancel");
-        qwenElements.autoLabelProgressWrap = document.getElementById("qwenAutoLabelProgressWrap");
-        qwenElements.autoLabelProgressFill = document.getElementById("qwenAutoLabelProgressFill");
-        qwenElements.autoLabelProgressText = document.getElementById("qwenAutoLabelProgressText");
         onCalibrationProgress((job) => {
             updateCalibrationProgressUi(job);
         });
@@ -21948,20 +22240,6 @@ async function cancelRfDetrTrainingJobRequest() {
             qwenElements.prepassRecipeSelect.addEventListener("change", () => {
                 loadPrepassRecipeForInference({ suppressMissingWarning: true }).catch((error) => {
                     console.error("Prepass recipe load on selection failed", error);
-                });
-            });
-        }
-        if (qwenElements.autoLabelRun) {
-            qwenElements.autoLabelRun.addEventListener("click", () => {
-                startAutoLabelJob().catch((error) => {
-                    console.error("Automatic labeling start failed", error);
-                });
-            });
-        }
-        if (qwenElements.autoLabelCancel) {
-            qwenElements.autoLabelCancel.addEventListener("click", () => {
-                cancelAutoLabelJob().catch((error) => {
-                    console.error("Automatic labeling cancel failed", error);
                 });
             });
         }
@@ -22633,12 +22911,12 @@ async function cancelRfDetrTrainingJobRequest() {
 		            const groupLabel = document.createElement("label");
 		            groupLabel.textContent = "Dedupe group";
 		            groupLabel.title =
-		                "Used for cross-class de-dupe: overlapping detections in the same group can suppress each other (e.g. car/truck/bus = vehicles).";
+		                "Used for cross-class de-dupe: overlapping detections in the same group can suppress each other when classes share a semantic family.";
 		            const groupInput = document.createElement("input");
 		            groupInput.type = "text";
-		            groupInput.placeholder = "e.g. vehicles";
+		            groupInput.placeholder = "e.g. semantic_family";
 		            groupInput.title =
-		                "Optional. Only affects cross-class de-dupe. Use different groups to prevent suppressing valid overlaps (e.g. person vs bike).";
+		                "Optional. Only affects cross-class de-dupe. Use different groups to prevent suppressing valid overlaps between unrelated classes.";
 		            groupInput.value = step.dedupe_group || "";
 		            groupInput.addEventListener("input", () => {
 		                step.dedupe_group = groupInput.value;
@@ -23273,22 +23551,22 @@ async function cancelRfDetrTrainingJobRequest() {
 	            if (sam3RecipeElements.cascadeFileInput) sam3RecipeElements.cascadeFileInput.value = "";
 	            sam3CascadeState.cascadePresetImportInFlight = false;
 	            refreshSam3CascadeControls();
-	        }
+		        }
 		    }
 
 		    async function runSam3CascadeOnImage() {
 	        if (sam3RecipeElements.status) {
-	            sam3RecipeElements.status.title = "";
+	            sam3RecipeElements.status.removeAttribute("title");
 	        } else if (sam3TextElements.status) {
-	            sam3TextElements.status.title = "";
+	            sam3TextElements.status.removeAttribute("title");
 	        }
 	        if (sam3AgentApplyActive || sam3TextRequestActive || sam3SimilarityRequestActive || sam3TextBatchActive || sam3TextCascadeActive) {
 	            setSam3RecipeStatus("SAM3 is busy; wait for the current job to finish.", "warn");
 	            return;
 	        }
-	        if (!ensureAutomationAvailable("SAM3 cascade")) {
-	            return;
-	        }
+		        if (!ensureAutomationAvailable("SAM3 cascade")) {
+		            return;
+		        }
 		        if (!currentImage) {
 		            setSam3RecipeStatus("Open an image first.", "warn");
 		            return;
@@ -23775,7 +24053,7 @@ async function cancelRfDetrTrainingJobRequest() {
         annotationDiversityMetricEl.hidden = Boolean(hidden);
         if (hidden) {
             annotationDiversityMetricEl.textContent = "";
-            annotationDiversityMetricEl.title = "";
+            annotationDiversityMetricEl.removeAttribute("title");
             annotationDiversityMetricEl.classList.remove("is-low", "is-mid", "is-high");
         }
     }
@@ -26234,7 +26512,7 @@ async function cancelRfDetrTrainingJobRequest() {
             qwenElements.imageTypeInput.placeholder = context || "Describe the image";
         }
         if (qwenElements.itemsInput && !qwenElements.itemsInput.value) {
-            qwenElements.itemsInput.placeholder = classes.length ? classes.join(", ") : "car, bus, kiosk";
+            qwenElements.itemsInput.placeholder = classes.length ? classes.join(", ") : "class_a, class_b";
         }
     }
 
@@ -26247,7 +26525,8 @@ async function cancelRfDetrTrainingJobRequest() {
             return;
         }
         const modelFamily = metadata.model_family || "qwen3";
-        const familyLabel = modelFamily !== "qwen3" ? "Legacy (read-only)" : "Qwen3";
+        const isAgentModel = Boolean(metadata.agent_model || metadata.agent_supported);
+        const familyLabel = modelFamily !== "qwen3" && !isAgentModel ? "Legacy (read-only)" : modelFamily === "qwen3" ? "Qwen3" : "Agent VLM";
         const classes = Array.isArray(metadata.classes) ? metadata.classes.join(", ") : "(not specified)";
         const context = metadata.dataset_context || "(not specified)";
         const runtimePlatform = metadata.runtime_platform || "transformers";
@@ -26301,7 +26580,8 @@ async function cancelRfDetrTrainingJobRequest() {
             const modelFamily = entry.metadata?.model_family || "qwen3";
             const runtimePlatform = entry.metadata?.runtime_platform || "";
             const quantization = entry.metadata?.quantization || "";
-            const legacyTag = modelFamily !== "qwen3" ? "Legacy (read-only)" : "";
+            const isAgentModel = Boolean(entry.metadata?.agent_model || entry.metadata?.agent_supported);
+            const legacyTag = modelFamily !== "qwen3" && !isAgentModel ? "Legacy (read-only)" : isAgentModel ? "Agent VLM" : "";
             const runtimeTag = runtimePlatform === "mlx_vlm"
                 ? `MLX ${quantization || ""}`.trim()
                 : runtimePlatform;
@@ -26337,7 +26617,7 @@ async function cancelRfDetrTrainingJobRequest() {
             const button = document.createElement("button");
             button.type = "button";
             button.className = "training-button";
-            const isLegacy = modelFamily !== "qwen3";
+            const isLegacy = modelFamily !== "qwen3" && !isAgentModel;
             if (isLegacy) {
                 card.classList.add("legacy");
             }
@@ -26384,6 +26664,7 @@ async function cancelRfDetrTrainingJobRequest() {
             }
             qwenModelState.models = data.models || [];
             qwenModelState.activeId = data.active || "default";
+            populateQwenRuntimeModelSelects(qwenModelState.models);
             if (data.progress && (data.progress.active || data.progress.run_id)) {
                 renderQwenProgressState(data.progress);
             } else if (data.memory) {
@@ -26694,10 +26975,6 @@ async function cancelRfDetrTrainingJobRequest() {
         return resp.json();
     }
 
-    function captionGlossaryLabelKey(label) {
-        return String(label || "").trim().toLowerCase().replace(/[^a-z0-9]+/g, "");
-    }
-
     function naturalizeCaptionGlossaryLabel(label) {
         return String(label || "")
             .trim()
@@ -26744,9 +27021,7 @@ async function cancelRfDetrTrainingJobRequest() {
                 return;
             }
             const natural = naturalizeCaptionGlossaryLabel(label);
-            const known = DEFAULT_CAPTION_GLOSSARY_TERMS[captionGlossaryLabelKey(label)];
-            const terms = known && known.length ? known.slice() : [natural || label];
-            mapping[label] = dedupeCaptionGlossaryTerms(terms);
+            mapping[label] = dedupeCaptionGlossaryTerms([natural || label]);
         });
         return Object.keys(mapping).length ? JSON.stringify(mapping, null, 2) : "";
     }
@@ -27056,6 +27331,7 @@ async function cancelRfDetrTrainingJobRequest() {
         textLabels = {};
         textLabelsDatasetId = key;
         captionAutoSaveState.lastSaved.clear();
+        captionAutoSaveState.lastAttempted.clear();
     }
 
     function getCaptionDatasetEntry() {
@@ -27368,7 +27644,7 @@ async function cancelRfDetrTrainingJobRequest() {
         if (!isCustom) {
             qwenElements.agentGlossary.placeholder = "Glossary preview";
         } else {
-            qwenElements.agentGlossary.placeholder = "Paste JSON: {\"light_vehicle\": [\"car\", \"sedan\"], ... }";
+            qwenElements.agentGlossary.placeholder = "Paste JSON: {\"class_name\": [\"broad visual term\", \"synonym\"], ... }";
         }
         loadQwenAgentGlossary().catch((error) => {
             console.debug("Failed to load agent glossary", error);
@@ -27938,6 +28214,12 @@ async function cancelRfDetrTrainingJobRequest() {
             return;
         }
         const trimmed = String(caption || "").trim();
+        if (captionAutoSaveState.timerId && captionAutoSaveState.pendingImage === imageName) {
+            clearTimeout(captionAutoSaveState.timerId);
+            captionAutoSaveState.timerId = null;
+            captionAutoSaveState.pendingImage = null;
+        }
+        captionAutoSaveState.lastAttempted.set(imageName, trimmed);
         try {
             const context = resolveCaptionPersistenceContext(options.datasetId || null);
             ensureCaptionLabelStoreForDataset(context.datasetId || "");
@@ -27983,6 +28265,10 @@ async function cancelRfDetrTrainingJobRequest() {
         if (lastSaved === trimmed) {
             return;
         }
+        const lastAttempted = captionAutoSaveState.lastAttempted.get(imageName);
+        if (lastAttempted === trimmed) {
+            return;
+        }
         if (captionAutoSaveState.timerId) {
             clearTimeout(captionAutoSaveState.timerId);
         }
@@ -27990,6 +28276,12 @@ async function cancelRfDetrTrainingJobRequest() {
         captionAutoSaveState.timerId = window.setTimeout(() => {
             captionAutoSaveState.timerId = null;
             captionAutoSaveState.pendingImage = null;
+            if (captionAutoSaveState.lastSaved.get(imageName) === trimmed) {
+                return;
+            }
+            if (captionAutoSaveState.lastAttempted.get(imageName) === trimmed) {
+                return;
+            }
             saveCaptionImmediate(imageName, trimmed, { datasetId }).catch((error) => {
                 console.warn("Caption autosave flush failed", error);
             });
@@ -28484,7 +28776,7 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         if (substepCurrent > 0 && substepTotal > 0) {
             const suffix = substepLabel ? ` (${substepLabel})` : "";
-            bits.push(`EDR [wip] discovery ${substepCurrent}/${substepTotal}${suffix}`);
+            bits.push(`Detection Recipe discovery ${substepCurrent}/${substepTotal}${suffix}`);
         }
         return bits.join(" • ");
     }
@@ -28541,7 +28833,7 @@ async function cancelRfDetrTrainingJobRequest() {
         qwenElements.calibrationReportStatus.textContent = message || "";
         if (!visible) {
             clearCalibrationReportUi();
-            qwenElements.calibrationReportSummary.textContent = "EDR [wip] report bundle";
+            qwenElements.calibrationReportSummary.textContent = "Detection Recipe report bundle";
         }
     }
 
@@ -28771,15 +29063,15 @@ async function cancelRfDetrTrainingJobRequest() {
 
     function renderCalibrationReportBundle(bundle) {
         if (!qwenElements.calibrationReportWrap || !bundle || typeof bundle !== "object") {
-            setCalibrationReportStatus("No EDR [wip] report bundle available yet.", { visible: false });
+            setCalibrationReportStatus("No Detection Recipe report bundle available yet.", { visible: false });
             return;
         }
         const selection = bundle.selection_summary || {};
         const overall = bundle.overall_metrics || {};
         const winner = selection.selected_policy_variant || selection.winner || selection.winner_lane || "result";
         qwenElements.calibrationReportWrap.hidden = false;
-        qwenElements.calibrationReportSummary.textContent = `EDR [wip] report bundle • ${winner} • F1 ${formatCalibrationMetric(overall.f1)}`;
-        qwenElements.calibrationReportStatus.textContent = "Loaded from completed EDR [wip] build.";
+        qwenElements.calibrationReportSummary.textContent = `Detection Recipe report bundle • ${winner} • F1 ${formatCalibrationMetric(overall.f1)}`;
+        qwenElements.calibrationReportStatus.textContent = "Loaded from completed Detection Recipe build.";
         renderCalibrationReportOverview(bundle);
         renderCalibrationPerClassTable(bundle.per_class);
         renderCalibrationPerSourceTable(bundle.per_class_per_source);
@@ -28790,10 +29082,10 @@ async function cancelRfDetrTrainingJobRequest() {
 
     async function fetchCalibrationReportBundle(jobId) {
         if (!jobId) {
-            setCalibrationReportStatus("No EDR [wip] report bundle available yet.", { visible: false });
+            setCalibrationReportStatus("No Detection Recipe report bundle available yet.", { visible: false });
             return;
         }
-        setCalibrationReportStatus("Loading EDR [wip] report bundle…", { visible: true });
+        setCalibrationReportStatus("Loading Detection Recipe report bundle…", { visible: true });
         clearCalibrationReportUi();
         try {
             const resp = await fetch(`${API_ROOT}/calibration/jobs/${encodeURIComponent(jobId)}/artifacts/report_bundle`);
@@ -28803,8 +29095,8 @@ async function cancelRfDetrTrainingJobRequest() {
             const bundle = await resp.json();
             renderCalibrationReportBundle(bundle);
         } catch (error) {
-            console.debug("EDR report bundle unavailable", error);
-            setCalibrationReportStatus("No EDR [wip] report bundle available for this build.", { visible: false });
+            console.debug("Detection Recipe report bundle unavailable", error);
+            setCalibrationReportStatus("No Detection Recipe report bundle available for this build.", { visible: false });
         }
     }
 
@@ -29932,12 +30224,12 @@ async function cancelRfDetrTrainingJobRequest() {
             return;
         }
         setCalibrationStatus("Starting…");
-        setCalibrationRecipeInfo(`EDR [wip] mode: ${String(payload.recipe_mode || "auto").replaceAll("_", " ")} • lane ${String(payload.lane_selection || "window").replaceAll("_", " ")}. Preparing EDR [wip] build…`);
-        setCalibrationReportStatus("No EDR [wip] report bundle available yet.", { visible: false });
+        setCalibrationRecipeInfo(`Detection Recipe mode: ${String(payload.recipe_mode || "auto").replaceAll("_", " ")} • lane ${String(payload.lane_selection || "window").replaceAll("_", " ")}. Preparing Detection Recipe build…`);
+        setCalibrationReportStatus("No Detection Recipe report bundle available yet.", { visible: false });
         updateCalibrationProgressUi({
             progress: 0,
             phase: "queue",
-            message: "Submitting EDR [wip] build",
+            message: "Submitting Detection Recipe build",
             processed: 0,
             total: Number.isFinite(payload.max_images) ? payload.max_images : 0,
         });
@@ -29957,19 +30249,19 @@ async function cancelRfDetrTrainingJobRequest() {
             qwenCalibrationState.jobId = job.job_id;
             qwenCalibrationState.pollRequestId += 1;
             qwenCalibrationState.pollInFlight = false;
-            qwenCalibrationState.overlay = showProgressModal("EDR [wip] build starting…");
+            qwenCalibrationState.overlay = showProgressModal("Detection Recipe build starting…");
             refreshAutomationLockStatus().catch((error) => {
                 console.debug("Automation-lock refresh failed after calibration start", error);
             });
             emitCalibrationProgress({
                 progress: 0,
                 phase: "queue",
-                message: "EDR [wip] build queued",
+                message: "Detection Recipe build queued",
                 processed: 0,
                 total: Number.isFinite(payload.max_images) ? payload.max_images : 0,
             });
             setCalibrationStatus("Running");
-            setCalibrationRecipeInfo(`EDR [wip] mode: ${String(payload.recipe_mode || "auto").replaceAll("_", " ")} • lane ${String(payload.lane_selection || "window").replaceAll("_", " ")}. Build queued.`);
+            setCalibrationRecipeInfo(`Detection Recipe mode: ${String(payload.recipe_mode || "auto").replaceAll("_", " ")} • lane ${String(payload.lane_selection || "window").replaceAll("_", " ")}. Build queued.`);
             updateCalibrationButtons();
             pollCalibrationJob().catch((error) => {
                 console.error("Calibration poll start failed", error);
@@ -29978,7 +30270,7 @@ async function cancelRfDetrTrainingJobRequest() {
             setCalibrationStatus("Error");
             emitCalibrationProgress(null);
             updateCalibrationButtons();
-            setSamStatus(`EDR [wip] build error: ${error.message || error}`, { variant: "error", duration: 5000 });
+            setSamStatus(`Detection Recipe build error: ${error.message || error}`, { variant: "error", duration: 5000 });
         } finally {
             qwenCalibrationState.startInFlight = false;
             updateCalibrationButtons();
@@ -30009,12 +30301,12 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         const recipeId = String(qwenElements.canonicalRecipeSelect?.value || "").trim();
         if (!recipeId) {
-            qwenElements.canonicalRecipeSummary.textContent = "No canonical EDR [wip] selected.";
+            qwenElements.canonicalRecipeSummary.textContent = "No canonical recipe selected.";
             return;
         }
         const item = canonicalPrepassRecipes.find((entry) => String(entry?.id || "").trim() === recipeId);
         if (!item) {
-            qwenElements.canonicalRecipeSummary.textContent = "Canonical EDR [wip] metadata unavailable.";
+            qwenElements.canonicalRecipeSummary.textContent = "Canonical recipe metadata unavailable.";
             return;
         }
         const datasetId = String(item?.dataset_id || "").trim();
@@ -30036,7 +30328,7 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         qwenElements.canonicalRecipeSummary.textContent = parts.length
             ? parts.join(" • ")
-            : "Canonical EDR [wip] selected.";
+            : "Canonical recipe selected.";
     }
 
     function applyLoadedRecipeToBuilder(data, recipeId) {
@@ -30056,19 +30348,19 @@ async function cancelRfDetrTrainingJobRequest() {
     async function loadCanonicalRecipeIntoBuilder() {
         const recipeId = String(qwenElements.canonicalRecipeSelect?.value || "").trim();
         if (!recipeId) {
-            setSamStatus("Select a canonical EDR [wip] to load.", { variant: "warn", duration: 2500 });
+            setSamStatus("Select a canonical recipe to load.", { variant: "warn", duration: 2500 });
             return;
         }
         syncCanonicalRecipeSelect(recipeId);
         const data = await fetchPrepassRecipe(recipeId);
         applyLoadedRecipeToBuilder(data, recipeId);
-        setSamStatus("Canonical EDR [wip] loaded into builder.", { variant: "info", duration: 2500 });
+        setSamStatus("Canonical recipe loaded into builder.", { variant: "info", duration: 2500 });
     }
 
     async function useCanonicalRecipeForInference() {
         const recipeId = String(qwenElements.canonicalRecipeSelect?.value || "").trim();
         if (!recipeId) {
-            setSamStatus("Select a canonical EDR [wip] to use.", { variant: "warn", duration: 2500 });
+            setSamStatus("Select a canonical recipe to use.", { variant: "warn", duration: 2500 });
             return;
         }
         if (qwenElements.prepassRecipeSelect) {
@@ -30079,7 +30371,7 @@ async function cancelRfDetrTrainingJobRequest() {
         if (!loaded) {
             return;
         }
-        setSamStatus("Canonical EDR is now active for Label Images.", { variant: "info", duration: 2500 });
+        setSamStatus("Canonical recipe is now active for Label Images.", { variant: "info", duration: 2500 });
     }
 
     async function refreshPrepassRecipes() {
@@ -30116,7 +30408,7 @@ async function cancelRfDetrTrainingJobRequest() {
             if (requestId !== prepassRecipeRefreshRequestId) {
                 return;
             }
-            const populate = (select, previousValue, entries, placeholderText = "Select EDR [wip]") => {
+            const populate = (select, previousValue, entries, placeholderText = "Select recipe") => {
                 if (!select) return;
                 select.innerHTML = "";
                 const placeholder = document.createElement("option");
@@ -30139,14 +30431,14 @@ async function cancelRfDetrTrainingJobRequest() {
                 qwenElements.canonicalRecipeSelect,
                 previousCanonical,
                 canonicalPrepassRecipes,
-                "Select Canonical EDR [wip]",
+                "Select canonical recipe",
             );
             updateCanonicalRecipeSummary();
         } catch (error) {
             if (requestId !== prepassRecipeRefreshRequestId) {
                 return;
             }
-            console.error("Failed to load EDRs", error);
+            console.error("Failed to load Detection Recipes", error);
         } finally {
             if (
                 requestId === prepassRecipeRefreshRequestId
@@ -30164,7 +30456,7 @@ async function cancelRfDetrTrainingJobRequest() {
             if (prepassRecipeRefreshNeedsRefresh) {
                 prepassRecipeRefreshNeedsRefresh = false;
                 refreshPrepassRecipes().catch((error) => {
-                    console.error("Queued EDR refresh failed", error);
+                    console.error("Queued Detection Recipe refresh failed", error);
                 });
             }
         }
@@ -30345,7 +30637,7 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         const name = (qwenElements.agentRecipeName?.value || "").trim();
         if (!name) {
-            setSamStatus("EDR [wip] name required.", { variant: "warn", duration: 3000 });
+            setSamStatus("Recipe name required.", { variant: "warn", duration: 3000 });
             return;
         }
         const description = (qwenElements.agentRecipeDescription?.value || "").trim();
@@ -30364,7 +30656,7 @@ async function cancelRfDetrTrainingJobRequest() {
                 throw new Error(await resp.text());
             }
             await refreshPrepassRecipes();
-            setSamStatus("EDR [wip] saved.", { variant: "info", duration: 2500 });
+            setSamStatus("Recipe saved.", { variant: "info", duration: 2500 });
         } catch (error) {
             setSamStatus(`Save failed: ${error.message || error}`, { variant: "error", duration: 4000 });
         } finally {
@@ -30387,7 +30679,7 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         const recipeId = (qwenElements.agentRecipeSelect?.value || "").trim();
         if (!recipeId) {
-            setSamStatus("Select an EDR [wip] to load.", { variant: "warn", duration: 2500 });
+            setSamStatus("Select a recipe to load.", { variant: "warn", duration: 2500 });
             return;
         }
         const requestId = prepassRecipeEditorLoadRequestId + 1;
@@ -30405,7 +30697,7 @@ async function cancelRfDetrTrainingJobRequest() {
                 return;
             }
             applyLoadedRecipeToBuilder(data, recipeId);
-            setSamStatus("EDR [wip] loaded.", { variant: "info", duration: 2500 });
+            setSamStatus("Recipe loaded.", { variant: "info", duration: 2500 });
         } catch (error) {
             if (requestId !== prepassRecipeEditorLoadRequestId) {
                 return;
@@ -30429,7 +30721,7 @@ async function cancelRfDetrTrainingJobRequest() {
             qwenActiveInferenceRecipe = null;
             qwenAgentSelectedEdrPackageId = "";
             if (!suppressMissingWarning) {
-                setSamStatus("Select an EDR [wip] before running inference.", { variant: "warn", duration: 2500 });
+                setSamStatus("Select a recipe before running inference.", { variant: "warn", duration: 2500 });
             }
             return null;
         }
@@ -30460,7 +30752,7 @@ async function cancelRfDetrTrainingJobRequest() {
             }
             qwenActiveInferenceRecipe = null;
             qwenAgentSelectedEdrPackageId = "";
-            setSamStatus(`EDR [wip] load failed: ${error.message || error}`, { variant: "error", duration: 4000 });
+            setSamStatus(`Detection Recipe load failed: ${error.message || error}`, { variant: "error", duration: 4000 });
             return null;
         }
     }
@@ -30471,10 +30763,10 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         const recipeId = (qwenElements.agentRecipeSelect?.value || "").trim();
         if (!recipeId) {
-            setSamStatus("Select an EDR [wip] to delete.", { variant: "warn", duration: 2500 });
+            setSamStatus("Select a recipe to delete.", { variant: "warn", duration: 2500 });
             return;
         }
-        if (!confirm("Delete this EDR [wip]? This cannot be undone.")) {
+        if (!confirm("Delete this recipe? This cannot be undone.")) {
             return;
         }
         prepassRecipeDeleteInFlight = true;
@@ -30485,7 +30777,7 @@ async function cancelRfDetrTrainingJobRequest() {
                 throw new Error(await resp.text());
             }
             await refreshPrepassRecipes();
-            setSamStatus("EDR [wip] deleted.", { variant: "info", duration: 2500 });
+            setSamStatus("Recipe deleted.", { variant: "info", duration: 2500 });
         } catch (error) {
             setSamStatus(`Delete failed: ${error.message || error}`, { variant: "error", duration: 4000 });
         } finally {
@@ -30500,7 +30792,7 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         const recipeId = (qwenElements.agentRecipeSelect?.value || "").trim();
         if (!recipeId) {
-            setSamStatus("Select an EDR [wip] to export.", { variant: "warn", duration: 2500 });
+            setSamStatus("Select a recipe to export.", { variant: "warn", duration: 2500 });
             return;
         }
         prepassRecipeExportInFlight = true;
@@ -30524,7 +30816,7 @@ async function cancelRfDetrTrainingJobRequest() {
             link.click();
             link.remove();
             window.setTimeout(() => URL.revokeObjectURL(objectUrl), 0);
-            setSamStatus("EDR [wip] exported.", { variant: "info", duration: 2500 });
+            setSamStatus("Recipe exported.", { variant: "info", duration: 2500 });
         } catch (error) {
             setSamStatus(`Export failed: ${error.message || error}`, { variant: "error", duration: 4000 });
         } finally {
@@ -30551,7 +30843,7 @@ async function cancelRfDetrTrainingJobRequest() {
             }
             const payload = await resp.json();
             await refreshPrepassRecipes();
-            const notice = payload?.notice || "EDR [wip] imported.";
+            const notice = payload?.notice || "Recipe imported.";
             setSamStatus(notice, { variant: "info", duration: 4000 });
         } catch (error) {
             setSamStatus(`Import failed: ${error.message || error}`, { variant: "error", duration: 4000 });
@@ -30598,16 +30890,16 @@ async function cancelRfDetrTrainingJobRequest() {
                 const laneSelection = String(job?.result?.lane_selection || job?.request?.lane_selection || qwenElements.calibrationLaneSelection?.value || "window");
                 const recipeFingerprint = String(job?.result?.recipe_fingerprint || job?.request?.recipe_fingerprint || "").trim();
                 const recipeState = job?.result?.recipe_discovered
-                    ? "EDR [wip] discovered"
-                    : (job?.result?.recipe_reused ? "EDR [wip] reused" : "EDR [wip] pending");
+                    ? "Detection Recipe discovered"
+                    : (job?.result?.recipe_reused ? "Detection Recipe reused" : "Detection Recipe pending");
                 const fingerprintSuffix = recipeFingerprint ? ` • ${recipeFingerprint.slice(0, 10)}` : "";
                 setCalibrationRecipeInfo(`${recipeState} • mode ${recipeMode.replaceAll("_", " ")} • lane ${laneSelection.replaceAll("_", " ")}${fingerprintSuffix}`);
                 emitCalibrationProgress(job);
                 if (qwenCalibrationState.overlay) {
                     const stepSummary = formatCalibrationStepSummary(job);
                     const detail = total > 0
-                        ? `${stepSummary ? `${stepSummary} • ` : ""}EDR [wip] build ${phase}: ${message} (${processed}/${total})`
-                        : `${stepSummary ? `${stepSummary} • ` : ""}EDR [wip] build ${phase}: ${message}`;
+                        ? `${stepSummary ? `${stepSummary} • ` : ""}Detection Recipe build ${phase}: ${message} (${processed}/${total})`
+                        : `${stepSummary ? `${stepSummary} • ` : ""}Detection Recipe build ${phase}: ${message}`;
                     qwenCalibrationState.overlay.update(detail, (Number.isFinite(job.progress) ? job.progress : 0));
                 }
                 if (job.status === "completed" || job.status === "failed" || job.status === "cancelled") {
@@ -30630,11 +30922,11 @@ async function cancelRfDetrTrainingJobRequest() {
                         const selectedPolicy = job?.result?.policy_layer_summary?.selected_variant;
                         const suffix = selectedPolicy ? ` Selected policy: ${selectedPolicy}.` : "";
                         const recipeSummary = job?.result?.recipe_discovered
-                            ? " EDR [wip] discovered and promoted."
-                            : (job?.result?.recipe_reused ? " Promoted EDR [wip] reused." : "");
+                            ? " Detection Recipe discovered and promoted."
+                            : (job?.result?.recipe_reused ? " Promoted Detection Recipe reused." : "");
                         const savedRecipeId = String(job?.result?.saved_prepass_recipe_id || "").trim();
-                        enqueueTaskNotice(`EDR [wip] build completed.${suffix}`, { durationMs: 5000 });
-                        setCalibrationRecipeInfo(`${job?.result?.recipe_discovered ? "EDR [wip] discovered" : (job?.result?.recipe_reused ? "EDR [wip] reused" : "EDR [wip] applied")} • lane ${laneSelection.replaceAll("_", " ")}${recipeFingerprint ? ` • ${recipeFingerprint.slice(0, 10)}` : ""}.${recipeSummary}`.trim());
+                        enqueueTaskNotice(`Detection Recipe build completed.${suffix}`, { durationMs: 5000 });
+                        setCalibrationRecipeInfo(`${job?.result?.recipe_discovered ? "Detection Recipe discovered" : (job?.result?.recipe_reused ? "Detection Recipe reused" : "Detection Recipe applied")} • lane ${laneSelection.replaceAll("_", " ")}${recipeFingerprint ? ` • ${recipeFingerprint.slice(0, 10)}` : ""}.${recipeSummary}`.trim());
                         if (savedRecipeId) {
                             refreshPrepassRecipes().then(() => {
                                 const genericHasSavedRecipe = Array.from(qwenElements.agentRecipeSelect?.options || []).some(
@@ -30651,17 +30943,17 @@ async function cancelRfDetrTrainingJobRequest() {
                                 }
                                 syncCanonicalRecipeSelect(savedRecipeId);
                             }).catch((error) => {
-                                console.debug("Failed to refresh Saved EDR [wip] recipes after calibration completion", error);
+                                console.debug("Failed to refresh saved recipes after calibration completion", error);
                             });
                         }
                         fetchCalibrationReportBundle(job.job_id).catch((error) => {
-                            console.debug("EDR report fetch failed", error);
+                            console.debug("Detection Recipe report fetch failed", error);
                         });
                     } else {
-                        setCalibrationRecipeInfo("EDR [wip] flow did not complete.");
-                        setCalibrationReportStatus("No EDR [wip] report bundle available for this build.", { visible: false });
+                        setCalibrationRecipeInfo("Detection Recipe flow did not complete.");
+                        setCalibrationReportStatus("No Detection Recipe report bundle available for this build.", { visible: false });
                         if (job.error) {
-                            setSamStatus(`EDR [wip] build error: ${job.error}`, { variant: "error", duration: 5000 });
+                            setSamStatus(`Detection Recipe build error: ${job.error}`, { variant: "error", duration: 5000 });
                         }
                     }
                 }
@@ -30672,12 +30964,12 @@ async function cancelRfDetrTrainingJobRequest() {
                 emitCalibrationProgress({
                     progress: 0,
                     phase: "error",
-                    message: `EDR [wip] status error: ${error.message || error}`,
+                    message: `Detection Recipe status error: ${error.message || error}`,
                     processed: 0,
                     total: 0,
                 });
                 if (qwenCalibrationState.overlay) {
-                    qwenCalibrationState.overlay.update(`EDR [wip] status error: ${error.message || error}`, 0);
+                    qwenCalibrationState.overlay.update(`Detection Recipe status error: ${error.message || error}`, 0);
                 }
             } finally {
                 qwenCalibrationState.pollInFlight = false;
@@ -30971,6 +31263,14 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         const hadActive = qwenAgentActive || qwenAgentBatchActive;
         qwenAgentRunToken += 1;
+        if (hadActive) {
+            fetch(`${API_ROOT}/qwen/cancel?force=false`, {
+                method: "POST",
+                keepalive: true,
+            }).catch((error) => {
+                console.warn("Backend Qwen prepass cancel endpoint did not respond", error);
+            });
+        }
         if (qwenAgentAbortController) {
             try {
                 qwenAgentAbortController.abort();
@@ -31369,7 +31669,7 @@ async function cancelRfDetrTrainingJobRequest() {
         step.innerHTML = `
             <div class="sam3-text-cascade__step-header">
                 <span class="sam3-text-cascade__step-title">Step</span>
-                <button type="button" class="training-button secondary sam3-text-cascade__remove">Remove</button>
+                <button type="button" class="training-button secondary sam3-text-cascade__remove" title="Remove this SAM3 text cascade step.">Remove</button>
             </div>
             <div class="sam3-text-field sam3-text-field--wide">
                 <label>Prompt</label>
@@ -34880,7 +35180,8 @@ async function cancelRfDetrTrainingJobRequest() {
                 agentElements.stepsPromptPrefilter.title =
                     "Disabled because the selected head uses DINOv3 (prefilter requires CLIP embeddings).";
             } else {
-                agentElements.stepsPromptPrefilter.title = "";
+                agentElements.stepsPromptPrefilter.removeAttribute("title");
+                refreshUiTooltips(agentElements.stepsPromptPrefilter);
             }
         }
         if (agentElements.stepsPromptPrefilterMode) {
@@ -39296,8 +39597,26 @@ async function cancelRfDetrTrainingJobRequest() {
         if (classSplitElements.projectionMinDist) {
             classSplitElements.projectionMinDist.disabled = !available || classSplitState.active || projectionChoice !== "umap";
         }
-        refreshClassSplitProjectionHint();
-	        setButtonDisabled(classSplitElements.runButton, !canRun);
+	        refreshClassSplitProjectionHint();
+            setButtonDisabled(classSplitElements.qwenReviewGlossaryReset, classSplitState.qwenReviewGlossaryLoadInFlight);
+            setButtonDisabled(
+                classSplitElements.qwenReviewGlossarySave,
+                classSplitState.qwenReviewGlossarySaveInFlight || !getClassSplitQwenReviewDatasetId()
+            );
+            if (classSplitElements.qwenReviewGlossary && !classSplitState.qwenReviewGlossaryDirty) {
+                const reviewContextKey = getClassSplitQwenReviewDatasetId()
+                    || `workspace:${classSplitHashValues(loadedClassList || [])}`;
+                if (
+                    reviewContextKey
+                    && classSplitState.qwenReviewGlossaryLoadedFor !== reviewContextKey
+                    && !classSplitState.qwenReviewGlossaryLoadInFlight
+                ) {
+                    loadClassSplitQwenReviewGlossary().catch((error) => {
+                        console.warn("Class Split review glossary refresh failed", error);
+                    });
+                }
+            }
+		        setButtonDisabled(classSplitElements.runButton, !canRun);
 	        setButtonDisabled(
 	            classSplitElements.cancelButton,
 	            !classSplitState.active
@@ -40431,17 +40750,6 @@ async function cancelRfDetrTrainingJobRequest() {
             }
         });
         setButtonDisabled(classSplitElements.clusterRun, disabled);
-        const control = classSplitElements.clusterOverlay;
-        if (!control) {
-            return;
-        }
-        control.checked = false;
-        control.disabled = true;
-        const label = control.closest(".class-split-toggle");
-        if (label) {
-            label.classList.add("class-split-toggle--disabled");
-            label.title = "Cluster hulls are disabled. Use selected-class subclass cluster search below the plot.";
-        }
     }
 
     function getClassSplitBackendClusterById(clusterKey) {
@@ -40671,7 +40979,7 @@ async function cancelRfDetrTrainingJobRequest() {
             ? "Strict embedding KMeans proposals"
             : "UMAP island proposals";
         listEl.innerHTML = [
-            `<div class="training-help">${escapeHtml(sourceText)} for ${escapeHtml(classSplitClusterContextClass() || "selected class")}. Review crop context and graph position before relabeling; proposals are not ground truth.</div>`,
+            `<div class="training-help">Subclass clusters: ${escapeHtml(sourceText)} for ${escapeHtml(classSplitClusterContextClass() || "selected class")}. Review crop context and graph position before relabeling; proposals are not ground truth.</div>`,
             summaries.map((summary) => {
                 const medoid = summary.medoidPoint;
                 const thumbUrl = medoid ? getClassSplitThumbnailUrl(medoid) : "";
@@ -40689,7 +40997,7 @@ async function cancelRfDetrTrainingJobRequest() {
                         ? `<img class="class-split-cluster-item__thumb" src="${escapeHtml(thumbUrl)}" alt="Cluster representative crop">`
                         : `<div class="class-split-cluster-item__thumb" aria-hidden="true"></div>`,
                     `<div class="class-split-cluster-item__body">`,
-                    `<strong>Cluster ${escapeHtml(summary.clusterKey)} • ${escapeHtml(summary.size)} object${summary.size === 1 ? "" : "s"}${escapeHtml(totalSuffix)}</strong>`,
+                    `<strong>Subclass cluster ${escapeHtml(summary.clusterKey)} • ${escapeHtml(summary.size)} object${summary.size === 1 ? "" : "s"}${escapeHtml(totalSuffix)}</strong>`,
                     `<span>${escapeHtml(mix)} • purity ${purityPct}% • mean outlier ${summary.meanOutlierScore.toFixed(2)}${escapeHtml(scoreText)}</span>`,
                     `<div class="class-split-cluster-item__actions">`,
                     `<button type="button" class="training-button secondary" data-action="select-cluster" data-cluster-id="${escapeHtml(summary.clusterKey)}">Select cluster</button>`,
@@ -42169,6 +42477,118 @@ async function cancelRfDetrTrainingJobRequest() {
         el.innerHTML = html || "";
     }
 
+    function setClassSplitQwenReviewContextStatus(message, variant = "") {
+        const el = classSplitElements.qwenReviewContextStatus;
+        if (!el) {
+            return;
+        }
+        el.textContent = message || "";
+        el.classList.toggle("warn", variant === "warn");
+        el.classList.toggle("error", variant === "error");
+        el.classList.toggle("success", variant === "success");
+        el.classList.toggle("info", variant === "info");
+    }
+
+    function getClassSplitQwenReviewDatasetId() {
+        return annotationSourceState.mode === "linked"
+            ? String(annotationSourceState.datasetId || "").trim()
+            : "";
+    }
+
+    function buildClassSplitDefaultGlossaryText() {
+        const classNames = (Array.isArray(loadedClassList) ? loadedClassList : [])
+            .map((className) => String(className || "").trim())
+            .filter(Boolean);
+        return classNames.map((className) => `${className}: ${className}`).join("\n");
+    }
+
+    async function loadClassSplitQwenReviewGlossary({ force = false } = {}) {
+        const textarea = classSplitElements.qwenReviewGlossary;
+        if (!textarea) {
+            return;
+        }
+        const datasetId = getClassSplitQwenReviewDatasetId();
+        const contextKey = datasetId || `workspace:${classSplitHashValues(loadedClassList || [])}`;
+        if (!force && classSplitState.qwenReviewGlossaryDirty) {
+            setClassSplitQwenReviewContextStatus("Review glossary has local edits.", "info");
+            return;
+        }
+        if (!force && classSplitState.qwenReviewGlossaryLoadedFor === contextKey && textarea.value.trim()) {
+            return;
+        }
+        if (classSplitState.qwenReviewGlossaryLoadInFlight) {
+            return;
+        }
+        classSplitState.qwenReviewGlossaryLoadInFlight = true;
+        setButtonDisabled(classSplitElements.qwenReviewGlossaryReset, true);
+        setButtonDisabled(classSplitElements.qwenReviewGlossarySave, true);
+        try {
+            if (datasetId) {
+                const resp = await fetch(`${API_ROOT}/datasets/${encodeURIComponent(datasetId)}/glossary`);
+                const detail = await resp.text();
+                if (!resp.ok) {
+                    throw new Error(parseApiError(detail, `HTTP ${resp.status}`));
+                }
+                const data = parseJsonObjectSafe(detail, {});
+                textarea.value = String(data.glossary || data.default_glossary || "").trim();
+                classSplitState.qwenReviewGlossaryLoadedFor = contextKey;
+                classSplitState.qwenReviewGlossaryDirty = false;
+                setClassSplitQwenReviewContextStatus("Loaded dataset review glossary.", "success");
+            } else {
+                textarea.value = buildClassSplitDefaultGlossaryText();
+                classSplitState.qwenReviewGlossaryLoadedFor = contextKey;
+                classSplitState.qwenReviewGlossaryDirty = false;
+                setClassSplitQwenReviewContextStatus("Using class-list review glossary for this session.", "info");
+            }
+        } catch (error) {
+            console.error("Class Split Qwen glossary load failed", error);
+            if (force || !textarea.value.trim()) {
+                textarea.value = buildClassSplitDefaultGlossaryText();
+                classSplitState.qwenReviewGlossaryLoadedFor = contextKey;
+                classSplitState.qwenReviewGlossaryDirty = false;
+            }
+            setClassSplitQwenReviewContextStatus(`Glossary load failed: ${error.message || error}`, "error");
+        } finally {
+            classSplitState.qwenReviewGlossaryLoadInFlight = false;
+            setButtonDisabled(classSplitElements.qwenReviewGlossaryReset, false);
+            setButtonDisabled(classSplitElements.qwenReviewGlossarySave, !getClassSplitQwenReviewDatasetId());
+        }
+    }
+
+    async function saveClassSplitQwenReviewGlossary() {
+        const datasetId = getClassSplitQwenReviewDatasetId();
+        const textarea = classSplitElements.qwenReviewGlossary;
+        if (!datasetId || !textarea) {
+            setClassSplitQwenReviewContextStatus("Open a linked backend dataset to save the glossary.", "warn");
+            return;
+        }
+        if (classSplitState.qwenReviewGlossarySaveInFlight) {
+            return;
+        }
+        classSplitState.qwenReviewGlossarySaveInFlight = true;
+        setButtonDisabled(classSplitElements.qwenReviewGlossarySave, true);
+        try {
+            const resp = await fetch(`${API_ROOT}/datasets/${encodeURIComponent(datasetId)}/glossary`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ glossary: textarea.value || "" }),
+            });
+            const detail = await resp.text();
+            if (!resp.ok) {
+                throw new Error(parseApiError(detail, `HTTP ${resp.status}`));
+            }
+            classSplitState.qwenReviewGlossaryDirty = false;
+            classSplitState.qwenReviewGlossaryLoadedFor = datasetId;
+            setClassSplitQwenReviewContextStatus("Saved review glossary to dataset.", "success");
+        } catch (error) {
+            console.error("Class Split Qwen glossary save failed", error);
+            setClassSplitQwenReviewContextStatus(`Glossary save failed: ${error.message || error}`, "error");
+        } finally {
+            classSplitState.qwenReviewGlossarySaveInFlight = false;
+            setButtonDisabled(classSplitElements.qwenReviewGlossarySave, !getClassSplitQwenReviewDatasetId());
+        }
+    }
+
     async function pushClassSplitReviewToMobile() {
         const jobId = String(classSplitState.currentJobId || "").trim();
         const result = classSplitState.result || {};
@@ -42342,6 +42762,388 @@ async function cancelRfDetrTrainingJobRequest() {
         }
     }
 
+    function setClassSplitQwenReviewStatus(message, variant = "") {
+        if (!classSplitElements.qwenReviewStatus) {
+            return;
+        }
+        classSplitElements.qwenReviewStatus.textContent = message || "";
+        classSplitElements.qwenReviewStatus.classList.toggle("warn", variant === "warn");
+        classSplitElements.qwenReviewStatus.classList.toggle("error", variant === "error");
+        classSplitElements.qwenReviewStatus.classList.toggle("success", variant === "success");
+    }
+
+    function renderClassSplitQwenReviewModelOptions() {
+        const select = classSplitElements.qwenReviewModel;
+        if (!select) {
+            return;
+        }
+        const selected = select.value || classSplitState.qwenReviewActiveModelId || "";
+        const models = Array.isArray(classSplitState.qwenReviewModels) ? classSplitState.qwenReviewModels : [];
+        const options = [
+            `<option value="">Active model${classSplitState.qwenReviewActiveModelId ? ` (${escapeHtml(classSplitState.qwenReviewActiveModelId)})` : ""}</option>`,
+            ...models.map((entry) => {
+                const id = String(entry?.id || "").trim();
+                if (!id) {
+                    return "";
+                }
+                const metadata = entry?.metadata || {};
+                if (metadata.inference_supported === false || metadata.vision_inference_supported === false) {
+                    return "";
+                }
+                const label = String(metadata.display_name || metadata.label || metadata.name || entry.label || entry.name || id);
+                const activeSuffix = id === classSplitState.qwenReviewActiveModelId ? " (active)" : "";
+                return `<option value="${escapeHtml(id)}"${id === selected ? " selected" : ""}>${escapeHtml(label + activeSuffix)}</option>`;
+            }).filter(Boolean),
+        ].join("");
+        select.innerHTML = options;
+        if (selected && models.some((entry) => String(entry?.id || "") === selected)) {
+            select.value = selected;
+        }
+    }
+
+    async function refreshClassSplitQwenReviewModels() {
+        if (classSplitState.qwenReviewModelRefreshInFlight) {
+            return;
+        }
+        classSplitState.qwenReviewModelRefreshInFlight = true;
+        setButtonDisabled(classSplitElements.qwenReviewRefresh, true);
+        setClassSplitQwenReviewStatus("Loading reviewer models ...", "info");
+        try {
+            const resp = await fetch(`${API_ROOT}/qwen/models`);
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(text || `HTTP ${resp.status}`);
+            }
+            const data = await resp.json();
+            classSplitState.qwenReviewModels = Array.isArray(data.models) ? data.models : [];
+            classSplitState.qwenReviewActiveModelId = String(data.active || "");
+            renderClassSplitQwenReviewModelOptions();
+            setClassSplitQwenReviewStatus("Reviewer models loaded.", "success");
+        } catch (error) {
+            console.error("Failed to load Class Split reviewer models", error);
+            setClassSplitQwenReviewStatus(`Reviewer models failed: ${error.message || error}`, "error");
+        } finally {
+            classSplitState.qwenReviewModelRefreshInFlight = false;
+            setButtonDisabled(classSplitElements.qwenReviewRefresh, false);
+        }
+    }
+
+    function clearClassSplitQwenReviewPolls({ clearJobs = false } = {}) {
+        classSplitState.qwenReviewPollTimers.forEach((timer) => clearTimeout(timer));
+        classSplitState.qwenReviewPollTimers.clear();
+        if (clearJobs) {
+            classSplitState.qwenReviewJobs.clear();
+        }
+    }
+
+    function getClassSplitQwenReviewForPoint(pointId) {
+        return classSplitState.qwenReviewJobs.get(String(pointId || "")) || null;
+    }
+
+    function isClassSplitQwenReviewActive(review) {
+        return ["queued", "running", "cancelling"].includes(String(review?.status || "").toLowerCase());
+    }
+
+    function updateClassSplitQwenReviewJob(review) {
+        const pointId = String(review?.point_id || "").trim();
+        if (!pointId) {
+            return;
+        }
+        classSplitState.qwenReviewJobs.set(pointId, review);
+    }
+
+    function scheduleClassSplitQwenReviewPoll(pointId, reviewId) {
+        const safePointId = String(pointId || "").trim();
+        const safeReviewId = String(reviewId || "").trim();
+        if (!safePointId || !safeReviewId) {
+            return;
+        }
+        const existing = classSplitState.qwenReviewPollTimers.get(safePointId);
+        if (existing) {
+            clearTimeout(existing);
+        }
+        const timer = setTimeout(async () => {
+            classSplitState.qwenReviewPollTimers.delete(safePointId);
+            try {
+                const resp = await fetch(`${API_ROOT}/class_analysis/qwen_review/${encodeURIComponent(safeReviewId)}`);
+                if (!resp.ok) {
+                    const text = await resp.text();
+                    throw new Error(text || `HTTP ${resp.status}`);
+                }
+                const review = await resp.json();
+                updateClassSplitQwenReviewJob(review);
+                renderClassSplitWrongList();
+                if (isClassSplitQwenReviewActive(review)) {
+                    scheduleClassSplitQwenReviewPoll(safePointId, safeReviewId);
+                }
+            } catch (error) {
+                console.error("Class Split Qwen review poll failed", error);
+                const review = getClassSplitQwenReviewForPoint(safePointId) || { point_id: safePointId };
+                updateClassSplitQwenReviewJob({
+                    ...review,
+                    status: "failed",
+                    message: `Poll failed: ${error.message || error}`,
+                    error: String(error.message || error),
+                });
+                renderClassSplitWrongList();
+            }
+        }, 1400);
+        classSplitState.qwenReviewPollTimers.set(safePointId, timer);
+    }
+
+    async function startClassSplitQwenReview(pointId) {
+        const safePointId = String(pointId || "").trim();
+        if (!safePointId || !classSplitState.currentJobId) {
+            setSamStatus("Run Class Split analysis before starting Qwen review.", { variant: "warn", duration: 5000 });
+            return;
+        }
+        const existing = getClassSplitQwenReviewForPoint(safePointId);
+        if (isClassSplitQwenReviewActive(existing)) {
+            return;
+        }
+        updateClassSplitQwenReviewJob({
+            point_id: safePointId,
+            status: "queued",
+            progress: 0,
+            message: "Starting Qwen review ...",
+            evidence: [],
+            result: null,
+        });
+        renderClassSplitWrongList();
+        try {
+            const modelId = String(classSplitElements.qwenReviewModel?.value || "").trim();
+            const labelmapGlossary = String(classSplitElements.qwenReviewGlossary?.value || "").trim();
+            const reviewGuidance = String(classSplitElements.qwenReviewGuidance?.value || "").trim();
+            const resp = await fetch(`${API_ROOT}/class_analysis/jobs/${encodeURIComponent(classSplitState.currentJobId)}/points/${encodeURIComponent(safePointId)}/qwen_review`, {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({
+                    model_id: modelId || null,
+                    max_turns: 10,
+                    labelmap_glossary: labelmapGlossary || null,
+                    review_guidance: reviewGuidance || null,
+                    enable_local_consensus_context: true,
+                    enable_class_concept_briefs: true,
+                    allow_limited_final_review: true,
+                    enable_cue_verifier: true,
+                }),
+            });
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(text || `HTTP ${resp.status}`);
+            }
+            const review = await resp.json();
+            updateClassSplitQwenReviewJob(review);
+            renderClassSplitWrongList();
+            if (isClassSplitQwenReviewActive(review)) {
+                scheduleClassSplitQwenReviewPoll(safePointId, review.review_id || review.job_id);
+            }
+        } catch (error) {
+            console.error("Class Split Qwen review failed to start", error);
+            updateClassSplitQwenReviewJob({
+                point_id: safePointId,
+                status: "failed",
+                progress: 1,
+                message: `Qwen review failed: ${error.message || error}`,
+                evidence: [],
+                result: null,
+                error: String(error.message || error),
+            });
+            renderClassSplitWrongList();
+        }
+    }
+
+    async function cancelClassSplitQwenReview(pointId) {
+        const safePointId = String(pointId || "").trim();
+        const review = getClassSplitQwenReviewForPoint(safePointId);
+        const reviewId = String(review?.review_id || review?.job_id || "").trim();
+        if (!reviewId) {
+            return;
+        }
+        try {
+            const resp = await fetch(`${API_ROOT}/class_analysis/qwen_review/${encodeURIComponent(reviewId)}/cancel`, { method: "POST" });
+            if (!resp.ok) {
+                const text = await resp.text();
+                throw new Error(text || `HTTP ${resp.status}`);
+            }
+            const updated = await resp.json();
+            updateClassSplitQwenReviewJob(updated);
+            renderClassSplitWrongList();
+        } catch (error) {
+            console.error("Class Split Qwen review cancel failed", error);
+            setSamStatus(`Qwen review cancel failed: ${error.message || error}`, { variant: "error", duration: 5000 });
+        }
+    }
+
+    function formatClassSplitQwenDecision(result) {
+        const decision = String(result?.decision || "").trim();
+        const targetClass = String(result?.target_class || "").trim();
+        const dualConflict = result && typeof result.dual_bbox_conflict === "object" ? result.dual_bbox_conflict : null;
+        const dualResolution = String(result?.dual_bbox_resolution || "not_applicable").trim();
+        if (dualConflict && dualResolution === "overlap_box_class") {
+            return targetClass ? `Resolve dual bbox: switch class to ${targetClass}` : "Resolve dual bbox: switch class";
+        }
+        if (dualConflict && dualResolution === "current_box_class") {
+            return "Resolve dual bbox: confirm current class";
+        }
+        if (dualConflict && dualResolution === "both_valid_overlapping_objects") {
+            return "Dual bbox: both classes may be valid";
+        }
+        if (dualConflict && dualResolution === "uncertain_or_neither") {
+            return "Dual bbox: unresolved";
+        }
+        const guarded = result && typeof result.guarded_recommendation === "object"
+            ? result.guarded_recommendation
+            : null;
+        if (guarded?.blocked) {
+            const guardedDecision = String(guarded.decision || "").trim();
+            const guardedTarget = String(guarded.target_class || "").trim();
+            if (guardedDecision === "confirm_current") {
+                return "Guarded suggestion: confirm current class";
+            }
+            return guardedTarget
+                ? `Guarded suggestion: switch class to ${guardedTarget}`
+                : "Guarded suggestion: review class change";
+        }
+        if (decision === "confirm_current") {
+            return "Confirm current class";
+        }
+        if (decision === "accept_suggested" || decision === "change_to_other") {
+            return targetClass ? `Switch class to ${targetClass}` : "Switch class";
+        }
+        if (decision === "skip_uncertain") {
+            return "Skip / human review";
+        }
+        return "Waiting for decision";
+    }
+
+    function getClassSplitDualBBoxConflict(item, point, result = null) {
+        const sources = [
+            result?.dual_bbox_conflict,
+            point?.dual_bbox_conflict,
+            item?.dual_bbox_conflict,
+        ];
+        for (const source of sources) {
+            if (source && typeof source === "object" && source.enabled !== false) {
+                return source;
+            }
+        }
+        return null;
+    }
+
+    function formatClassSplitDualBBoxConflict(conflict, currentClass = "") {
+        if (!conflict || typeof conflict !== "object") {
+            return "";
+        }
+        const otherClass = String(conflict.other_class_name || conflict.class_name || "").trim();
+        const current = String(conflict.current_class || currentClass || "").trim();
+        const iou = Number(conflict.iou);
+        const cover = Number(conflict.target_area_covered);
+        const parts = [];
+        if (current || otherClass) {
+            parts.push(`${current || "current"} vs ${otherClass || "overlap"}`);
+        }
+        if (Number.isFinite(iou)) {
+            parts.push(`IoU ${iou.toFixed(2)}`);
+        }
+        if (Number.isFinite(cover)) {
+            parts.push(`target cover ${Math.round(cover * 100)}%`);
+        }
+        return parts.join(" • ");
+    }
+
+    function renderClassSplitQwenReviewBlock(pointId) {
+        const review = getClassSplitQwenReviewForPoint(pointId);
+        if (!review) {
+            return "";
+        }
+        const status = String(review.status || "queued").toLowerCase();
+        const progress = Math.max(0, Math.min(1, Number(review.progress) || 0));
+        const result = review.result || null;
+        const evidence = Array.isArray(review.evidence) ? review.evidence : [];
+        const resultEvidenceIds = new Set((Array.isArray(result?.evidence_ids) ? result.evidence_ids : []).map((id) => String(id || "")));
+        const visibleEvidence = evidence.filter((item) => {
+            const id = String(item?.evidence_id || "");
+            return !resultEvidenceIds.size || resultEvidenceIds.has(id);
+        }).slice(-6);
+        const guarded = result && typeof result.guarded_recommendation === "object"
+            ? result.guarded_recommendation
+            : null;
+        const guardedReasons = Array.isArray(guarded?.guardrail_reasons)
+            ? guarded.guardrail_reasons.map((item) => String(item || "").trim()).filter(Boolean)
+            : [];
+        const guardedTarget = String(guarded?.target_class || "").trim();
+        const guardedDecision = String(guarded?.decision || "").trim();
+        const guardedConfidence = Number(guarded?.confidence);
+        const guardedLabel = guardedDecision === "confirm_current"
+            ? "confirm current class"
+            : guardedTarget
+                ? `switch class to ${guardedTarget}`
+                : "class change";
+        const disposition = result && typeof result.review_disposition === "object"
+            ? result.review_disposition
+            : null;
+        const dispositionLabel = String(disposition?.label || "").trim();
+        const dispositionPriority = String(disposition?.priority || "").trim();
+        const dispositionSignal = String(disposition?.signal || "").trim();
+        const dispositionHtml = dispositionLabel
+            ? `<span>${escapeHtml(dispositionLabel)}${dispositionPriority ? ` • priority ${escapeHtml(dispositionPriority)}` : ""}${dispositionSignal ? ` • ${escapeHtml(dispositionSignal.replace(/_/g, " "))}` : ""}</span>`
+            : "";
+        const guardedUsefulNegative = dispositionSignal === "useful_negative" && dispositionLabel;
+        const guardedHeader = guardedUsefulNegative
+            ? dispositionLabel
+            : `Guarded suggestion: ${guardedLabel}`;
+        const guardedDetail = guardedUsefulNegative
+            ? `Controller rejected model suggestion (${guardedLabel})${guardedReasons.length ? `: ${guardedReasons[0]}` : "."}`
+            : `Model confidence ${Number.isFinite(guardedConfidence) ? `${Math.round(guardedConfidence * 100)}%` : "n/a"} • held for human review${guardedReasons.length ? `: ${guardedReasons[0]}` : "."}`;
+        const guardedHtml = guarded?.blocked
+            ? [
+                `<div class="class-split-qwen-review__guarded">`,
+                `<strong>${escapeHtml(guardedHeader)}</strong>`,
+                `<span>${escapeHtml(guardedDetail)}</span>`,
+                guarded.rationale_short ? `<p>${escapeHtml(guarded.rationale_short)}</p>` : "",
+                `</div>`,
+            ].join("")
+            : "";
+        const dualConflict = getClassSplitDualBBoxConflict(null, null, result);
+        const dualResolution = String(result?.dual_bbox_resolution || "not_applicable").trim();
+        const dualConflictLabel = formatClassSplitDualBBoxConflict(dualConflict, result?.current_class || "");
+        const dualHtml = dualConflict
+            ? `<span>dual-bbox ${escapeHtml(dualResolution.replace(/_/g, " "))}${dualConflictLabel ? ` • ${escapeHtml(dualConflictLabel)}` : ""}</span>`
+            : "";
+        const evidenceHtml = visibleEvidence.length
+            ? `<div class="class-split-qwen-review__evidence">${visibleEvidence.map((item) => {
+                const url = String(item?.artifact_url || "");
+                return url
+                    ? `<a href="${escapeHtml(url)}" target="_blank" rel="noopener"><img src="${escapeHtml(url)}" alt="${escapeHtml(item?.title || "Qwen evidence")}" loading="lazy"></a>`
+                    : "";
+            }).join("")}</div>`
+            : "";
+        const resultHtml = result
+            ? [
+                `<strong>${escapeHtml(formatClassSplitQwenDecision(result))}</strong>`,
+                `<span>confidence ${Math.round((Number(result.confidence) || 0) * 100)}% • ${escapeHtml(result.reviewed_by_model || "")}</span>`,
+                dispositionHtml,
+                dualHtml,
+                `<span>overlap ${escapeHtml(result.overlap_assessment || "n/a")} • anchors current ${escapeHtml(result.anchor_evidence_current || "n/a")} / suggested ${escapeHtml(result.anchor_evidence_suggested || "n/a")}</span>`,
+                result.rationale_short ? `<p>${escapeHtml(result.rationale_short)}</p>` : "",
+                result.counter_evidence ? `<p><em>Counter-evidence:</em> ${escapeHtml(result.counter_evidence)}</p>` : "",
+                guardedHtml,
+            ].join("")
+            : `<span>${escapeHtml(review.message || status)}</span>`;
+        const cancelHtml = isClassSplitQwenReviewActive(review)
+            ? `<button type="button" class="training-button secondary" data-action="qwen-cancel" data-point-id="${escapeHtml(pointId)}">Cancel Qwen</button>`
+            : "";
+        return [
+            `<div class="class-split-qwen-review class-split-qwen-review--${escapeHtml(status)}">`,
+            `<div class="class-split-qwen-review__bar"><span style="width:${Math.round(progress * 100)}%"></span></div>`,
+            `<div class="class-split-qwen-review__body">${resultHtml}</div>`,
+            evidenceHtml,
+            cancelHtml ? `<div class="class-split-qwen-review__actions">${cancelHtml}</div>` : "",
+            `</div>`,
+        ].join("");
+    }
+
     function renderClassSplitWrongList() {
         const listEl = classSplitElements.wrongList;
         if (!listEl) {
@@ -42377,11 +43179,38 @@ async function cancelRfDetrTrainingJobRequest() {
             const pointId = String(item.point_id || "");
             const currentClass = String(point?.class_name || item.class_name || "").trim();
             const suggestedClass = String(item.suggested_neighbor_class || "").trim();
+            const dualConflict = getClassSplitDualBBoxConflict(item, point);
+            const dualOtherClass = String(dualConflict?.other_class_name || dualConflict?.class_name || "").trim();
+            const dualConflictLabel = formatClassSplitDualBBoxConflict(dualConflict, currentClass);
             const suggestedClassAvailable = suggestedClass && classNames.includes(suggestedClass);
+            const dualOtherClassAvailable = dualOtherClass && classNames.includes(dualOtherClass);
+            const qwenReview = getClassSplitQwenReviewForPoint(pointId);
+            const qwenBusy = isClassSplitQwenReviewActive(qwenReview);
+            const qwenResult = qwenReview?.result || null;
+            const displayedTargetClass = dualOtherClass || suggestedClass;
+            const qwenGuarded = qwenResult && typeof qwenResult.guarded_recommendation === "object"
+                ? qwenResult.guarded_recommendation
+                : null;
+            const qwenDecision = String(qwenResult?.decision || "").trim();
+            const qwenGuardedDecision = String(qwenGuarded?.decision || "").trim();
+            const qwenGuardedTarget = String(qwenGuarded?.target_class || "").trim();
+            const qwenActionTarget = String(qwenResult?.target_class || "").trim();
+            const qwenPreferredTarget = qwenGuarded?.blocked && qwenGuardedDecision !== "confirm_current"
+                ? qwenGuardedTarget
+                : (qwenDecision === "accept_suggested" || qwenDecision === "change_to_other")
+                    ? qwenActionTarget
+                    : "";
+            const preferredTargetClass = classNames.includes(qwenPreferredTarget)
+                ? qwenPreferredTarget
+                : dualOtherClassAvailable
+                    ? dualOtherClass
+                : suggestedClassAvailable
+                    ? suggestedClass
+                    : "";
             const options = [
-                `<option value=""${suggestedClassAvailable ? "" : " selected"}>Choose class</option>`,
+                `<option value=""${preferredTargetClass ? "" : " selected"}>Choose class</option>`,
                 ...classNames.map((className) => {
-                    const selected = className === suggestedClass ? " selected" : "";
+                    const selected = className === preferredTargetClass ? " selected" : "";
                     return `<option value="${escapeHtml(className)}"${selected}>${escapeHtml(className)}</option>`;
                 }),
             ].join("");
@@ -42392,16 +43221,25 @@ async function cancelRfDetrTrainingJobRequest() {
                     ? `<img class="class-split-wrong-item__preview" src="${escapeHtml(thumbUrl)}" alt="Object context crop" loading="lazy" data-context-point-id="${escapeHtml(pointId)}">`
                     : `<div class="class-split-wrong-item__preview" aria-hidden="true"></div>`,
                 `<div class="class-split-wrong-item__body">`,
-                `<strong>${escapeHtml(currentClass || "current class")} → ${escapeHtml(suggestedClass || "neighbor class")}</strong>`,
+                `<strong>${escapeHtml(currentClass || "current class")} → ${escapeHtml(displayedTargetClass || "review target")}</strong>`,
+                dualConflict
+                    ? `<span class="class-split-wrong-item__badge class-split-wrong-item__badge--dual">Dual-box conflict • ${escapeHtml(dualConflictLabel || "near-identical cross-class boxes")}</span>`
+                    : "",
+                dualConflict
+                    ? `<span>Qwen question: choose ${escapeHtml(currentClass || "current class")} vs ${escapeHtml(dualOtherClass || "overlap class")} vs both-valid overlap vs unresolved.</span>`
+                    : "",
                 suggestedClass ? `<span>Suggested target: ${escapeHtml(suggestedClass)}</span>` : "",
+                dualOtherClass && dualOtherClass !== suggestedClass ? `<span>Overlapping target: ${escapeHtml(dualOtherClass)}</span>` : "",
                 `<span>${Math.round(score * 100)}% suspicion • ${escapeHtml(item.image_relpath || "")}</span>`,
                 `<div class="class-split-wrong-item__actions">`,
                 `<button type="button" class="training-button secondary" data-action="jump-instance" data-point-id="${escapeHtml(pointId)}">See instance</button>`,
                 `<button type="button" class="training-button secondary" data-action="correct-class" data-point-id="${escapeHtml(pointId)}">Confirm current class</button>`,
                 `<button type="button" class="training-button secondary" data-action="skip-wrong" data-point-id="${escapeHtml(pointId)}">Skip</button>`,
+                `<button type="button" class="training-button secondary" data-action="qwen-review" data-point-id="${escapeHtml(pointId)}"${qwenBusy ? " disabled" : ""}>${qwenBusy ? "Qwen reviewing ..." : dualConflict ? "Review dual bbox with Qwen" : "Review with Qwen"}</button>`,
                 `<select data-action="target-class" data-point-id="${escapeHtml(pointId)}">${options}</select>`,
-                `<button type="button" class="training-button" data-action="reassign-class" data-point-id="${escapeHtml(pointId)}">${escapeHtml(suggestedClass ? `Switch class to ${suggestedClass}` : "Reassign")}</button>`,
+                `<button type="button" class="training-button" data-action="reassign-class" data-point-id="${escapeHtml(pointId)}">${escapeHtml(preferredTargetClass ? `Switch class to ${preferredTargetClass}` : "Reassign")}</button>`,
                 `</div>`,
+                renderClassSplitQwenReviewBlock(pointId),
                 `</div>`,
                 `</div>`,
             ].join("");
@@ -42462,6 +43300,23 @@ async function cancelRfDetrTrainingJobRequest() {
                 changeClassSplitPointClass(point, targetClass).catch((error) => {
                     console.error("Class Split vignette relabel failed", error);
                     setSamStatus(`Class change failed: ${error.message || error}`, { variant: "error", duration: 5000 });
+                });
+            });
+        });
+        listEl.querySelectorAll('[data-action="qwen-review"]').forEach((button) => {
+            button.addEventListener("click", (event) => {
+                event.stopPropagation();
+                startClassSplitQwenReview(button.getAttribute("data-point-id") || "").catch((error) => {
+                    console.error("Class Split Qwen review action failed", error);
+                    setSamStatus(`Qwen review failed: ${error.message || error}`, { variant: "error", duration: 5000 });
+                });
+            });
+        });
+        listEl.querySelectorAll('[data-action="qwen-cancel"]').forEach((button) => {
+            button.addEventListener("click", (event) => {
+                event.stopPropagation();
+                cancelClassSplitQwenReview(button.getAttribute("data-point-id") || "").catch((error) => {
+                    console.error("Class Split Qwen review cancel action failed", error);
                 });
             });
         });
@@ -42608,6 +43463,7 @@ async function cancelRfDetrTrainingJobRequest() {
 
     function hideClassSplitResultUiUntilReady() {
         classSplitState.plotRenderToken += 1;
+        clearClassSplitQwenReviewPolls({ clearJobs: true });
         hideClassSplitGraphHoverPreview();
         if (classSplitElements.results) {
             classSplitElements.results.hidden = true;
@@ -43327,7 +44183,6 @@ async function cancelRfDetrTrainingJobRequest() {
         classSplitElements.overlapClassA = document.getElementById("classSplitOverlapClassA");
         classSplitElements.overlapClassB = document.getElementById("classSplitOverlapClassB");
         classSplitElements.dragMode = document.getElementById("classSplitDragMode");
-        classSplitElements.clusterOverlay = document.getElementById("classSplitClusterOverlay");
         classSplitElements.clusterSource = document.getElementById("classSplitClusterSource");
         classSplitElements.clusterSensitivity = document.getElementById("classSplitClusterSensitivity");
         classSplitElements.clusterMaxClusters = document.getElementById("classSplitClusterMaxClusters");
@@ -43351,6 +44206,14 @@ async function cancelRfDetrTrainingJobRequest() {
         classSplitElements.mobilePush = document.getElementById("classSplitMobilePush");
         classSplitElements.mobileSync = document.getElementById("classSplitMobileSync");
         classSplitElements.mobileStatus = document.getElementById("classSplitMobileStatus");
+        classSplitElements.qwenReviewModel = document.getElementById("classSplitQwenReviewModel");
+        classSplitElements.qwenReviewRefresh = document.getElementById("classSplitQwenReviewRefresh");
+        classSplitElements.qwenReviewStatus = document.getElementById("classSplitQwenReviewStatus");
+        classSplitElements.qwenReviewGlossary = document.getElementById("classSplitQwenReviewGlossary");
+        classSplitElements.qwenReviewGuidance = document.getElementById("classSplitQwenReviewGuidance");
+        classSplitElements.qwenReviewGlossaryReset = document.getElementById("classSplitQwenReviewGlossaryReset");
+        classSplitElements.qwenReviewGlossarySave = document.getElementById("classSplitQwenReviewGlossarySave");
+        classSplitElements.qwenReviewContextStatus = document.getElementById("classSplitQwenReviewContextStatus");
         classSplitElements.wrongList = document.getElementById("classSplitWrongList");
         classSplitElements.inspector = document.getElementById("classSplitInspector");
         classSplitElements.datasetAnalysisPanel = document.getElementById("classSplitDatasetAnalysisPanel");
@@ -43470,9 +44333,6 @@ async function cancelRfDetrTrainingJobRequest() {
         if (classSplitElements.dragMode) {
             classSplitElements.dragMode.addEventListener("change", renderClassSplitPlot);
         }
-        if (classSplitElements.clusterOverlay) {
-            classSplitElements.clusterOverlay.addEventListener("change", renderClassSplitPlot);
-        }
         if (classSplitElements.clusterSource) {
             classSplitElements.clusterSource.addEventListener("change", refreshClassSplitClusterControls);
         }
@@ -43506,6 +44366,49 @@ async function cancelRfDetrTrainingJobRequest() {
                 });
             });
         }
+        if (classSplitElements.qwenReviewRefresh) {
+            classSplitElements.qwenReviewRefresh.addEventListener("click", () => {
+                refreshClassSplitQwenReviewModels().catch((error) => {
+                    console.error("Class Split Qwen model refresh failed", error);
+                });
+            });
+        }
+        if (classSplitElements.qwenReviewModel) {
+            classSplitElements.qwenReviewModel.addEventListener("change", () => {
+                setClassSplitQwenReviewStatus(
+                    classSplitElements.qwenReviewModel.value
+                        ? `Reviewer model set to ${classSplitElements.qwenReviewModel.value}.`
+                        : "Reviewer will use the active model.",
+                    "info"
+                );
+            });
+        }
+        if (classSplitElements.qwenReviewGlossary) {
+            classSplitElements.qwenReviewGlossary.addEventListener("input", () => {
+                classSplitState.qwenReviewGlossaryDirty = true;
+                setClassSplitQwenReviewContextStatus("Review glossary has unsaved session edits.", "info");
+            });
+        }
+        if (classSplitElements.qwenReviewGuidance) {
+            classSplitElements.qwenReviewGuidance.addEventListener("input", () => {
+                setClassSplitQwenReviewContextStatus("Review guidance will be sent with each Qwen review.", "info");
+            });
+        }
+        if (classSplitElements.qwenReviewGlossaryReset) {
+            classSplitElements.qwenReviewGlossaryReset.addEventListener("click", () => {
+                loadClassSplitQwenReviewGlossary({ force: true }).catch((error) => {
+                    console.error("Class Split review glossary reset failed", error);
+                    setClassSplitQwenReviewContextStatus(`Glossary reset failed: ${error.message || error}`, "error");
+                });
+            });
+        }
+        if (classSplitElements.qwenReviewGlossarySave) {
+            classSplitElements.qwenReviewGlossarySave.addEventListener("click", () => {
+                saveClassSplitQwenReviewGlossary().catch((error) => {
+                    console.error("Class Split review glossary save failed", error);
+                });
+            });
+        }
         if (classSplitElements.bulkApply) {
             classSplitElements.bulkApply.addEventListener("click", () => {
                 changeClassSplitSelectedPointsClass(classSplitElements.bulkClass?.value || "").catch((error) => {
@@ -43531,6 +44434,12 @@ async function cancelRfDetrTrainingJobRequest() {
         }
         applyEmbeddingRecipePresetToClassSplit(classSplitElements.recipePreset?.value || "precise");
         populateClassSplitClasses({ preserveSelection: true });
+        refreshClassSplitQwenReviewModels().catch((error) => {
+            console.warn("Initial Class Split Qwen model refresh failed", error);
+        });
+        loadClassSplitQwenReviewGlossary().catch((error) => {
+            console.warn("Initial Class Split Qwen glossary load failed", error);
+        });
         refreshClassSplitControls();
         loadClassSplitClipBackbones()
             .then(() => loadClassSplitCapabilities())
@@ -43605,15 +44514,16 @@ async function cancelRfDetrTrainingJobRequest() {
             classSplitClusterDebugState() {
                 const summaries = getClassSplitVisibleClusterSummaries();
                 const scope = getClassSplitResultScope();
+                const classFilteredPoints = getClassSplitFilteredPoints();
+                const graphFilteredPoints = getClassSplitGraphPoints();
                 return {
                     scope,
                     analysisScope: scope,
                     filterClass: String(classSplitElements.filterClass?.value || ""),
-                    filteredCount: getClassSplitFilteredPoints().length,
+                    classFilteredCount: classFilteredPoints.length,
+                    filteredCount: graphFilteredPoints.length,
                     proposalsAllowed: classSplitClusterProposalsAllowed(),
                     hullsAllowed: classSplitClusterHullsAllowed(),
-                    overlayDisabled: classSplitElements.clusterOverlay ? !!classSplitElements.clusterOverlay.disabled : true,
-                    overlayChecked: classSplitElements.clusterOverlay ? !!classSplitElements.clusterOverlay.checked : false,
                     clusterKeys: summaries.map((summary) => String(summary.clusterKey || "")),
                 };
             },
@@ -43638,9 +44548,10 @@ async function cancelRfDetrTrainingJobRequest() {
     }
 
     document.addEventListener("DOMContentLoaded", () => {
-        initHelpTooltips();
+        preventUiOnlyFormSubmits();
+        refreshUiTooltips();
+        initializeUiTooltipObserver();
         initializeThemeToggle();
-        initializeAdaptiveTopTabs();
         setupTabNavigation();
         applyPlaywrightTestIds();
         autoModeCheckbox = document.getElementById("autoMode");
@@ -49364,6 +50275,350 @@ async function cancelRfDetrTrainingJobRequest() {
         const imageList = document.getElementById("imageList");
         const classList = document.getElementById("classList");
         let modeSnapshot = null;
+        let shortcutCaptureActionId = null;
+        const SHORTCUT_STORAGE_KEY = "tator.annotation.shortcuts.v1";
+        const CLASS_SHORTCUT_ID_PATTERN = /^class_id_(\d+)$/;
+        const MODIFIER_KEYS = new Set(["Shift", "Control", "Alt", "Meta", "OS"]);
+
+        const makeBinding = (code, key, modifiers = {}) => ({
+            code,
+            key,
+            ctrl: !!modifiers.ctrl,
+            meta: !!modifiers.meta,
+            alt: !!modifiers.alt,
+            shift: !!modifiers.shift,
+        });
+
+        const baseShortcutActions = [
+            {
+                id: "image_next",
+                group: "Images",
+                label: "Next image",
+                description: "Switch to the next image.",
+                defaultBindings: [makeBinding("Space", "Space"), makeBinding("ArrowRight", "ArrowRight")],
+                run: () => navigateImage(1),
+            },
+            {
+                id: "image_previous",
+                group: "Images",
+                label: "Previous image",
+                description: "Switch to the previous image.",
+                defaultBindings: [makeBinding("Tab", "Tab"), makeBinding("ArrowLeft", "ArrowLeft")],
+                run: () => navigateImage(-1),
+            },
+            {
+                id: "class_next",
+                group: "Classes",
+                label: "Next class",
+                description: "Move the class carousel down.",
+                defaultBindings: [makeBinding("KeyR", "R"), makeBinding("ArrowDown", "ArrowDown")],
+                allowRepeat: true,
+                run: () => cycleClassSelection(1),
+            },
+            {
+                id: "class_previous",
+                group: "Classes",
+                label: "Previous class",
+                description: "Move the class carousel up.",
+                defaultBindings: [makeBinding("KeyE", "E"), makeBinding("ArrowUp", "ArrowUp")],
+                allowRepeat: true,
+                run: () => cycleClassSelection(-1),
+            },
+            {
+                id: "drawing_start",
+                group: "Drawing",
+                label: "Start drawing",
+                description: "Enable drawing. In segmentation mode this starts or resumes polygon drawing.",
+                defaultBindings: [],
+                run: () => startAnnotationDrawing(),
+            },
+            {
+                id: "drawing_finish",
+                group: "Drawing",
+                label: "End drawing",
+                description: "Finish a polygon draft when possible, otherwise pause drawing.",
+                defaultBindings: [],
+                run: () => finishAnnotationDrawing(),
+            },
+            {
+                id: "drawing_toggle",
+                group: "Drawing",
+                label: "Toggle polygon drawing",
+                description: "Switch to segmentation mode or pause/resume polygon drawing.",
+                defaultBindings: [makeBinding("KeyP", "P")],
+                run: () => togglePolygonDrawingShortcut(),
+            },
+            {
+                id: "drawing_cancel",
+                group: "Drawing",
+                label: "Cancel drawing / exit focus",
+                description: "Exit focus mode, clear a polygon draft, or clear the selected object.",
+                defaultBindings: [makeBinding("Escape", "Escape")],
+                run: () => cancelAnnotationDrawingOrFocus(),
+            },
+            {
+                id: "focus_toggle",
+                group: "View",
+                label: "Toggle image focus",
+                description: "Enter or leave image-only focus mode.",
+                defaultBindings: [makeBinding("KeyV", "V")],
+                run: () => {
+                    toggleAnnotationFocusMode();
+                    return true;
+                },
+            },
+            {
+                id: "temporary_mode_pause",
+                group: "Modes",
+                label: "Hold to pause Auto/SAM",
+                description: "Temporarily pause Auto Class and SAM while held.",
+                defaultBindings: [makeBinding("KeyZ", "Z")],
+                hold: true,
+                run: () => beginTemporaryModePause(),
+                release: () => endTemporaryModePause(),
+            },
+            {
+                id: "auto_toggle",
+                group: "Modes",
+                label: "Toggle auto-class",
+                description: "Turn auto-class on or off.",
+                defaultBindings: [makeBinding("KeyA", "A")],
+                disabledWhenPaused: true,
+                run: () => {
+                    updateAutoModeState(!autoMode);
+                    showShortcutToast("auto_toggle", `Auto-class: ${autoMode ? "ON" : "OFF"}.`);
+                    showAnnotationFocusHud();
+                    return true;
+                },
+            },
+            {
+                id: "sam_toggle",
+                group: "SAM",
+                label: "Toggle SAM",
+                description: "Turn SAM mode on or off.",
+                defaultBindings: [makeBinding("KeyS", "S")],
+                disabledWhenPaused: true,
+                run: () => {
+                    updateSamModeState(!samMode);
+                    showShortcutToast("sam_toggle", `SAM mode: ${samMode ? "ON" : "OFF"}.`);
+                    showAnnotationFocusHud();
+                    return true;
+                },
+            },
+            {
+                id: "sam_point_toggle",
+                group: "SAM",
+                label: "Toggle point mode",
+                description: "Enable or disable SAM point mode.",
+                defaultBindings: [makeBinding("KeyD", "D")],
+                disabledWhenPaused: true,
+                run: () => {
+                    if (!pointMode) {
+                        if (!samMode) {
+                            updateSamModeState(true);
+                        }
+                        updatePointModeState(true);
+                    } else {
+                        updatePointModeState(false);
+                    }
+                    showShortcutToast("sam_point_toggle", `SAM point: ${pointMode ? "ON" : "OFF"}.`);
+                    showAnnotationFocusHud();
+                    return true;
+                },
+            },
+            {
+                id: "sam_multi_toggle",
+                group: "SAM",
+                label: "Toggle multi-point",
+                description: "Enable or disable SAM multi-point mode.",
+                defaultBindings: [makeBinding("KeyM", "M")],
+                disabledWhenPaused: true,
+                run: () => {
+                    if (!multiPointMode) {
+                        if (!samMode) {
+                            updateSamModeState(true);
+                        }
+                        updateMultiPointState(true);
+                    } else {
+                        updateMultiPointState(false);
+                    }
+                    showShortcutToast("sam_multi_toggle", `SAM multi-point: ${multiPointMode ? "ON" : "OFF"}.`);
+                    showAnnotationFocusHud();
+                    return true;
+                },
+            },
+            {
+                id: "multi_point_positive",
+                group: "SAM",
+                label: "Add positive point",
+                description: "Add a positive point at the cursor in multi-point mode.",
+                defaultBindings: [makeBinding("KeyF", "F")],
+                disabledWhenPaused: true,
+                requires: () => multiPointMode,
+                run: () => {
+                    addMultiPointAnnotation(1);
+                    showShortcutToast("multi_point_pos", "Multi-point: +positive.", { cooldownMs: 600 });
+                    return true;
+                },
+            },
+            {
+                id: "multi_point_negative",
+                group: "SAM",
+                label: "Add negative point",
+                description: "Add a negative point at the cursor in multi-point mode.",
+                defaultBindings: [makeBinding("KeyG", "G")],
+                disabledWhenPaused: true,
+                requires: () => multiPointMode,
+                run: () => {
+                    addMultiPointAnnotation(0);
+                    showShortcutToast("multi_point_neg", "Multi-point: +negative.", { cooldownMs: 600 });
+                    return true;
+                },
+            },
+            {
+                id: "multi_point_submit",
+                group: "SAM",
+                label: "Submit multi-point mask",
+                description: "Submit the current multi-point prompt.",
+                defaultBindings: [makeBinding("Enter", "Enter")],
+                disabledWhenPaused: true,
+                requires: () => multiPointMode,
+                run: () => {
+                    submitMultiPointSelection().catch((error) => {
+                        console.error("Failed to submit multi-point selection", error);
+                    });
+                    showShortcutToast("multi_point_submit", "Multi-point submitted.");
+                    return true;
+                },
+            },
+            {
+                id: "magic_tweak",
+                group: "Box edits",
+                label: "Magic tweak",
+                description: "Run magic tweak on selected boxes or the current class.",
+                defaultBindings: [makeBinding("KeyW", "W")],
+                run: () => {
+                    handleMagicTweakTapHotkey();
+                    showShortcutToast("magic_tweak", "Magic tweak requested.");
+                    return true;
+                },
+            },
+            {
+                id: "delete_selected_current",
+                group: "Box edits",
+                label: "Delete selected/current boxes",
+                description: "Delete selected boxes, otherwise delete the current box.",
+                defaultBindings: [makeBinding("Backspace", "Backspace"), makeBinding("Delete", "Delete"), makeBinding("KeyX", "X")],
+                run: () => deleteSelectedOrCurrentBboxShortcut(),
+            },
+            {
+                id: "delete_latest",
+                group: "Box edits",
+                label: "Delete latest box",
+                description: "Delete the most recently created box on the current image.",
+                defaultBindings: [makeBinding("KeyQ", "Q")],
+                run: () => deleteLatestBboxShortcut(),
+            },
+            {
+                id: "region_detect_hold",
+                group: "Detection/export",
+                label: "Hold for region detect",
+                description: "Hold, then drag a region for YOLO/RF-DETR detection.",
+                defaultBindings: [makeBinding("KeyR", "R", { shift: true })],
+                hold: true,
+                run: () => beginRegionDetectHold(),
+                release: () => {
+                    mouse.yoloKeyActive = false;
+                    return true;
+                },
+            },
+            {
+                id: "sam3_similarity",
+                group: "Detection/export",
+                label: "Run SAM3 similarity",
+                description: "Run SAM3 similarity from the selected/current bbox.",
+                defaultBindings: [makeBinding("Digit1", "1")],
+                disabledWhenPaused: true,
+                run: () => {
+                    triggerSam3SimilarityHotkey().catch((error) => {
+                        console.error("SAM3 similarity hotkey action failed", error);
+                    });
+                    showShortcutToast("sam3_similarity", "SAM3 similarity requested.");
+                    return true;
+                },
+            },
+            {
+                id: "yolo_captions_export",
+                group: "Detection/export",
+                label: "Save YOLO + captions",
+                description: "Request YOLO labels plus captions export.",
+                defaultBindings: [makeBinding("KeyY", "Y", { shift: true })],
+                run: () => {
+                    runYoloCaptionsExport({ preferDirectory: true }).catch((error) => {
+                        console.error("YOLO + captions hotkey export failed", error);
+                    });
+                    showShortcutToast("yolo_captions_export", "YOLO + captions export requested.");
+                    return true;
+                },
+            },
+        ];
+        let shortcutActions = [];
+        let shortcutActionById = new Map();
+        let shortcutClassListSignature = "";
+        let shortcutClassRefreshFrame = null;
+        let shortcutClassListObserver = null;
+
+        function getShortcutClassNames() {
+            if (!classList || !classList.options || !classList.options.length) {
+                return [];
+            }
+            return Array.from(classList.options)
+                .map((option) => String(option.text || option.textContent || option.value || "").trim())
+                .filter(Boolean);
+        }
+
+        function makeClassShortcutAction(index, className) {
+            const label = className || `Class ${index}`;
+            return {
+                id: `class_id_${index}`,
+                group: "Class IDs",
+                label: `Select ${label} (#${index})`,
+                description: `Select labelmap class ${index}: ${label}.`,
+                defaultBindings: [],
+                run: () => selectClassByIndex(index),
+            };
+        }
+
+        function refreshShortcutActions() {
+            const classNames = getShortcutClassNames();
+            shortcutClassListSignature = classNames.join("\u001f");
+            shortcutActions = baseShortcutActions.concat(
+                classNames.map((className, index) => makeClassShortcutAction(index, className))
+            );
+            shortcutActionById = new Map(shortcutActions.map((action) => [action.id, action]));
+            if (shortcutCaptureActionId && !shortcutActionById.has(shortcutCaptureActionId)) {
+                shortcutCaptureActionId = null;
+            }
+            return classNames;
+        }
+
+        function refreshShortcutActionsIfNeeded() {
+            const classNames = getShortcutClassNames();
+            const signature = classNames.join("\u001f");
+            if (!shortcutActions.length || signature !== shortcutClassListSignature) {
+                return refreshShortcutActions();
+            }
+            return classNames;
+        }
+
+        function isKnownOrDeferredShortcutAction(actionId) {
+            const normalized = String(actionId || "");
+            return shortcutActionById.has(normalized) || CLASS_SHORTCUT_ID_PATTERN.test(normalized);
+        }
+
+        refreshShortcutActions();
+        let shortcutState = loadShortcutState();
+
         const cycleClassSelection = (delta) => {
             if (!classList || classList.length <= 1) {
                 return false;
@@ -49373,88 +50628,797 @@ async function cancelRfDetrTrainingJobRequest() {
                 ? classList.selectedIndex
                 : Math.min(Math.max(0, classListIndex || 0), total - 1);
             const nextIndex = (currentIndex + delta + total) % total;
-            if (classList.selectedOptions && classList.selectedOptions.length > 1) {
-                Array.from(classList.selectedOptions).forEach((option) => {
-                    option.selected = false;
-                });
-            } else if (currentIndex >= 0 && currentIndex < total) {
-                classList.options[currentIndex].selected = false;
-            }
-            classListIndex = nextIndex;
-            classList.options[classListIndex].selected = true;
-            classList.selectedIndex = classListIndex;
-            setCurrentClass();
-            showClassScrollIndicatorForList(classList, classListIndex, {
+            return selectClassByIndex(nextIndex, {
                 direction: delta > 0 ? 1 : -1,
+                wrapIndex: currentIndex,
+                quiet: true,
             });
-            return true;
         };
-        const isLabelingTabActive = () => {
+
+        function isLabelingTabActive() {
             const labelingPanel = document.getElementById("tabLabeling");
             return activeTab === TAB_LABELING || !!labelingPanel?.classList.contains("active");
-        };
-        const imageNavigationKey = (event) => {
-            const eventKey = event.keyCode || event.charCode;
-            if (eventKey === 32 || event.key === " " || event.key === "Spacebar" || event.code === "Space") {
-                return 1;
-            }
-            if (eventKey === 9 || event.key === "Tab" || event.code === "Tab") {
-                return -1;
-            }
-            return null;
-        };
-        const isTextEditingTarget = (target) => {
+        }
+
+        function isTextEditingTarget(target) {
             const targetElement = target instanceof Element ? target : null;
             if (!targetElement) {
                 return false;
+            }
+            if (targetElement.closest && targetElement.closest(".shortcut-settings-panel")) {
+                return true;
             }
             const targetTag = (targetElement.tagName || "").toLowerCase();
             const inputType = targetElement.getAttribute("type")
                 ? targetElement.getAttribute("type").toLowerCase()
                 : "";
             return targetTag === "textarea"
-                || (targetTag === "input" && !["checkbox", "radio", "button", "range", "color"].includes(inputType))
+                || (targetTag === "input" && !["checkbox", "radio", "button", "range", "color", "file"].includes(inputType))
                 || !!targetElement.isContentEditable;
-        };
-        const shouldHandleKeyboardImageNavigation = (event) => {
-            if (
-                !isLabelingTabActive()
-                || event.repeat
-                || event.ctrlKey
-                || event.metaKey
-                || event.altKey
-                || !imageNavigationKey(event)
-            ) {
+        }
+
+        function normalizeShortcutKey(key) {
+            const raw = String(key || "").trim();
+            if (!raw) {
+                return "";
+            }
+            if (raw === " ") {
+                return "Space";
+            }
+            if (raw.length === 1) {
+                return raw.toLowerCase();
+            }
+            return raw.toLowerCase();
+        }
+
+        function normalizeBinding(binding) {
+            if (!binding || typeof binding !== "object") {
+                return null;
+            }
+            const code = String(binding.code || "").trim();
+            const rawKey = String(binding.key || "").trim() || code;
+            if (!code && !rawKey) {
+                return null;
+            }
+            return {
+                code,
+                key: rawKey === " " ? "Space" : rawKey,
+                ctrl: !!binding.ctrl,
+                meta: !!binding.meta,
+                alt: !!binding.alt,
+                shift: !!binding.shift,
+            };
+        }
+
+        function bindingSignature(binding) {
+            const normalized = normalizeBinding(binding);
+            if (!normalized) {
+                return "";
+            }
+            return [
+                normalized.ctrl ? "Ctrl" : "",
+                normalized.meta ? "Meta" : "",
+                normalized.alt ? "Alt" : "",
+                normalized.shift ? "Shift" : "",
+                normalized.code || normalizeShortcutKey(normalized.key),
+            ].filter(Boolean).join("+");
+        }
+
+        function eventToBinding(event) {
+            if (!event || MODIFIER_KEYS.has(event.key)) {
+                return null;
+            }
+            const code = String(event.code || "").trim();
+            const key = event.key === " " ? "Space" : String(event.key || code || "").trim();
+            if (!code && !key) {
+                return null;
+            }
+            return normalizeBinding({
+                code,
+                key,
+                ctrl: event.ctrlKey,
+                meta: event.metaKey,
+                alt: event.altKey,
+                shift: event.shiftKey,
+            });
+        }
+
+        function eventMatchesBinding(event, binding) {
+            const normalized = normalizeBinding(binding);
+            if (!event || !normalized) {
                 return false;
             }
-            if (annotationFocusMode) {
-                return true;
-            }
-            if (isTextEditingTarget(event.target)) {
+            if (!!event.ctrlKey !== normalized.ctrl || !!event.metaKey !== normalized.meta || !!event.altKey !== normalized.alt || !!event.shiftKey !== normalized.shift) {
                 return false;
             }
-            return true;
-        };
-        const handleKeyboardImageNavigation = (event) => {
-            if (event.__tatorImageNavigationHandled) {
-                return false;
+            if (normalized.code) {
+                return event.code === normalized.code;
             }
-            const direction = imageNavigationKey(event);
-            if (!shouldHandleKeyboardImageNavigation(event) || !direction) {
-                return false;
+            return normalizeShortcutKey(event.key) === normalizeShortcutKey(normalized.key);
+        }
+
+        function bindingLabel(binding) {
+            const normalized = normalizeBinding(binding);
+            if (!normalized) {
+                return "Unassigned";
             }
-            event.__tatorImageNavigationHandled = true;
-            navigateImage(direction);
+            const parts = [];
+            if (normalized.ctrl) parts.push("Ctrl");
+            if (normalized.meta) parts.push("Cmd");
+            if (normalized.alt) parts.push("Alt");
+            if (normalized.shift) parts.push("Shift");
+            const codeLabel = {
+                Space: "Space",
+                Tab: "Tab",
+                Escape: "Esc",
+                Enter: "Enter",
+                Backspace: "Backspace",
+                Delete: "Delete",
+                ArrowLeft: "←",
+                ArrowRight: "→",
+                ArrowUp: "↑",
+                ArrowDown: "↓",
+            }[normalized.code];
+            if (codeLabel) {
+                parts.push(codeLabel);
+            } else if (/^Key[A-Z]$/.test(normalized.code)) {
+                parts.push(normalized.code.slice(3));
+            } else if (/^Digit[0-9]$/.test(normalized.code)) {
+                parts.push(normalized.code.slice(5));
+            } else {
+                parts.push(normalized.key || normalized.code);
+            }
+            return parts.join(" + ");
+        }
+
+        function defaultShortcutBindings(action) {
+            return (action.defaultBindings || []).map(normalizeBinding).filter(Boolean);
+        }
+
+        function getShortcutBindings(actionId) {
+            refreshShortcutActionsIfNeeded();
+            const action = shortcutActionById.get(actionId);
+            if (!action) {
+                return [];
+            }
+            if (Object.prototype.hasOwnProperty.call(shortcutState.bindings, actionId)) {
+                return (shortcutState.bindings[actionId] || []).map(normalizeBinding).filter(Boolean);
+            }
+            return defaultShortcutBindings(action);
+        }
+
+        function shortcutActionMatches(event, actionId) {
+            return getShortcutBindings(actionId).some((binding) => eventMatchesBinding(event, binding));
+        }
+
+        function findShortcutActionForEvent(event, { includeHold = true } = {}) {
+            refreshShortcutActionsIfNeeded();
+            for (const action of shortcutActions) {
+                if (!includeHold && action.hold) {
+                    continue;
+                }
+                if (shortcutActionMatches(event, action.id)) {
+                    return action;
+                }
+            }
+            return null;
+        }
+
+        function loadShortcutState() {
+            const state = { version: 1, bindings: {} };
+            try {
+                const raw = window.localStorage.getItem(SHORTCUT_STORAGE_KEY);
+                if (!raw) {
+                    return state;
+                }
+                const parsed = JSON.parse(raw);
+                const bindings = parsed && typeof parsed === "object" && parsed.bindings && typeof parsed.bindings === "object"
+                    ? parsed.bindings
+                    : {};
+                Object.keys(bindings).forEach((actionId) => {
+                    if (!isKnownOrDeferredShortcutAction(actionId)) {
+                        return;
+                    }
+                    const rows = Array.isArray(bindings[actionId]) ? bindings[actionId] : [];
+                    state.bindings[actionId] = rows.map(normalizeBinding).filter(Boolean);
+                });
+            } catch (error) {
+                console.warn("Failed to load shortcut settings", error);
+            }
+            return state;
+        }
+
+        function saveShortcutState(message = "") {
+            try {
+                window.localStorage.setItem(SHORTCUT_STORAGE_KEY, JSON.stringify(shortcutState));
+            } catch (error) {
+                console.warn("Failed to save shortcut settings", error);
+                setShortcutSettingsMessage("Could not save shortcuts in this browser.", "error");
+            }
+            renderShortcutHelp();
+            renderShortcutSettings();
+            if (message) {
+                setShortcutSettingsMessage(message, "success");
+            }
+        }
+
+        function setShortcutSettingsMessage(text, variant = "") {
+            const el = document.getElementById("shortcutSettingsMessage");
+            if (!el) {
+                return;
+            }
+            el.textContent = text || "";
+            el.classList.remove("warn", "error", "success");
+            if (variant) {
+                el.classList.add(variant);
+            }
+        }
+
+        function removeShortcutBindingConflicts(actionId, bindings) {
+            refreshShortcutActionsIfNeeded();
+            const signatures = new Set(
+                (bindings || []).map(bindingSignature).filter(Boolean)
+            );
+            const movedFrom = [];
+            if (!signatures.size) {
+                return movedFrom;
+            }
+            shortcutActions.forEach((candidate) => {
+                if (candidate.id === actionId) {
+                    return;
+                }
+                const bindings = getShortcutBindings(candidate.id);
+                const filtered = bindings.filter((row) => !signatures.has(bindingSignature(row)));
+                if (filtered.length !== bindings.length) {
+                    shortcutState.bindings[candidate.id] = filtered;
+                    movedFrom.push(candidate.label);
+                }
+            });
+            return movedFrom;
+        }
+
+        function assignShortcutBinding(actionId, binding) {
+            const normalized = normalizeBinding(binding);
+            const action = shortcutActionById.get(actionId);
+            if (!action || !normalized) {
+                return;
+            }
+            const signature = bindingSignature(normalized);
+            const movedFrom = removeShortcutBindingConflicts(actionId, [normalized]);
+            const current = getShortcutBindings(actionId);
+            if (!current.some((row) => bindingSignature(row) === signature)) {
+                current.push(normalized);
+            }
+            shortcutState.bindings[actionId] = current;
+            const moveText = movedFrom.length ? ` Moved from ${movedFrom.join(", ")}.` : "";
+            saveShortcutState(`${bindingLabel(normalized)} assigned to ${action.label}.${moveText}`);
+        }
+
+        function clearShortcutBindings(actionId) {
+            const action = shortcutActionById.get(actionId);
+            if (!action) {
+                return;
+            }
+            shortcutState.bindings[actionId] = [];
+            if (shortcutCaptureActionId === actionId) {
+                shortcutCaptureActionId = null;
+            }
+            saveShortcutState(`${action.label} is now unassigned.`);
+        }
+
+        function resetShortcutBindings(actionId) {
+            const action = shortcutActionById.get(actionId);
+            if (!action) {
+                return;
+            }
+            const movedFrom = removeShortcutBindingConflicts(actionId, defaultShortcutBindings(action));
+            delete shortcutState.bindings[actionId];
+            if (shortcutCaptureActionId === actionId) {
+                shortcutCaptureActionId = null;
+            }
+            const moveText = movedFrom.length ? ` Removed conflicting defaults from ${movedFrom.join(", ")}.` : "";
+            saveShortcutState(`${action.label} reset to default.${moveText}`);
+        }
+
+        function resetAllShortcutBindings() {
+            shortcutState = { version: 1, bindings: {} };
+            shortcutCaptureActionId = null;
+            saveShortcutState("All shortcuts reset to defaults.");
+        }
+
+        function stopShortcutEvent(event) {
             event.preventDefault();
             if (typeof event.stopImmediatePropagation === "function") {
                 event.stopImmediatePropagation();
             } else {
                 event.stopPropagation();
             }
+        }
+
+        function captureShortcutBindingEvent(event) {
+            if (!shortcutCaptureActionId) {
+                return false;
+            }
+            const binding = eventToBinding(event);
+            if (!binding) {
+                stopShortcutEvent(event);
+                return true;
+            }
+            const actionId = shortcutCaptureActionId;
+            shortcutCaptureActionId = null;
+            assignShortcutBinding(actionId, binding);
+            stopShortcutEvent(event);
+            return true;
+        }
+
+        function renderKeyList(container, bindings) {
+            if (!container) {
+                return;
+            }
+            container.innerHTML = "";
+            const rows = (bindings || []).map(normalizeBinding).filter(Boolean);
+            if (!rows.length) {
+                const empty = document.createElement("span");
+                empty.className = "shortcut-key shortcut-key--empty";
+                empty.textContent = "Unassigned";
+                container.appendChild(empty);
+                return;
+            }
+            rows.forEach((binding) => {
+                const chip = document.createElement("kbd");
+                chip.className = "shortcut-key";
+                chip.textContent = bindingLabel(binding);
+                container.appendChild(chip);
+            });
+        }
+
+        function shortcutKeyListHtml(actionId) {
+            const bindings = getShortcutBindings(actionId);
+            if (!bindings.length) {
+                return '<span class="shortcut-key shortcut-key--empty">Unassigned</span>';
+            }
+            return bindings.map((binding) => `<kbd class="shortcut-key">${escapeHtml(bindingLabel(binding))}</kbd>`).join(" ");
+        }
+
+        function renderShortcutHelp() {
+            const list = document.getElementById("shortcutHelpList");
+            if (!list) {
+                return;
+            }
+            const classNames = refreshShortcutActionsIfNeeded();
+            const classShortcutText = classNames.length
+                ? `Next ${shortcutKeyListHtml("class_next")}; previous ${shortcutKeyListHtml("class_previous")}; direct shortcuts are available for ${classNames.length} loaded labelmap class${classNames.length === 1 ? "" : "es"} in Customize keyboard shortcuts.`
+                : `Next ${shortcutKeyListHtml("class_next")}; previous ${shortcutKeyListHtml("class_previous")}; load a labelmap or dataset first to configure direct class shortcuts.`;
+            const groupRows = [
+                ["Images", `Next ${shortcutKeyListHtml("image_next")}; previous ${shortcutKeyListHtml("image_previous")}.`],
+                ["Drawing", `Start ${shortcutKeyListHtml("drawing_start")}; end ${shortcutKeyListHtml("drawing_finish")}; toggle polygon draw ${shortcutKeyListHtml("drawing_toggle")}; cancel/exit ${shortcutKeyListHtml("drawing_cancel")}.`],
+                ["Classes", classShortcutText],
+                ["Selection", "Shift + click adds/removes positive selections; Shift + drag draws a positive selection box; Shift + Alt + click/drag marks SAM3 similarity negatives."],
+                ["Box edits", `Delete selected/current ${shortcutKeyListHtml("delete_selected_current")}; delete latest ${shortcutKeyListHtml("delete_latest")}; magic tweak ${shortcutKeyListHtml("magic_tweak")}.`],
+                ["SAM", `Toggle SAM ${shortcutKeyListHtml("sam_toggle")}; point mode ${shortcutKeyListHtml("sam_point_toggle")}; multi-point ${shortcutKeyListHtml("sam_multi_toggle")}; positive ${shortcutKeyListHtml("multi_point_positive")}; negative ${shortcutKeyListHtml("multi_point_negative")}; submit ${shortcutKeyListHtml("multi_point_submit")}.`],
+                ["Detection/export", `Hold region detect ${shortcutKeyListHtml("region_detect_hold")}; SAM3 similarity ${shortcutKeyListHtml("sam3_similarity")}; Save YOLO + captions ${shortcutKeyListHtml("yolo_captions_export")}.`],
+                ["Canvas", "Mouse wheel zooms; Shift + wheel pans; right-click drag pans."],
+                ["Modes", `Auto-class ${shortcutKeyListHtml("auto_toggle")}; image focus ${shortcutKeyListHtml("focus_toggle")}; hold pause ${shortcutKeyListHtml("temporary_mode_pause")}.`],
+            ];
+            list.innerHTML = groupRows.map(([group, html]) => `<li><strong>${escapeHtml(group)}:</strong> ${html}</li>`).join("");
+        }
+
+        function renderShortcutSettings() {
+            const root = document.getElementById("shortcutSettingsList");
+            if (!root) {
+                return;
+            }
+            const classNames = refreshShortcutActionsIfNeeded();
+            root.innerHTML = "";
+            const groups = new Map();
+            shortcutActions.forEach((action) => {
+                if (!groups.has(action.group)) {
+                    groups.set(action.group, []);
+                }
+                groups.get(action.group).push(action);
+            });
+            groups.forEach((actions, groupName) => {
+                const section = document.createElement("section");
+                section.className = "shortcut-settings-group";
+                const title = document.createElement("div");
+                title.className = "shortcut-settings-group__title";
+                title.textContent = groupName;
+                section.appendChild(title);
+                actions.forEach((action) => {
+                    const row = document.createElement("div");
+                    row.className = "shortcut-settings-row";
+                    row.dataset.shortcutAction = action.id;
+                    if (shortcutCaptureActionId === action.id) {
+                        row.classList.add("is-capturing");
+                    }
+                    const label = document.createElement("div");
+                    label.className = "shortcut-settings-row__label";
+                    const strong = document.createElement("strong");
+                    strong.textContent = action.label;
+                    const desc = document.createElement("span");
+                    desc.textContent = shortcutCaptureActionId === action.id
+                        ? "Press the key combination to assign now."
+                        : action.description;
+                    label.append(strong, desc);
+                    const keys = document.createElement("div");
+                    keys.className = "shortcut-settings-row__keys";
+                    renderKeyList(keys, getShortcutBindings(action.id));
+                    const buttons = document.createElement("div");
+                    buttons.className = "shortcut-settings-row__actions";
+                    const addBtn = document.createElement("button");
+                    addBtn.type = "button";
+                    addBtn.className = "training-button secondary";
+                    addBtn.textContent = shortcutCaptureActionId === action.id ? "Cancel" : "Add key";
+                    addBtn.addEventListener("click", () => {
+                        shortcutCaptureActionId = shortcutCaptureActionId === action.id ? null : action.id;
+                        renderShortcutSettings();
+                        setShortcutSettingsMessage(
+                            shortcutCaptureActionId ? `Press a key for ${action.label}.` : "",
+                            shortcutCaptureActionId ? "warn" : ""
+                        );
+                    });
+                    const clearBtn = document.createElement("button");
+                    clearBtn.type = "button";
+                    clearBtn.className = "training-button secondary";
+                    clearBtn.textContent = "Clear";
+                    clearBtn.addEventListener("click", () => clearShortcutBindings(action.id));
+                    const resetBtn = document.createElement("button");
+                    resetBtn.type = "button";
+                    resetBtn.className = "training-button secondary";
+                    resetBtn.textContent = "Reset";
+                    resetBtn.addEventListener("click", () => resetShortcutBindings(action.id));
+                    buttons.append(addBtn, clearBtn, resetBtn);
+                    row.append(label, keys, buttons);
+                    section.appendChild(row);
+                });
+                root.appendChild(section);
+            });
+            if (!classNames.length) {
+                const section = document.createElement("section");
+                section.className = "shortcut-settings-group";
+                const title = document.createElement("div");
+                title.className = "shortcut-settings-group__title";
+                title.textContent = "Class IDs";
+                const row = document.createElement("div");
+                row.className = "shortcut-settings-row shortcut-settings-row--notice";
+                const label = document.createElement("div");
+                label.className = "shortcut-settings-row__label";
+                const strong = document.createElement("strong");
+                strong.textContent = "Load a labelmap first";
+                const desc = document.createElement("span");
+                desc.textContent = "Direct class shortcuts are created from the active labelmap, so Tator can expose every real class and avoid stale fixed IDs.";
+                label.append(strong, desc);
+                row.appendChild(label);
+                section.append(title, row);
+                root.appendChild(section);
+            }
+        }
+
+        function initShortcutSettingsUi() {
+            renderShortcutHelp();
+            renderShortcutSettings();
+            if (classList && "MutationObserver" in window && !shortcutClassListObserver) {
+                const refreshShortcutClassUi = () => {
+                    if (shortcutClassRefreshFrame !== null) {
+                        return;
+                    }
+                    shortcutClassRefreshFrame = window.requestAnimationFrame(() => {
+                        shortcutClassRefreshFrame = null;
+                        refreshShortcutActions();
+                        renderShortcutHelp();
+                        renderShortcutSettings();
+                    });
+                };
+                shortcutClassListObserver = new MutationObserver(refreshShortcutClassUi);
+                shortcutClassListObserver.observe(classList, { childList: true });
+            }
+            const resetAll = document.getElementById("shortcutResetAll");
+            const exportButton = document.getElementById("shortcutExportConfig");
+            const importButton = document.getElementById("shortcutImportConfigButton");
+            const importInput = document.getElementById("shortcutImportConfig");
+            if (resetAll) {
+                resetAll.addEventListener("click", resetAllShortcutBindings);
+            }
+            if (exportButton) {
+                exportButton.addEventListener("click", () => {
+                    const payload = {
+                        version: 1,
+                        exported_at: new Date().toISOString(),
+                        bindings: shortcutState.bindings,
+                    };
+                    const blob = new Blob([JSON.stringify(payload, null, 2)], { type: "application/json" });
+                    saveBlobToDisk(blob, "tator-shortcuts.json");
+                    setShortcutSettingsMessage("Shortcut configuration exported.", "success");
+                });
+            }
+            if (importButton && importInput) {
+                importButton.addEventListener("click", () => importInput.click());
+                importInput.addEventListener("change", async () => {
+                    const file = importInput.files && importInput.files[0];
+                    if (!file) {
+                        return;
+                    }
+                    try {
+                        const text = await readFileAsTextPromise(file);
+                        const parsed = JSON.parse(text);
+                        const nextState = { version: 1, bindings: {} };
+                        const bindings = parsed && typeof parsed === "object" && parsed.bindings && typeof parsed.bindings === "object"
+                            ? parsed.bindings
+                            : {};
+                        Object.keys(bindings).forEach((actionId) => {
+                            if (!isKnownOrDeferredShortcutAction(actionId)) {
+                                return;
+                            }
+                            const rows = Array.isArray(bindings[actionId]) ? bindings[actionId] : [];
+                            nextState.bindings[actionId] = rows.map(normalizeBinding).filter(Boolean);
+                        });
+                        shortcutState = nextState;
+                        saveShortcutState("Shortcut configuration imported.");
+                    } catch (error) {
+                        console.error("Shortcut import failed", error);
+                        setShortcutSettingsMessage(`Import failed: ${error.message || error}`, "error");
+                    } finally {
+                        importInput.value = "";
+                    }
+                });
+            }
+        }
+
+        function selectClassByIndex(index, options = {}) {
+            if (!classList || !classList.options.length) {
+                return false;
+            }
+            const targetIndex = Number(index);
+            if (!Number.isInteger(targetIndex) || targetIndex < 0 || targetIndex >= classList.options.length) {
+                if (!options.quiet) {
+                    showShortcutToast("class_select", `Class ID ${index} is not available in this dataset.`);
+                }
+                return false;
+            }
+            if (classList.selectedOptions && classList.selectedOptions.length > 1) {
+                Array.from(classList.selectedOptions).forEach((option) => {
+                    option.selected = false;
+                });
+            }
+            classListIndex = targetIndex;
+            Array.from(classList.options).forEach((option, idx) => {
+                option.selected = idx === targetIndex;
+            });
+            classList.selectedIndex = targetIndex;
+            setCurrentClass();
+            showClassScrollIndicatorForList(classList, classListIndex, {
+                direction: Number(options.direction) || 0,
+            });
+            if (!options.quiet) {
+                showShortcutToast("class_select", `Class ${targetIndex}: ${classList.options[targetIndex].text}`);
+            }
+            return true;
+        }
+
+        function startAnnotationDrawing() {
+            if (datasetType === "seg") {
+                setPolygonDrawEnabled(true);
+                if (!polygonDraft && currentClass) {
+                    polygonDraft = { className: currentClass, points: [] };
+                }
+                showShortcutToast("drawing_start", "Polygon drawing started.");
+            } else {
+                setGlobalCursor("crosshair");
+                showShortcutToast("drawing_start", "Box drawing is ready; drag on the image to draw.");
+            }
+            showAnnotationFocusHud();
+            return true;
+        }
+
+        function finishAnnotationDrawing() {
+            if (datasetType === "seg") {
+                if (polygonDraft && Array.isArray(polygonDraft.points) && polygonDraft.points.length >= 3) {
+                    finalizePolygonDraft();
+                    showShortcutToast("drawing_finish", "Polygon finished.");
+                } else {
+                    polygonDraft = null;
+                    polygonDrag = null;
+                    setPolygonDrawEnabled(false);
+                    showShortcutToast("drawing_finish", "Polygon drawing paused.");
+                }
+            } else {
+                setGlobalCursor("default");
+                currentBbox = null;
+                showShortcutToast("drawing_finish", "Box drawing ends on mouse release.");
+            }
+            showAnnotationFocusHud();
+            return true;
+        }
+
+        function togglePolygonDrawingShortcut() {
+            if (datasetType !== "seg") {
+                setDatasetType("seg");
+                setPolygonDrawEnabled(true);
+                showShortcutToast("polygon_toggle", "Polygon draw: ON (seg mode).");
+                showAnnotationFocusHud();
+                return true;
+            }
+            setPolygonDrawEnabled(!polygonDrawEnabled);
+            showShortcutToast("polygon_toggle", `Polygon draw: ${polygonDrawEnabled ? "ON" : "OFF"}.`);
+            showAnnotationFocusHud();
+            return true;
+        }
+
+        function cancelAnnotationDrawingOrFocus() {
+            if (annotationFocusMode) {
+                exitAnnotationFocusMode();
+                return true;
+            }
+            if (datasetType === "seg") {
+                polygonDraft = null;
+                polygonDrag = null;
+                currentBbox = null;
+                showShortcutToast("drawing_cancel", "Polygon draft cleared.");
+                return true;
+            }
+            currentBbox = null;
+            setGlobalCursor("default");
+            return true;
+        }
+
+        function beginTemporaryModePause() {
+            if (!modeSnapshot) {
+                modeSnapshot = {
+                    auto: autoMode,
+                    sam: samMode,
+                    point: pointMode,
+                    multi: multiPointMode,
+                };
+                updateSamModeState(false, { preservePoints: true });
+                updateAutoModeState(false);
+                showShortcutToast("hold_z", "SAM/Auto paused while held.");
+                showAnnotationFocusHud();
+            }
+            return true;
+        }
+
+        function endTemporaryModePause() {
+            if (!modeSnapshot) {
+                return false;
+            }
+            const snapshot = modeSnapshot;
+            modeSnapshot = null;
+            updateSamModeState(snapshot.sam);
+            updateAutoModeState(snapshot.auto);
+            updatePointModeState(snapshot.point);
+            updateMultiPointState(snapshot.multi);
+            showShortcutToast("hold_z", "Modes restored.", { cooldownMs: 800 });
+            showAnnotationFocusHud();
+            return true;
+        }
+
+        function beginRegionDetectHold() {
+            mouse.yoloKeyActive = true;
+            const regionModeLabel = getRegionDetectorMode() === "rfdetr" ? "RF-DETR" : "YOLO";
+            showShortcutToast(
+                "yolo_region",
+                `${regionModeLabel} region mode: drag a box to scan (zoom in for more detail).`,
+                { durationMs: 4000, cooldownMs: 2000 }
+            );
+            return true;
+        }
+
+        function deleteSelectedOrCurrentBboxShortcut() {
+            if (!annotationEditableGuard("Delete")) {
+                return true;
+            }
+            if (selectedBboxes.size) {
+                const removed = deleteSelectedBboxes();
+                if (removed > 0) {
+                    showShortcutToast("delete_bbox", `Deleted ${removed} selection${removed === 1 ? "" : "s"}.`);
+                    return true;
+                }
+            }
+            if (currentBbox !== null) {
+                const imageBuckets = currentImage ? bboxes[currentImage.name] : null;
+                const className = currentBbox.bbox?.class;
+                const bucket = imageBuckets && className ? imageBuckets[className] : null;
+                let removed = false;
+                if (Array.isArray(bucket) && currentBbox.index >= 0 && currentBbox.index < bucket.length) {
+                    const spliceResult = bucket.splice(currentBbox.index, 1);
+                    if (bucket.length === 0 && className) {
+                        delete imageBuckets[className];
+                    }
+                    removed = spliceResult.length > 0;
+                }
+                currentBbox = null;
+                setGlobalCursor("default");
+                if (removed) {
+                    showShortcutToast("delete_bbox", "Deleted 1 bbox.");
+                    scheduleAnnotationDiversityMetricRefresh();
+                }
+            }
+            return true;
+        }
+
+        function deleteLatestBboxShortcut() {
+            if (!annotationEditableGuard("Delete")) {
+                return true;
+            }
+            let removed = false;
+            if (currentImage && bboxes[currentImage.name]) {
+                const latest = findLatestCreatedBbox(currentImage.name);
+                if (latest) {
+                    const bucket = bboxes[currentImage.name][latest.className];
+                    if (Array.isArray(bucket)) {
+                        const spliceResult = bucket.splice(latest.index, 1);
+                        if (bucket.length === 0) {
+                            delete bboxes[currentImage.name][latest.className];
+                        }
+                        if (spliceResult.length > 0) {
+                            removed = true;
+                            if (currentBbox && currentBbox.bbox === spliceResult[0]) {
+                                currentBbox = null;
+                                setGlobalCursor("default");
+                            }
+                        }
+                    }
+                }
+            }
+            if (removed) {
+                showShortcutToast("delete_latest", "Deleted latest bbox.");
+                scheduleAnnotationDiversityMetricRefresh();
+            }
+            return true;
+        }
+
+        function shouldHandleShortcut(event, action) {
+            if (!action || !isLabelingTabActive()) {
+                return false;
+            }
+            if (event.repeat && !action.allowRepeat && !action.hold) {
+                return false;
+            }
+            if (action.disabledWhenPaused && modeSnapshot) {
+                return false;
+            }
+            if (typeof action.requires === "function" && !action.requires()) {
+                return false;
+            }
+            if (annotationFocusMode) {
+                return true;
+            }
+            return !isTextEditingTarget(event.target);
+        }
+
+        function runShortcutAction(event, action) {
+            if (!shouldHandleShortcut(event, action)) {
+                return false;
+            }
+            const handled = action.run(event) !== false;
+            if (handled) {
+                stopShortcutEvent(event);
+            }
+            return handled;
+        }
+
+        const handleKeyboardImageNavigation = (event) => {
+            if (event.__tatorImageNavigationHandled) {
+                return false;
+            }
+            const action = shortcutActionMatches(event, "image_next")
+                ? shortcutActionById.get("image_next")
+                : shortcutActionMatches(event, "image_previous")
+                    ? shortcutActionById.get("image_previous")
+                    : null;
+            if (!action || !shouldHandleShortcut(event, action)) {
+                return false;
+            }
+            event.__tatorImageNavigationHandled = true;
+            action.run(event);
+            stopShortcutEvent(event);
             return true;
         };
 
+        initShortcutSettingsUi();
         keyboardListenersBound = true;
+        window.addEventListener("keydown", captureShortcutBindingEvent, true);
+        document.addEventListener("keydown", captureShortcutBindingEvent, true);
         window.addEventListener("keydown", (event) => {
             handleKeyboardImageNavigation(event);
         }, true);
@@ -49462,291 +51426,22 @@ async function cancelRfDetrTrainingJobRequest() {
             handleKeyboardImageNavigation(event);
         }, true);
         document.addEventListener("keydown", (event) => {
-            if (!isLabelingTabActive()) {
+            if (captureShortcutBindingEvent(event) || handleKeyboardImageNavigation(event)) {
                 return;
             }
-            if (isTextEditingTarget(event.target)) {
-                return;
-            }
-            const key = event.keyCode || event.charCode;
-            if (handleKeyboardImageNavigation(event)) {
-                return;
-            }
-
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && (key === 86 || event.key === "v" || event.key === "V")) {
-                toggleAnnotationFocusMode();
-                event.preventDefault();
-                return;
-            }
-
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && event.shiftKey && (key === 89 || event.key === "Y")) {
-                runYoloCaptionsExport({ preferDirectory: true }).catch((error) => {
-                    console.error("YOLO + captions hotkey export failed", error);
-                });
-                showShortcutToast("yolo_captions_export", "YOLO + captions export requested.");
-                event.preventDefault();
-                return;
-            }
-
-            if (annotationFocusMode && (key === 27 || event.key === "Escape")) {
-                exitAnnotationFocusMode();
-                event.preventDefault();
-                return;
-            }
-
-            if (datasetType === "seg" && (key === 27 || event.key === "Escape")) {
-                polygonDraft = null;
-                polygonDrag = null;
-                currentBbox = null;
-                event.preventDefault();
-                return;
-            }
-
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && (key === 80 || event.key === "p" || event.key === "P")) {
-                if (datasetType !== "seg") {
-                    setDatasetType("seg");
-                    setPolygonDrawEnabled(true);
-                    showShortcutToast("polygon_toggle", "Polygon draw: ON (seg mode).");
-                    showAnnotationFocusHud();
-                    event.preventDefault();
-                    return;
-                }
-                setPolygonDrawEnabled(!polygonDrawEnabled);
-                showShortcutToast(
-                    "polygon_toggle",
-                    `Polygon draw: ${polygonDrawEnabled ? "ON" : "OFF"}.`
-                );
-                showAnnotationFocusHud();
-                event.preventDefault();
-                return;
-            }
-
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && (key === 90 || event.key === "z" || event.key === "Z")) {
-                if (!modeSnapshot) {
-                    modeSnapshot = {
-                        auto: autoMode,
-                        sam: samMode,
-                        point: pointMode,
-                        multi: multiPointMode,
-                    };
-                    updateSamModeState(false, { preservePoints: true });
-                    updateAutoModeState(false);
-                    showShortcutToast("hold_z", "Hold Z: SAM/Auto paused.");
-                    showAnnotationFocusHud();
-                }
-                event.preventDefault();
-                return;
-            }
-
-            if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && (key === 69 || event.key === "e" || event.key === "E")) {
-                if (cycleClassSelection(-1)) {
-                    event.preventDefault();
-                    return;
-                }
-            }
-
-            if (!event.ctrlKey && !event.metaKey && !event.altKey && !event.shiftKey && (key === 82 || event.key === "r" || event.key === "R")) {
-                if (cycleClassSelection(1)) {
-                    event.preventDefault();
-                    return;
-                }
-            }
-
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && event.shiftKey && (key === 82 || event.key === "R")) {
-                mouse.yoloKeyActive = true;
-                const regionModeLabel = getRegionDetectorMode() === "rfdetr" ? "RF-DETR" : "YOLO";
-                showShortcutToast(
-                    "yolo_region",
-                    `${regionModeLabel} region mode: drag a box to scan (zoom in for more detail).`,
-                    { durationMs: 4000, cooldownMs: 2000 }
-                );
-                event.preventDefault();
-                return;
-            }
-
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && (key === 87 || event.key === "w" || event.key === "W")) {
-                event.preventDefault();
-                handleMagicTweakTapHotkey();
-                showShortcutToast("magic_tweak", "Magic tweak requested.");
-                return;
-            }
-
-            const plainDeleteHotkey = !event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey
-                && (key === 88 || event.key === "x" || event.key === "X");
-            if (key === 8 || (key === 46 && event.metaKey === true) || plainDeleteHotkey) {
-                if (!annotationEditableGuard("Delete")) {
-                    event.preventDefault();
-                    return;
-                }
-                if (selectedBboxes.size) {
-                    const removed = deleteSelectedBboxes();
-                    if (removed > 0) {
-                        showShortcutToast("delete_bbox", `Deleted ${removed} selection${removed === 1 ? "" : "s"}.`);
-                        event.preventDefault();
-                        return;
-                    }
-                }
-                if (currentBbox !== null) {
-                    const imageBuckets = currentImage ? bboxes[currentImage.name] : null;
-                    const className = currentBbox.bbox?.class;
-                    const bucket = imageBuckets && className ? imageBuckets[className] : null;
-                    let removed = false;
-                    // Guard against stale currentBbox pointers after imports/resets.
-                    if (Array.isArray(bucket) && currentBbox.index >= 0 && currentBbox.index < bucket.length) {
-                        const spliceResult = bucket.splice(currentBbox.index, 1);
-                        if (bucket.length === 0 && className) {
-                            delete imageBuckets[className];
-                        }
-                        removed = spliceResult.length > 0;
-                    }
-                    currentBbox = null;
-                    setGlobalCursor("default");
-                    if (removed) {
-                        showShortcutToast("delete_bbox", "Deleted 1 bbox.");
-                        scheduleAnnotationDiversityMetricRefresh();
-                    }
-                }
-                event.preventDefault();
-            }
-            if (!event.repeat && !event.ctrlKey && !event.metaKey && !event.altKey && (key === 81 || event.key === "q" || event.key === "Q")) {
-                if (!annotationEditableGuard("Delete")) {
-                    event.preventDefault();
-                    return;
-                }
-                let removed = false;
-                if (currentImage && bboxes[currentImage.name]) {
-                    const latest = findLatestCreatedBbox(currentImage.name);
-                    if (latest) {
-                        const bucket = bboxes[currentImage.name][latest.className];
-                        if (Array.isArray(bucket)) {
-                            const spliceResult = bucket.splice(latest.index, 1);
-                            if (bucket.length === 0) {
-                                delete bboxes[currentImage.name][latest.className];
-                            }
-                            if (spliceResult.length > 0) {
-                                removed = true;
-                                if (currentBbox && currentBbox.bbox === spliceResult[0]) {
-                                    currentBbox = null;
-                                    setGlobalCursor("default");
-                                }
-                            }
-                        }
-                    }
-                }
-                if (removed) {
-                    showShortcutToast("delete_latest", "Deleted latest bbox.");
-                    scheduleAnnotationDiversityMetricRefresh();
-                    event.preventDefault();
-                }
-            }
-            // 'a' => toggle auto class
-            if (key === 65 && !modeSnapshot) {
-                updateAutoModeState(!autoMode);
-                showShortcutToast("auto_toggle", `Auto-class: ${autoMode ? "ON" : "OFF"}.`);
-                showAnnotationFocusHud();
-                event.preventDefault();
-            }
-            // 's' => toggle SAM
-            if (key === 83 && !modeSnapshot) {
-                updateSamModeState(!samMode);
-                showShortcutToast("sam_toggle", `SAM mode: ${samMode ? "ON" : "OFF"}.`);
-                showAnnotationFocusHud();
-                event.preventDefault();
-            }
-            // 'd' => toggle SAM point mode
-            if (key === 68 && !modeSnapshot) {
-                if (!pointMode) {
-                    if (!samMode) {
-                        updateSamModeState(true);
-                    }
-                    updatePointModeState(true);
-                } else {
-                    updatePointModeState(false);
-                }
-                showShortcutToast("sam_point_toggle", `SAM point: ${pointMode ? "ON" : "OFF"}.`);
-                showAnnotationFocusHud();
-                event.preventDefault();
-            }
-            // 'm' => toggle SAM multi-point mode
-            if (key === 77 && !modeSnapshot) {
-                if (!multiPointMode) {
-                    if (!samMode) {
-                        updateSamModeState(true);
-                    }
-                    updateMultiPointState(true);
-                } else {
-                    updateMultiPointState(false);
-                }
-                showShortcutToast("sam_multi_toggle", `SAM multi-point: ${multiPointMode ? "ON" : "OFF"}.`);
-                showAnnotationFocusHud();
-                event.preventDefault();
-            }
-            // '1' => SAM3 similarity (requires SAM3 predictor loaded for current image)
-            if (!event.repeat && (key === 49 || event.key === "1") && !modeSnapshot) {
-                triggerSam3SimilarityHotkey().catch((error) => {
-                    console.error("SAM3 similarity hotkey action failed", error);
-                });
-                showShortcutToast("sam3_similarity", "SAM3 similarity requested.");
-                event.preventDefault();
-                return;
-            }
-            // 'f' => add positive point
-            if (!event.repeat && key === 70 && multiPointMode && !modeSnapshot) {
-                addMultiPointAnnotation(1);
-                showShortcutToast("multi_point_pos", "Multi-point: +positive.", { cooldownMs: 600 });
-                event.preventDefault();
-            }
-            // 'g' => add negative point
-            if (!event.repeat && key === 71 && multiPointMode && !modeSnapshot) {
-                addMultiPointAnnotation(0);
-                showShortcutToast("multi_point_neg", "Multi-point: +negative.", { cooldownMs: 600 });
-                event.preventDefault();
-            }
-            // Enter => submit multi-point selection
-            if (!event.repeat && key === 13 && multiPointMode && !modeSnapshot) {
-                submitMultiPointSelection().catch((error) => {
-                    console.error("Failed to submit multi-point selection", error);
-                });
-                showShortcutToast("multi_point_submit", "Multi-point submitted.");
-                event.preventDefault();
-                return;
-            }
-            if (key === 37) {
-                navigateImage(-1);
-                event.preventDefault();
-            }
-            if (key === 39) {
-                navigateImage(1);
-                event.preventDefault();
-            }
-            if (key === 38) {
-                cycleClassSelection(-1);
-                event.preventDefault();
-            }
-            if (key === 40) {
-                cycleClassSelection(1);
-                event.preventDefault();
+            const action = findShortcutActionForEvent(event);
+            if (action) {
+                runShortcutAction(event, action);
             }
         });
 
         document.addEventListener("keyup", (event) => {
-            const key = event.keyCode || event.charCode;
-            if (key === 82 || event.key === "r" || event.key === "R") {
-                mouse.yoloKeyActive = false;
-            }
-            if (activeTab !== TAB_LABELING) {
+            const action = findShortcutActionForEvent(event);
+            if (!action || !action.hold || !isLabelingTabActive()) {
                 return;
             }
-            if (modeSnapshot && (key === 90 || event.key === "z" || event.key === "Z")) {
-                const snapshot = modeSnapshot;
-                modeSnapshot = null;
-                updateSamModeState(snapshot.sam);
-                updateAutoModeState(snapshot.auto);
-                updatePointModeState(snapshot.point);
-                updateMultiPointState(snapshot.multi);
-                showShortcutToast("hold_z", "Z released: modes restored.", { cooldownMs: 800 });
-                showAnnotationFocusHud();
-                event.preventDefault();
+            if (action.release(event) !== false) {
+                stopShortcutEvent(event);
             }
         });
     };

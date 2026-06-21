@@ -1,3 +1,4 @@
+from html.parser import HTMLParser
 import re
 from pathlib import Path
 
@@ -7,6 +8,36 @@ HTML_PATH = REPO_ROOT / "ybat-master" / "tator.html"
 CSS_PATH = REPO_ROOT / "ybat-master" / "ybat.css"
 JS_PATH = REPO_ROOT / "ybat-master" / "ybat.js"
 MOBILE_REVIEW_PATH = REPO_ROOT / "ybat-master" / "mobile_review.html"
+STATIC_CONTROL_FIELD_CLASSES = {
+    "training-field",
+    "sam3-text-field",
+    "data-ingestion-field",
+    "class-split-field",
+    "class-split-cluster-controls__field",
+    "qwen-caption-row",
+    "shortcut-settings-row",
+}
+VOID_HTML_TAGS = {
+    "area",
+    "base",
+    "br",
+    "col",
+    "embed",
+    "hr",
+    "img",
+    "input",
+    "link",
+    "meta",
+    "param",
+    "source",
+    "track",
+    "wbr",
+}
+DYNAMIC_JS_CREATED_IDS = {
+    "dataIngestionHoverPreview",
+    "classSplitGraphHoverPreview",
+    "classSplitDatasetAnalysisHoverPreview",
+}
 
 
 def _html() -> str:
@@ -27,6 +58,150 @@ def _read(rel_path: str) -> str:
 
 def _mobile_review_html() -> str:
     return MOBILE_REVIEW_PATH.read_text(encoding="utf-8")
+
+
+class _HtmlNode:
+    def __init__(self, tag: str, attrs: dict[str, str | None], parent=None, position=(0, 0)):
+        self.tag = tag
+        self.attrs = attrs
+        self.parent = parent
+        self.position = position
+        self.children: list[_HtmlNode] = []
+        self.text_parts: list[str] = []
+
+    @property
+    def classes(self) -> set[str]:
+        return set(str(self.attrs.get("class") or "").split())
+
+    def text_content(self) -> str:
+        text = "".join(self.text_parts)
+        for child in self.children:
+            text += child.text_content()
+        return re.sub(r"\s+", " ", text).strip()
+
+    def ancestors(self):
+        node = self.parent
+        while node is not None:
+            yield node
+            node = node.parent
+
+    def descendants(self, tag: str | None = None):
+        for child in self.children:
+            if tag is None or child.tag == tag:
+                yield child
+            yield from child.descendants(tag)
+
+
+class _StaticHtmlParser(HTMLParser):
+    def __init__(self):
+        super().__init__()
+        self.root = _HtmlNode("document", {})
+        self.stack = [self.root]
+
+    def handle_starttag(self, tag, attrs):
+        tag = tag.lower()
+        node = _HtmlNode(tag, dict(attrs), self.stack[-1], self.getpos())
+        self.stack[-1].children.append(node)
+        if tag not in VOID_HTML_TAGS:
+            self.stack.append(node)
+
+    def handle_startendtag(self, tag, attrs):
+        tag = tag.lower()
+        node = _HtmlNode(tag, dict(attrs), self.stack[-1], self.getpos())
+        self.stack[-1].children.append(node)
+
+    def handle_endtag(self, tag):
+        tag = tag.lower()
+        while len(self.stack) > 1:
+            node = self.stack.pop()
+            if node.tag == tag:
+                break
+
+    def handle_data(self, data):
+        self.stack[-1].text_parts.append(data)
+
+
+def _parse_static_html() -> _HtmlNode:
+    parser = _StaticHtmlParser()
+    parser.feed(_html())
+    return parser.root
+
+
+def _static_html_ids(html: str) -> set[str]:
+    matches = re.findall(r"""\bid=(?:"([^"]+)"|'([^']+)')""", html)
+    return {first or second for first, second in matches if first or second}
+
+
+def _static_get_element_by_id_refs(js: str) -> set[str]:
+    matches = re.findall(r"""document\.getElementById\(\s*(?:"([^"]+)"|'([^']+)')\s*\)""", js)
+    return {first or second for first, second in matches if first or second}
+
+
+def _nodes_by_tag(root: _HtmlNode, tag: str) -> list[_HtmlNode]:
+    return list(root.descendants(tag))
+
+
+def _control_override_id_list(js: str) -> list[str]:
+    match = re.search(r"const CONTROL_TOOLTIP_OVERRIDES = Object\.freeze\(\{(.*?)\n\s*\}\);", js, re.S)
+    assert match, "missing CONTROL_TOOLTIP_OVERRIDES"
+    override_block = match.group(1)
+    return re.findall(r"^\s*([A-Za-z_$][A-Za-z0-9_$]*)\s*:", override_block, re.M)
+
+
+def _control_override_ids(js: str) -> set[str]:
+    return set(_control_override_id_list(js))
+
+
+def _label_text_for_field(control: _HtmlNode) -> str:
+    for ancestor in control.ancestors():
+        if ancestor.classes & STATIC_CONTROL_FIELD_CLASSES:
+            labels = [child for child in ancestor.children if child.tag == "label"]
+            labels.extend(ancestor.descendants("label"))
+            for label in labels:
+                text = label.text_content()
+                if text:
+                    return text
+        if ancestor.tag == "details":
+            summary = next(ancestor.descendants("summary"), None)
+            if summary:
+                return summary.text_content()
+    return ""
+
+
+def _control_has_accessible_static_or_runtime_tooltip(
+    control: _HtmlNode,
+    labels_by_for: dict[str, str],
+    override_ids: set[str],
+) -> bool:
+    if str(control.attrs.get("title") or "").strip():
+        return True
+    if control.tag == "button" and control.text_content():
+        return True
+    if control.tag == "input" and str(control.attrs.get("type") or "").lower() in {"button", "submit", "reset"}:
+        if str(control.attrs.get("value") or "").strip():
+            return True
+
+    control_id = str(control.attrs.get("id") or "").strip()
+    if control_id:
+        if control_id in override_ids:
+            return True
+        if labels_by_for.get(control_id):
+            return True
+
+    if any(ancestor.tag == "label" and ancestor.text_content() for ancestor in control.ancestors()):
+        return True
+
+    return bool(_label_text_for_field(control))
+
+
+def _describe_control(control: _HtmlNode) -> str:
+    attrs = []
+    for key in ("id", "name", "type", "class"):
+        value = control.attrs.get(key)
+        if value:
+            attrs.append(f'{key}="{value}"')
+    line, column = control.position
+    return f"<{control.tag} {' '.join(attrs)}> at {line}:{column}"
 
 
 def _details_opening_tag(html: str, element_id: str) -> str:
@@ -51,9 +226,72 @@ def test_labeling_tool_panels_default_closed_and_ordered():
         positions.append(html.index(f'id="{panel_id}"'))
 
     assert positions == sorted(positions)
-    assert "Qwen 3 detection engine (not great)" in html
-    assert "EDR [wip]" in html
+    assert "Qwen 3 object detection" in html
+    assert "not great" not in html.lower()
+    assert "Detection Recipe" in html
     assert "Ensemble Detection Recipe" in html
+    assert "[wip]" not in html.lower()
+
+
+def test_top_navigation_tabs_have_tooltips():
+    html = _html()
+    css = _css()
+    js = _js()
+    tab_buttons = re.findall(r"<button\b[^>]*\bclass=\"[^\"]*\btab-button\b[^\"]*\"[^>]*>", html)
+
+    assert tab_buttons
+    missing_titles = [tag for tag in tab_buttons if 'title="' not in tag]
+    assert not missing_titles
+    assert "Open the main annotation workspace" in html
+    assert "Score new images and videos against a reference dataset" in html
+    assert "Embed labeled objects, inspect likely wrong classes" in html
+    assert "overflow-x: auto;" in css
+    assert "scrollbar-gutter: stable;" in css
+    utility_block = css[css.index(".tab-bar__utility"):css.index(".theme-toggle-button")]
+    assert "margin-left: auto;" not in utility_block
+    assert "TOP_TAB_BASE_METRICS" not in js
+    assert "adaptiveTopTabs" not in js
+    assert "setAdaptiveTopTabsScale" not in js
+    assert "scheduleAdaptiveTopTabsUpdate" not in js
+    assert "measureAdaptiveTopTabsWidth" not in js
+    assert "availableWidth / naturalWidth" not in js
+    assert "button.dataset.automationUnlockedTitle = button.getAttribute(\"title\") || \"\";" in js
+    assert "button.title = restoredTitle;" in js
+    assert 'button.title = "";' not in js
+    assert 'activeElements.clipSelect.removeAttribute("title");' in js
+    assert "refreshUiTooltips(activeElements.clipSelect);" in js
+    assert 'agentElements.stepsPromptPrefilter.removeAttribute("title");' in js
+    assert "refreshUiTooltips(agentElements.stepsPromptPrefilter);" in js
+    assert 'activeElements.clipSelect.title = "";' not in js
+    assert 'agentElements.stepsPromptPrefilter.title = "";' not in js
+
+
+def test_static_get_element_by_id_bindings_exist_in_tator_html():
+    html_ids = _static_html_ids(_html())
+    js_refs = _static_get_element_by_id_refs(_js())
+    missing = sorted(js_refs - html_ids - DYNAMIC_JS_CREATED_IDS)
+
+    assert missing == []
+
+
+def test_all_tator_buttons_declare_type_to_avoid_form_submit_fallbacks():
+    root = _parse_static_html()
+    missing = [
+        _describe_control(button)
+        for button in _nodes_by_tag(root, "button")
+        if not str(button.attrs.get("type") or "").strip()
+    ]
+
+    assert missing == []
+
+
+def test_ui_only_forms_prevent_browser_submit_navigation():
+    js = _js()
+
+    assert "function preventUiOnlyFormSubmits()" in js
+    assert 'form.addEventListener("submit", (event) => {' in js
+    assert "event.preventDefault();" in js
+    assert "preventUiOnlyFormSubmits();" in js
 
 
 def test_yolo_import_and_export_controls_live_in_annotation_source_panel():
@@ -88,6 +326,16 @@ def test_mobile_review_page_contract():
     assert 'action: "change_class"' in html
     assert 'action: "skip_next"' in html
     assert "Change class to ${els.targetClass.value}" in html
+
+
+def test_class_split_qwen_guarded_review_is_prominent_and_actionable():
+    js = _js()
+
+    assert "Guarded suggestion: confirm current class" in js
+    assert "Guarded suggestion: switch class to ${guardedTarget}" in js
+    assert "Model confidence ${Number.isFinite(guardedConfidence)" in js
+    assert "qwenGuarded?.blocked && qwenGuardedDecision !== \"confirm_current\"" in js
+    assert "preferredTargetClass ? `Switch class to ${preferredTargetClass}` : \"Reassign\"" in js
 
 
 def test_local_image_selection_shows_first_image_before_dimension_scan():
@@ -167,6 +415,129 @@ def test_caption_prompt_controls_have_tooltips_and_roomy_textareas():
     assert "max-height: 520px;" in css
 
 
+def test_help_tooltips_are_keyboard_accessible_app_wide():
+    js = _js()
+    css = _css()
+
+    assert 'tooltipElements(root, ".help-icon").forEach' in js
+    assert 'el.dataset.tooltip = tooltip;' in js
+    assert 'el.removeAttribute("title");' in js
+    assert "el.tabIndex = 0;" in js
+    assert 'el.setAttribute("aria-label", `Help: ${tooltip}`);' in js
+    assert ".help-icon[data-tooltip]:focus-visible" in css
+    assert ".help-icon[data-tooltip]:focus-visible::before" in css
+    assert ".help-icon[data-tooltip]:focus-visible::after" in css
+    assert "content: attr(data-tooltip);" in css
+
+
+def test_runtime_control_tooltips_cover_core_workflows():
+    js = _js()
+    override_ids = _control_override_id_list(js)
+
+    assert "const CONTROL_TOOLTIP_OVERRIDES = Object.freeze({" in js
+    assert len(override_ids) == len(set(override_ids))
+    assert "const CONTROL_FIELD_LABEL_SELECTOR = [" in js
+    assert '".data-ingestion-field"' in js
+    assert '".class-split-field"' in js
+    assert '".sam3-text-field"' in js
+    assert "function initControlTooltips(root = document)" in js
+    assert "function tooltipElements(root, selector)" in js
+    assert "root.nodeType === 1" in js
+    assert "root.querySelectorAll(selector).forEach" in js
+    assert 'tooltipElements(root, "button, input, select, textarea").forEach' in js
+    assert "function deriveControlTooltip(el)" in js
+    assert "function cssEscapeIdentifier(value)" in js
+    assert 'return raw.replace(/[^A-Za-z0-9_-]/g, "\\\\$&");' in js
+    assert "function normalizeTooltipLabelText(text)" in js
+    assert "function labelTextFromElement(label)" in js
+    assert "function associatedControlLabelText(el)" in js
+    assert 'document.querySelector(`label[for="${cssEscapeIdentifier(id)}"]`)' in js
+    assert "el.closest(CONTROL_FIELD_LABEL_SELECTOR)" in js
+    assert 'child?.tagName?.toLowerCase() === "label"' in js
+    assert 'details?.querySelector("summary")?.textContent' in js
+    assert "function initializeUiTooltipObserver()" in js
+    assert "new MutationObserver" in js
+    assert "function scheduleUiTooltipRefresh(root = document)" in js
+    assert "scheduleUiTooltipRefresh(node);" in js
+    assert "const uiTooltipRefreshRoots = new Set();" in js
+    assert "uiTooltipRefreshRoots.add(root);" in js
+    assert "const roots = uiTooltipRefreshRoots.size ? Array.from(uiTooltipRefreshRoots) : [document];" in js
+    assert "uiTooltipRefreshRoots.clear();" in js
+    assert 'const existingTitle = String(el.getAttribute("title") || "").trim();' in js
+    assert "const tooltip = existingTitle || String(deriveControlTooltip(el) || \"\").trim();" in js
+    assert "if (!existingTitle) {" in js
+    assert "initializeUiTooltipObserver();" in js
+    assert "initControlTooltips(root);" in js
+    assert 'if (lower === "refresh") return "Refresh this list or status panel.";' in js
+    assert "Open this Qwen training job and refresh its status when it is still active." in js
+    assert "Show this Qwen training job's status, logs, and result metadata." in js
+    assert "Show this YOLO training job's status, logs, and result metadata." in js
+    assert "Show this RF-DETR training job's status, logs, and result metadata." in js
+    assert "Show this head-graft job's status, logs, and result metadata." in js
+    assert 'title="Remove this SAM3 text cascade step."' in js
+    for control_id in [
+        "saveBboxes",
+        "detectorRunButton",
+        "qwenRunButton",
+        "qwenCaptionPromptUser",
+        "qwenCaptionPromptCleanup",
+        "sam3RunButton",
+        "dataIngestionAnalyzeButton",
+        "dataIngestionDownloadAcceptedButton",
+        "classSplitRunButton",
+        "classSplitBulkClass",
+        "classSplitWrongShuffle",
+        "classSplitMobilePush",
+        "qwenAgentRecipeImportFile",
+        "datasetUploadCurrentBtn",
+        "datasetPathRegisterBtn",
+        "datasetGlossarySave",
+        "trainDatasetRefresh",
+        "startTrainingBtn",
+        "qwenTrainStartBtn",
+        "sam3StartBtn",
+        "sam3TrendSmooth",
+        "yoloTrainStartBtn",
+        "rfdetrTrainStartBtn",
+        "detectorYoloRunActivate",
+        "activeClassifierUse",
+        "activeClassifierUpload",
+        "activeLabelmapUpload",
+        "qwenModelRefreshBtn",
+        "sam3PromptActivate",
+        "settingsTest",
+        "runBackendFuzzer",
+    ]:
+        assert f"{control_id}:" in js
+
+
+def test_static_visible_controls_have_tooltips_or_discoverable_labels():
+    root = _parse_static_html()
+    js = _js()
+    labels_by_for = {
+        str(label.attrs.get("for")).strip(): label.text_content()
+        for label in _nodes_by_tag(root, "label")
+        if str(label.attrs.get("for") or "").strip()
+    }
+    override_ids = _control_override_ids(js)
+    controls = [
+        node
+        for tag in ("button", "input", "select", "textarea")
+        for node in _nodes_by_tag(root, tag)
+        if str(node.attrs.get("type") or "").lower() != "hidden"
+    ]
+
+    missing = [
+        _describe_control(control)
+        for control in controls
+        if not _control_has_accessible_static_or_runtime_tooltip(control, labels_by_for, override_ids)
+    ]
+
+    assert not missing, "static controls without title, text, label, or runtime tooltip override:\n" + "\n".join(
+        missing[:40]
+    )
+
+
 def test_caption_dataset_picker_is_locked_to_annotation_dataset():
     js = _js()
 
@@ -208,21 +579,41 @@ def test_keyboard_image_navigation_shortcuts_are_documented_and_guarded():
     html = _html()
     js = _js()
 
-    assert "<strong>Images:</strong> Space = next image; Tab = previous image" in html
-    assert "<strong>Focus:</strong> V toggles image-only focus mode" in html
-    assert "<strong>Classes:</strong> ↓ / R = next class; ↑ / E = previous class" in html
-    assert "Delete / Backspace / X removes selected or current bboxes" in html
-    assert "S toggles SAM; W runs magic tweak; double W tweaks selected boxes first, otherwise the carousel class" in html
-    assert "<strong>Point prompts:</strong> D toggles SAM point mode; M toggles multi-point" in html
-    assert "Shift + R + drag runs YOLO/RF-DETR region detect" in html
-    assert "Shift + Y requests Save YOLO + captions" in html
-    assert "const imageNavigationKey = (event) =>" in js
-    assert "eventKey === 32" in js
-    assert "eventKey === 9" in js
-    assert 'event.key === "Tab"' in js
-    assert "return 1;" in js
-    assert "return -1;" in js
-    assert "navigateImage(direction)" in js
+    assert 'id="shortcutHelpList"' in html
+    assert 'id="shortcutSettingsPanel"' in html
+    assert "Customize keyboard shortcuts" in html
+    assert 'id="shortcutResetAll"' in html
+    assert 'id="shortcutExportConfig"' in html
+    assert 'id="shortcutImportConfigButton"' in html
+    assert 'id="shortcutImportConfig"' in html
+    assert 'accept=".json,application/json"' in html
+    assert 'id="shortcutSettingsList"' in html
+    assert 'class="shortcut-help-list"' in html
+    assert "SHORTCUT_STORAGE_KEY" in js
+    assert '"tator.annotation.shortcuts.v1"' in js
+    assert "SHORTCUT_CLASS_ID_COUNT" not in js
+    assert "CLASS_SHORTCUT_ID_PATTERN" in js
+    assert "function getShortcutClassNames()" in js
+    assert "function makeClassShortcutAction(index, className)" in js
+    assert 'id: `class_id_${index}`' in js
+    assert "load a labelmap or dataset first to configure direct class shortcuts" in js
+    assert "direct class IDs 0-19" not in js
+    assert "shortcutClassListObserver.observe(classList, { childList: true });" in js
+    assert 'id: "image_next"' in js
+    assert 'id: "image_previous"' in js
+    assert 'id: "drawing_start"' in js
+    assert 'id: "drawing_finish"' in js
+    assert 'id: "delete_selected_current"' in js
+    assert "renderShortcutHelp()" in js
+    assert "renderShortcutSettings()" in js
+    assert "assignShortcutBinding(actionId, binding)" in js
+    assert "removeShortcutBindingConflicts(actionId, bindings)" in js
+    assert "eventToBinding(event)" in js
+    assert "readFileAsTextPromise(file)" in js
+    assert 'saveBlobToDisk(blob, "tator-shortcuts.json")' in js
+    assert "run: () => navigateImage(1)" in js
+    assert "run: () => navigateImage(-1)" in js
+    assert "action.run(event)" in js
     assert 'window.addEventListener("keydown"' in js
     assert '}, true);' in js
     assert "annotationWorkspaceHotkeysActive" in js
@@ -262,7 +653,8 @@ def test_local_salad_is_data_ingestion_only_in_ui():
     assert "Aggregation: ${escapeHtml(art.embedding_aggregation" not in js
     assert "startLocalSaladTraining" in js
     assert "canvas.element.focus();" in js
-    assert "const isTextEditingTarget = (target) =>" in js
+    assert "function isTextEditingTarget(target)" in js
+    assert 'targetElement.closest(".shortcut-settings-panel")' in js
     assert 'targetTag === "textarea"' in js
 
 
@@ -598,8 +990,10 @@ def test_class_scroll_contrast_and_double_w_selected_scope_contract():
     assert "async function runBatchTweakForClass" in js
     assert "function handleMagicTweakTapHotkey" in js
     assert "let magicTweakHotkeyTimeoutId = null" in js
-    assert '(key === 87 || event.key === "w" || event.key === "W")' in js
-    assert '(key === 88 || event.key === "x" || event.key === "X")' in js
+    assert 'id: "magic_tweak"' in js
+    assert 'defaultBindings: [makeBinding("KeyW", "W")]' in js
+    assert 'id: "delete_selected_current"' in js
+    assert 'makeBinding("KeyX", "X")' in js
 
 
 def test_sam3_text_panel_has_dark_theme_coverage():
@@ -782,6 +1176,7 @@ def test_class_split_explorer_panel_contract():
     assert ".class-split-wrong-panel--wide" in css
     assert ".class-split-wrong-toolbar__discard" in css
     assert ".class-split-wrong-item__preview" in css
+    assert ".class-split-wrong-item__badge--dual" in css
     assert "grid-template-columns: 232px minmax(0, 1fr);" in css
     assert "width: 232px;" in css
     assert "height: 192px;" in css
@@ -815,7 +1210,7 @@ def test_class_split_explorer_panel_contract():
     assert "document.addEventListener(\"click\", handleTopTabNavigationClick, true);" in js
     assert "let tabNavigationInitialized = false;" in js
     assert "if (tabNavigationInitialized) {\n            setActiveTab(activeTab);\n            return;\n        }\n        tabNavigationInitialized = true;" in js
-    assert "initializeAdaptiveTopTabs();\n        setupTabNavigation();\n        applyPlaywrightTestIds();" in js
+    assert "initializeThemeToggle();\n        setupTabNavigation();\n        applyPlaywrightTestIds();" in js
     assert "document.readyState !== \"complete\"" in js
     assert "const classSplitElements = {" in js
     assert "const classSplitState = {" in js
@@ -1020,6 +1415,9 @@ def test_class_split_explorer_panel_contract():
     assert "Reassign" in js
     assert "Switch class to ${suggestedClass}" in js
     assert ">Choose class</option>" in js
+    assert "Review dual bbox with Qwen" in js
+    assert "dual_bbox_resolution" in js
+    assert "Dual-box conflict" in js
     assert "function getClassSplitContextCropUrl" in js
     assert "const maxPreviewDim = 1400;" in js
     assert 'alt="Object context crop"' in js
@@ -1062,5 +1460,8 @@ def test_class_split_explorer_panel_contract():
     assert "Class Split analysis is running. The graph will appear when the backend finishes embedding and projection." in js
     assert "startClassSplitAnalysis({ reuseLast: true })" in js
     assert "initClassSplitExplorer();" in js
+    assert "function renderClassSplitQwenReviewModelOptions" in js
+    assert "metadata.inference_supported === false || metadata.vision_inference_supported === false" in js
+    assert "metadata.display_name || metadata.label || metadata.name || entry.label" in js
     assert "max_files=float(\"inf\")" in router
     assert "max_part_size=512 * 1024 * 1024" in router

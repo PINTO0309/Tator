@@ -19,14 +19,30 @@ QWEN_PLATFORM_ALIASES = {
     "mlx_vlm": QWEN_PLATFORM_MLX,
 }
 QWEN_MLX_DEFAULT_MODEL = "mlx-community/Qwen3-VL-4B-Instruct-4bit"
-QWEN_MLX_LANGUAGE_ONLY_REPACK_IDS = {
-    "introvoyz041/Huihui-Qwen3-VL-30B-A3B-Thinking-abliterated-qx86-hi-mlx-mlx-4Bit",
-    "introvoyz041/Huihui-Qwen3-VL-32B-Thinking-abliterated-qx65-hi-mlx-mlx-4Bit",
-}
-QWEN_MLX_LANGUAGE_ONLY_REPACK_NOTE = (
+QWEN_VANCH007_QWEN36_35B_MLX_MODEL = "vanch007/Huihui-Qwen3.6-35B-A3B-abliterated-mlx-4bit"
+QWEN_VANCH007_QWEN36_35B_MLX_NOTE = (
+    "Experimental Qwen3.6 35B-A3B abliterated MLX-VLM checkpoint. "
+    "Class-split vignette smoke tests passed with mlx-vlm 0.6.1 plus the local "
+    "Qwen3.5/3.6 MoE split-weight compatibility shim; adapter training is not "
+    "enabled until tested on this architecture."
+)
+QWEN_KNOWN_INCOMPATIBLE_MLX_LANGUAGE_ONLY_NOTE = (
     "This MLX repack contains only language_model weights and no vision_tower weights, "
     "so it cannot run Qwen3-VL image captioning, detection, or vision LoRA training."
 )
+QWEN_KNOWN_INCOMPATIBLE_MLX_MODELS = {
+    "Youssofal/Qwen3.6-35B-A3B-Abliterated-Heretic-MLX-4bit": (
+        "Candidate Heretic Qwen3.6 35B-A3B MLX checkpoint was removed from the "
+        "model list because smoke tests generated invalid text in the Class Split "
+        "vignette benchmark."
+    ),
+    "introvoyz041/Huihui-Qwen3-VL-30B-A3B-Thinking-abliterated-qx86-hi-mlx-mlx-4Bit": (
+        QWEN_KNOWN_INCOMPATIBLE_MLX_LANGUAGE_ONLY_NOTE
+    ),
+    "introvoyz041/Huihui-Qwen3-VL-32B-Thinking-abliterated-qx65-hi-mlx-mlx-4Bit": (
+        QWEN_KNOWN_INCOMPATIBLE_MLX_LANGUAGE_ONLY_NOTE
+    ),
+}
 
 
 def normalize_qwen_platform(value: Optional[str]) -> str:
@@ -57,6 +73,14 @@ def is_mlx_model_id(model_id: Optional[str]) -> bool:
     )
 
 
+def qwen_known_incompatible_mlx_detail(model_id: str) -> Optional[str]:
+    raw = str(model_id or "").strip()
+    note = QWEN_KNOWN_INCOMPATIBLE_MLX_MODELS.get(raw)
+    if not note:
+        return None
+    return f"{raw}: {note}"
+
+
 def _model_entry(size: str, variant: str, quant: str, *, moe: bool = False) -> Dict[str, Any]:
     stem = f"Qwen3-VL-{size}-{variant}"
     if moe:
@@ -85,8 +109,12 @@ def _external_mlx_entry(
     quantization: str,
     source: str,
     abliterated: bool = False,
+    vision_inference_supported: bool = True,
+    training_supported: bool = True,
+    compatibility_note: Optional[str] = None,
+    training_note: Optional[str] = None,
 ) -> Dict[str, Any]:
-    return {
+    entry = {
         "id": model_id,
         "label": label,
         "model_id": model_id,
@@ -96,9 +124,14 @@ def _external_mlx_entry(
         "runtime_platform": QWEN_PLATFORM_MLX,
         "source": source,
         "abliterated": abliterated,
-        "vision_inference_supported": True,
-        "training_supported": True,
+        "vision_inference_supported": vision_inference_supported,
+        "training_supported": training_supported,
     }
+    if compatibility_note:
+        entry["compatibility_note"] = compatibility_note
+    if training_note:
+        entry["training_note"] = training_note
+    return entry
 
 
 def qwen_mlx_model_options() -> List[Dict[str, Any]]:
@@ -203,6 +236,13 @@ def qwen_mlx_model_options() -> List[Dict[str, Any]]:
             )
     for model_id, size, variant, quantization, source in (
         (
+            QWEN_VANCH007_QWEN36_35B_MLX_MODEL,
+            "35B-A3B",
+            "Abliterated",
+            "4bit",
+            "vanch007",
+        ),
+        (
             "nightmedia/Huihui-Qwen3-VL-30B-A3B-Thinking-abliterated-qx86-hi-mlx",
             "30B-A3B",
             "Thinking",
@@ -215,20 +255,6 @@ def qwen_mlx_model_options() -> List[Dict[str, Any]]:
             "Thinking",
             "qx65-hi",
             "nightmedia",
-        ),
-        (
-            "introvoyz041/Huihui-Qwen3-VL-30B-A3B-Thinking-abliterated-qx86-hi-mlx-mlx-4Bit",
-            "30B-A3B",
-            "Thinking",
-            "qx86-hi 4bit repack",
-            "introvoyz041",
-        ),
-        (
-            "introvoyz041/Huihui-Qwen3-VL-32B-Thinking-abliterated-qx65-hi-mlx-mlx-4Bit",
-            "32B",
-            "Thinking",
-            "qx65-hi 4bit repack",
-            "introvoyz041",
         ),
         (
             "veeceey/Huihui-Qwen3-VL-8B-Instruct-abliterated-mlx-4bit",
@@ -245,19 +271,33 @@ def qwen_mlx_model_options() -> List[Dict[str, Any]]:
             "Goekdeniz-Guelmez",
         ),
     ):
+        if source == "Goekdeniz-Guelmez":
+            label = f"MLX Josiefied Qwen3-VL {size} {variant} abliterated {quantization}"
+        elif source == "vanch007":
+            label = f"MLX Qwen3.6 {size} abliterated {quantization}"
+        else:
+            label = f"MLX Huihui Qwen3-VL {size} {variant} abliterated {quantization}"
+        is_vanch007_qwen36 = model_id == QWEN_VANCH007_QWEN36_35B_MLX_MODEL
         entries.append(
             _external_mlx_entry(
                 model_id,
-                label=(
-                    f"MLX Josiefied Qwen3-VL {size} {variant} abliterated {quantization}"
-                    if source == "Goekdeniz-Guelmez"
-                    else f"MLX Huihui Qwen3-VL {size} {variant} abliterated {quantization}"
-                ),
+                label=label,
                 size=size,
                 variant=variant,
                 quantization=quantization,
                 source=source,
                 abliterated=True,
+                training_supported=not is_vanch007_qwen36,
+                compatibility_note=(
+                    QWEN_VANCH007_QWEN36_35B_MLX_NOTE
+                    if is_vanch007_qwen36
+                    else None
+                ),
+                training_note=(
+                    QWEN_VANCH007_QWEN36_35B_MLX_NOTE
+                    if is_vanch007_qwen36
+                    else None
+                ),
             )
         )
     preferred = {
@@ -270,13 +310,8 @@ def qwen_mlx_model_options() -> List[Dict[str, Any]]:
         "EZCon/Huihui-Qwen3-VL-2B-Instruct-abliterated-4bit-mlx": 6,
         "alexgusevski/Huihui-Qwen3-VL-8B-Instruct-abliterated-q4-mlx": 7,
         "nightmedia/Huihui-Qwen3-VL-32B-Thinking-abliterated-qx65-hi-mlx": 8,
+        QWEN_VANCH007_QWEN36_35B_MLX_MODEL: 9,
     }
-    for entry in entries:
-        if str(entry.get("id")) in QWEN_MLX_LANGUAGE_ONLY_REPACK_IDS:
-            entry["vision_inference_supported"] = False
-            entry["training_supported"] = False
-            entry["compatibility_note"] = QWEN_MLX_LANGUAGE_ONLY_REPACK_NOTE
-            entry["training_note"] = QWEN_MLX_LANGUAGE_ONLY_REPACK_NOTE
     entries.sort(
         key=lambda entry: (
             preferred.get(str(entry["id"]), 1000),

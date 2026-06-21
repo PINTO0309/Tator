@@ -72,6 +72,128 @@ def test_download_clip_classifier_zip_skips_symlink_meta_escape(tmp_path, monkey
     assert payloads["head.pkl"] == b"model"
 
 
+def test_download_clip_classifier_zip_fails_if_resolved_meta_cannot_be_written(tmp_path, monkeypatch) -> None:
+    upload_root = tmp_path / "uploads"
+    classifiers_root = upload_root / "classifiers"
+    classifiers_root.mkdir(parents=True, exist_ok=True)
+    classifier_path = classifiers_root / "head.pkl"
+    classifier_path.write_bytes(b"model")
+    meta_path = classifiers_root / "head.meta.pkl"
+    meta_path.write_bytes(b"meta")
+    monkeypatch.setattr(localinferenceapi, "UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_resolve_agent_clip_classifier_path_impl",
+        lambda *args, **kwargs: classifier_path,
+    )
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_safe_classifier_meta_path_impl",
+        lambda _path: meta_path,
+    )
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_find_labelmap_for_classifier_impl",
+        lambda *args, **kwargs: None,
+    )
+    real_zip_write = localinferenceapi._zip_write_safe_file
+
+    def fail_meta_write(zf, path, root, arcname):
+        if Path(path) == meta_path:
+            return False
+        return real_zip_write(zf, path, root, arcname)
+
+    monkeypatch.setattr(localinferenceapi, "_zip_write_safe_file", fail_meta_write)
+
+    with pytest.raises(localinferenceapi.HTTPException) as exc_info:
+        localinferenceapi.download_clip_classifier_zip(rel_path="head.pkl")
+
+    assert exc_info.value.status_code == 412
+    assert exc_info.value.detail == "clip_classifier_zip_meta_missing"
+
+
+def test_download_clip_classifier_zip_fails_if_resolved_labelmap_cannot_be_written(tmp_path, monkeypatch) -> None:
+    upload_root = tmp_path / "uploads"
+    classifiers_root = upload_root / "classifiers"
+    labelmaps_root = upload_root / "labelmaps"
+    classifiers_root.mkdir(parents=True, exist_ok=True)
+    labelmaps_root.mkdir(parents=True, exist_ok=True)
+    classifier_path = classifiers_root / "head.pkl"
+    classifier_path.write_bytes(b"model")
+    labelmap_path = labelmaps_root / "head.txt"
+    labelmap_path.write_text("target\n", encoding="utf-8")
+    monkeypatch.setattr(localinferenceapi, "UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_resolve_agent_clip_classifier_path_impl",
+        lambda *args, **kwargs: classifier_path,
+    )
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_safe_classifier_meta_path_impl",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_find_labelmap_for_classifier_impl",
+        lambda *args, **kwargs: labelmap_path,
+    )
+    real_zip_write = localinferenceapi._zip_write_safe_file
+
+    def fail_labelmap_write(zf, path, root, arcname):
+        if Path(path) == labelmap_path:
+            return False
+        return real_zip_write(zf, path, root, arcname)
+
+    monkeypatch.setattr(localinferenceapi, "_zip_write_safe_file", fail_labelmap_write)
+
+    with pytest.raises(localinferenceapi.HTTPException) as exc_info:
+        localinferenceapi.download_clip_classifier_zip(rel_path="head.pkl")
+
+    assert exc_info.value.status_code == 412
+    assert exc_info.value.detail == "clip_classifier_zip_labelmap_missing"
+
+
+def test_download_clip_classifier_zip_disambiguates_duplicate_labelmap_name(
+    tmp_path, monkeypatch
+) -> None:
+    upload_root = tmp_path / "uploads"
+    classifiers_root = upload_root / "classifiers"
+    labelmaps_root = upload_root / "labelmaps"
+    classifiers_root.mkdir(parents=True, exist_ok=True)
+    labelmaps_root.mkdir(parents=True, exist_ok=True)
+    classifier_path = classifiers_root / "head.pkl"
+    classifier_path.write_bytes(b"model")
+    labelmap_path = labelmaps_root / "head.pkl"
+    labelmap_path.write_bytes(b"labels")
+    monkeypatch.setattr(localinferenceapi, "UPLOAD_ROOT", upload_root)
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_resolve_agent_clip_classifier_path_impl",
+        lambda *args, **kwargs: classifier_path,
+    )
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_safe_classifier_meta_path_impl",
+        lambda _path: None,
+    )
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_find_labelmap_for_classifier_impl",
+        lambda *args, **kwargs: labelmap_path,
+    )
+
+    response = localinferenceapi.download_clip_classifier_zip(rel_path="head.pkl")
+    raw = asyncio.run(_stream_body(response))
+
+    with zipfile.ZipFile(io.BytesIO(raw), "r") as zf:
+        names = zf.namelist()
+        payloads = {name: zf.read(name) for name in names}
+    assert names == ["head.pkl", "labelmaps/head.pkl"]
+    assert payloads["head.pkl"] == b"model"
+    assert payloads["labelmaps/head.pkl"] == b"labels"
+
+
 def test_load_clip_head_skips_symlink_meta_escape(tmp_path) -> None:
     classifier_path = tmp_path / "head.pkl"
     classifier_path.write_bytes(b"model")
@@ -246,6 +368,36 @@ def test_delete_clip_classifier_unlinks_broken_meta_symlink(tmp_path, monkeypatc
     assert not meta_path.is_symlink()
 
 
+def test_delete_clip_classifier_keeps_model_when_meta_delete_fails(
+    tmp_path, monkeypatch
+) -> None:
+    classifier_path = tmp_path / "head.pkl"
+    meta_path = tmp_path / "head.meta.pkl"
+    classifier_path.write_bytes(b"model")
+    meta_path.write_bytes(b"meta")
+    monkeypatch.setattr(
+        localinferenceapi,
+        "_resolve_agent_clip_classifier_path_impl",
+        lambda *args, **kwargs: classifier_path,
+    )
+    original_unlink = Path.unlink
+
+    def fail_meta_unlink(self: Path, *args, **kwargs):
+        if self == meta_path:
+            raise OSError("forced metadata delete failure")
+        return original_unlink(self, *args, **kwargs)
+
+    monkeypatch.setattr(Path, "unlink", fail_meta_unlink)
+
+    with pytest.raises(HTTPException) as exc_info:
+        localinferenceapi.delete_clip_classifier(rel_path="head.pkl")
+
+    assert exc_info.value.status_code == 500
+    assert str(exc_info.value.detail).startswith("classifier_meta_delete_failed:")
+    assert classifier_path.read_bytes() == b"model"
+    assert meta_path.read_bytes() == b"meta"
+
+
 def test_delete_clip_classifier_rejects_symlink_alias_without_target_unlink(
     tmp_path, monkeypatch
 ) -> None:
@@ -334,6 +486,67 @@ def test_rename_clip_classifier_moves_file_meta_and_active_state(tmp_path, monke
     assert not classifier_path.exists()
     assert not meta_path.exists()
     assert localinferenceapi.active_classifier_path == str(renamed_path)
+
+
+def test_rename_clip_classifier_keeps_model_when_meta_move_fails(
+    tmp_path, monkeypatch
+) -> None:
+    upload_root = tmp_path / "uploads"
+    classifiers_root = upload_root / "classifiers"
+    classifiers_root.mkdir(parents=True)
+    classifier_path = classifiers_root / "head.pkl"
+    meta_path = classifiers_root / "head.meta.pkl"
+    classifier_path.write_bytes(b"model")
+    meta_path.write_bytes(b"meta")
+    monkeypatch.setattr(localinferenceapi, "UPLOAD_ROOT", upload_root)
+    original_replace = Path.replace
+
+    def fail_meta_replace(self: Path, target):
+        if self == meta_path:
+            raise OSError("forced metadata rename failure")
+        return original_replace(self, target)
+
+    monkeypatch.setattr(Path, "replace", fail_meta_replace)
+
+    with pytest.raises(HTTPException) as exc_info:
+        localinferenceapi.rename_clip_classifier(rel_path="head.pkl", new_name="renamed")
+
+    assert exc_info.value.status_code == 500
+    assert str(exc_info.value.detail).startswith("classifier_meta_rename_failed:")
+    assert classifier_path.read_bytes() == b"model"
+    assert meta_path.read_bytes() == b"meta"
+    assert not (classifiers_root / "renamed.pkl").exists()
+    assert not (classifiers_root / "renamed.meta.pkl").exists()
+
+
+def test_rename_clip_classifier_rolls_back_meta_when_model_rename_fails(
+    tmp_path, monkeypatch
+) -> None:
+    upload_root = tmp_path / "uploads"
+    classifiers_root = upload_root / "classifiers"
+    classifiers_root.mkdir(parents=True)
+    classifier_path = classifiers_root / "head.pkl"
+    meta_path = classifiers_root / "head.meta.pkl"
+    classifier_path.write_bytes(b"model")
+    meta_path.write_bytes(b"meta")
+    monkeypatch.setattr(localinferenceapi, "UPLOAD_ROOT", upload_root)
+    original_rename = Path.rename
+
+    def fail_model_rename(self: Path, target):
+        if self == classifier_path:
+            raise OSError("forced model rename failure")
+        return original_rename(self, target)
+
+    monkeypatch.setattr(Path, "rename", fail_model_rename)
+
+    with pytest.raises(HTTPException) as exc_info:
+        localinferenceapi.rename_clip_classifier(rel_path="head.pkl", new_name="renamed")
+
+    assert exc_info.value.status_code == 500
+    assert classifier_path.read_bytes() == b"model"
+    assert meta_path.read_bytes() == b"meta"
+    assert not (classifiers_root / "renamed.pkl").exists()
+    assert not (classifiers_root / "renamed.meta.pkl").exists()
 
 
 def test_rename_clip_classifier_does_not_follow_existing_target_symlink(
@@ -646,6 +859,42 @@ def test_resolve_clip_labelmap_allows_plain_nested_relative_path(tmp_path) -> No
     )
 
     assert resolved == target.resolve()
+
+
+def test_resolve_clip_labelmap_supports_windows_path_hints(tmp_path) -> None:
+    upload_root = tmp_path / "uploads"
+    labelmaps_root = upload_root / "labelmaps"
+    nested = labelmaps_root / "nested"
+    nested.mkdir(parents=True)
+    basename_target = labelmaps_root / "target.pkl"
+    basename_target.write_bytes(b"labels")
+    nested_target = nested / "target.txt"
+    nested_target.write_text("car\n", encoding="utf-8")
+
+    for raw_path in (
+        "C:/export/target.pkl",
+        r"C:\export\target.pkl",
+        r"\\server\share\target.pkl",
+    ):
+        resolved = localinferenceapi._resolve_clip_labelmap_path_impl(
+            raw_path,
+            root_hint="labelmaps",
+            upload_root=upload_root,
+            labelmap_exts=localinferenceapi.LABELMAP_ALLOWED_EXTS,
+            path_is_within_root_fn=localinferenceapi._path_is_within_root_impl,
+        )
+
+        assert resolved == basename_target.resolve()
+
+    resolved_nested = localinferenceapi._resolve_clip_labelmap_path_impl(
+        r"nested\target.txt",
+        root_hint="labelmaps",
+        upload_root=upload_root,
+        labelmap_exts=localinferenceapi.LABELMAP_ALLOWED_EXTS,
+        path_is_within_root_fn=localinferenceapi._path_is_within_root_impl,
+    )
+
+    assert resolved_nested == nested_target.resolve()
 
 
 def test_delete_active_clip_labelmap_clears_active_label_state(tmp_path, monkeypatch) -> None:

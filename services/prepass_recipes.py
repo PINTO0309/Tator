@@ -15,7 +15,7 @@ import zipfile
 import hashlib
 import tempfile
 from datetime import datetime
-from pathlib import Path
+from pathlib import Path, PureWindowsPath
 from typing import Any, Dict, Optional, Literal, List, Tuple
 
 from fastapi import HTTPException
@@ -192,11 +192,49 @@ def _write_png_file(path: Path, image: Image.Image) -> Path:
     return _write_binary_file(path, lambda handle: image.save(handle, format="PNG"))
 
 
+def _zip_directory_guarded(source_dir: Path, zip_path: Path) -> Path:
+    source_root = source_dir.resolve(strict=True)
+    tmp_path = _prepare_atomic_output_file(zip_path)
+    try:
+        with zipfile.ZipFile(tmp_path, "w", compression=zipfile.ZIP_DEFLATED) as zf:
+            for item in sorted(source_root.rglob("*")):
+                if not _safe_regular_file_within_root(item, source_root):
+                    continue
+                zf.write(item.resolve(strict=True), arcname=str(item.relative_to(source_root)))
+        os.replace(tmp_path, zip_path)
+    finally:
+        if tmp_path.exists() or tmp_path.is_symlink():
+            tmp_path.unlink(missing_ok=True)
+    return zip_path
+
+
 def _zip_write_safe_file(zf: zipfile.ZipFile, path: Path, root: Path, arcname: str) -> bool:
     if not _safe_regular_file_within_root(path, root):
         return False
     zf.write(path.resolve(strict=True), arcname=arcname)
     return True
+
+
+def _zip_member_names_or_duplicate_error(zf: zipfile.ZipFile, *, detail: str) -> List[str]:
+    names = zf.namelist()
+    if len(names) != len(set(names)):
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail=detail)
+    return names
+
+
+def _zip_member_path_is_unsafe(name: str) -> bool:
+    member_name = str(name or "")
+    member_win = PureWindowsPath(member_name)
+    member_posix = Path(member_name)
+    return (
+        not member_name
+        or member_name.startswith("/")
+        or member_name.startswith("\\")
+        or member_win.is_absolute()
+        or bool(member_win.drive)
+        or member_posix.is_absolute()
+        or ".." in member_posix.parts
+    )
 
 
 def _write_prepass_recipe_meta(recipe_dir: Path, payload: Dict[str, Any]) -> None:
@@ -1533,7 +1571,7 @@ def _ensure_recipe_zip_impl(
     if zip_raw.exists():
         try:
             with zipfile.ZipFile(zip_raw, "r") as zf:
-                if zf.testzip() is None:
+                if zf.testzip() is None and "recipe.json" in set(zf.namelist()):
                     return zip_raw
         except Exception:
             try:
@@ -1680,12 +1718,11 @@ def _import_agent_recipe_zip_obj_impl(
     data: Dict[str, Any] = {}
     crops: Dict[str, bytes] = {}
     clip_head_files: Dict[str, bytes] = {}
-    names = zf.namelist()
-    json_name = None
+    names = _zip_member_names_or_duplicate_error(zf, detail="agent_recipe_import_duplicate_files")
     for name in names:
-        if name.lower().endswith(".json"):
-            json_name = name
-            break
+        if _zip_member_path_is_unsafe(name):
+            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="agent_recipe_import_invalid_path")
+    json_name = "recipe.json" if "recipe.json" in names else None
     if not json_name:
         raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="agent_recipe_import_no_json")
     json_info = zf.getinfo(json_name)
@@ -1696,9 +1733,6 @@ def _import_agent_recipe_zip_obj_impl(
         )
     if json_info.file_size > max_json_bytes:
         raise HTTPException(status_code=HTTP_413_CONTENT_TOO_LARGE, detail="agent_recipe_import_json_too_large")
-    json_path = Path(json_name)
-    if json_path.is_absolute() or ".." in json_path.parts:
-        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="agent_recipe_import_invalid_path")
     with zf.open(json_name) as jf:
         data = json.load(jf)
 
@@ -1710,8 +1744,6 @@ def _import_agent_recipe_zip_obj_impl(
         arc_path = Path(name)
         if arc_path.is_dir():
             continue
-        if arc_path.is_absolute() or ".." in arc_path.parts:
-            raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="agent_recipe_import_invalid_path")
         mode = (info.external_attr >> 16) & 0xFFFF
         if stat.S_ISLNK(mode):
             raise HTTPException(
@@ -2240,13 +2272,19 @@ def _import_prepass_recipe_from_zip_impl(
     def _extract_zip_safely(zf: zipfile.ZipFile, dest_dir: Path) -> None:
         root = dest_dir.resolve()
         total_uncompressed = 0
+        seen_members: set[str] = set()
         for info in zf.infolist():
             member_name = info.filename or ""
+            if member_name in seen_members:
+                raise HTTPException(
+                    status_code=HTTP_400_BAD_REQUEST,
+                    detail="prepass_recipe_archive_duplicate_files",
+                )
+            seen_members.add(member_name)
             # Reject absolute paths and parent traversal entries before extraction.
             resolved_member = (dest_dir / member_name).resolve()
             if (
-                member_name.startswith("/")
-                or member_name.startswith("\\")
+                _zip_member_path_is_unsafe(member_name)
                 or (
                     resolved_member != root
                     and root not in resolved_member.parents
@@ -2647,33 +2685,48 @@ def _export_prepass_recipe_impl(
         sanitize_id_fn=sanitize_run_id_fn,
     )
     meta = load_meta_fn(recipe_dir)
-    temp_dir = Path(
-        tempfile.mkdtemp(prefix=f"prepass_recipe_{recipe_id}_", dir=prepass_recipe_export_root)
+    export_root = _recipe_storage_root(
+        prepass_recipe_export_root,
+        create=True,
+        detail="prepass_recipe_path_invalid",
     )
-    meta_copy = json.loads(json.dumps(meta))
-    config_copy = meta_copy.get("config") or {}
+    temp_dir = Path(
+        tempfile.mkdtemp(prefix=f"prepass_recipe_{recipe_dir.name}_", dir=str(export_root))
+    )
+    temp_dir = temp_dir.resolve(strict=True)
     if (
-        isinstance(config_copy, dict)
-        and "dataset_id" in config_copy
-        and not _is_canonical_prepass_recipe_config(config_copy)
+        _path_has_symlink_component(temp_dir)
+        or temp_dir.parent != export_root
+        or not _path_within_root(temp_dir, export_root)
     ):
-        config_copy = dict(config_copy)
-        config_copy.pop("dataset_id", None)
-        meta_copy["config"] = config_copy
-    meta_path = temp_dir / prepass_recipe_meta
-    _write_json_file(meta_path, meta_copy)
-    assets = collect_assets_fn(meta_copy, temp_dir)
-    manifest = {
-        "schema_version": prepass_schema_version,
-        "recipe_id": meta.get("id") or recipe_id,
-        "generated_at": time.time(),
-        "assets": assets,
-    }
-    manifest_path = temp_dir / "manifest.json"
-    _write_json_file(manifest_path, manifest)
+        shutil.rmtree(temp_dir, ignore_errors=True)
+        raise HTTPException(status_code=HTTP_400_BAD_REQUEST, detail="prepass_recipe_path_invalid")
     zip_path = temp_dir.with_suffix(".zip")
-    shutil.make_archive(zip_path.with_suffix("").as_posix(), "zip", temp_dir.as_posix())
-    return zip_path
+    try:
+        meta_copy = json.loads(json.dumps(meta))
+        config_copy = meta_copy.get("config") or {}
+        if (
+            isinstance(config_copy, dict)
+            and "dataset_id" in config_copy
+            and not _is_canonical_prepass_recipe_config(config_copy)
+        ):
+            config_copy = dict(config_copy)
+            config_copy.pop("dataset_id", None)
+            meta_copy["config"] = config_copy
+        meta_path = temp_dir / prepass_recipe_meta
+        _write_json_file(meta_path, meta_copy)
+        assets = collect_assets_fn(meta_copy, temp_dir)
+        manifest = {
+            "schema_version": prepass_schema_version,
+            "recipe_id": meta.get("id") or recipe_id,
+            "generated_at": time.time(),
+            "assets": assets,
+        }
+        manifest_path = temp_dir / "manifest.json"
+        _write_json_file(manifest_path, manifest)
+        return _zip_directory_guarded(temp_dir, zip_path)
+    finally:
+        shutil.rmtree(temp_dir, ignore_errors=True)
 
 
 def _save_prepass_recipe_impl(
