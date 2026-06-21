@@ -1,8 +1,10 @@
 Tools
 
-- macOS backend launcher
+- Backend launchers
   - Run: `tools/run_macos_backend.sh`
+  - Linux run: `tools/run_linux_backend.sh`
   - Optional port override: `PORT=8080 tools/run_macos_backend.sh`
+  - Linux optional port override: `PORT=8080 tools/run_linux_backend.sh`
 
 - Labelmap reorder via Hungarian assignment
   - Run: `python tools/reorder_labelmap.py --help`

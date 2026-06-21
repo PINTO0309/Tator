@@ -42,6 +42,13 @@ The generated environments are:
 - `.venv-macos` for the Apple Silicon profile.
 - `.venv` for the default Linux and Falcon profiles, unless `--venv-dir` is provided.
 
+Start the backend with the matching launcher:
+
+```bash
+tools/run_macos_backend.sh
+tools/run_linux_backend.sh
+```
+
 The older shell commands remain available and now delegate to the same setup
 implementation:
 
@@ -174,6 +181,13 @@ Expected outcome for the recommended path:
 
 - `torch 2.7.1+cu118`
 - CUDA available on the GPU machine
+
+Then start the Linux backend:
+
+```bash
+cp .env.example .env
+tools/run_linux_backend.sh
+```
 
 ## Optional Newer-Wheel Path
 

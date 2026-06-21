@@ -256,7 +256,7 @@ def _finish_message(profile: str, venv_dir: Path) -> None:
         print("  tools/run_macos_backend.sh")
     else:
         print("  cp .env.example .env")
-        print("  python -m uvicorn app:app --host 0.0.0.0 --port 8000")
+        print("  tools/run_linux_backend.sh")
 
 
 def parse_args(argv: list[str] | None = None) -> argparse.Namespace:

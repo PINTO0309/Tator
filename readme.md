@@ -14,7 +14,7 @@ annotation changes become trusted labels.
 
 ## Start Here
 
-Install the local environment once:
+Install the local environment once. On Apple Silicon macOS:
 
 ```bash
 poetry install --only-root
@@ -36,10 +36,21 @@ Then start the backend from the repository root with this single command:
 tools/run_macos_backend.sh
 ```
 
+On Linux:
+
+```bash
+poetry install --only-root
+poetry run tator-setup linux
+cp .env.example .env
+tools/run_linux_backend.sh
+```
+
 If you are not already in the repo, use:
 
 ```bash
 cd <your Tator checkout> && tools/run_macos_backend.sh
+# or, on Linux:
+cd <your Tator checkout> && tools/run_linux_backend.sh
 ```
 
 Leave that terminal running. When the backend is up, open:
@@ -55,6 +66,8 @@ If port `8000` is already in use:
 
 ```bash
 PORT=8080 tools/run_macos_backend.sh
+# or, on Linux:
+PORT=8080 tools/run_linux_backend.sh
 ```
 
 Quick health check from a second terminal:
@@ -259,6 +272,15 @@ QWEN_INFERENCE_PLATFORM=auto
 QWEN_MLX_MODEL_NAME=mlx-community/Qwen3-VL-4B-Instruct-4bit
 TATOR_QWEN_PROGRESS_STALE_SECONDS=1800
 DINOV3_BACKEND=auto
+```
+
+Optional Linux overrides can go in `.env`:
+
+```bash
+TATOR_INFERENCE_DEVICE=auto
+SAM3_DEVICE=auto
+QWEN_DEVICE=auto
+QWEN_INFERENCE_PLATFORM=auto
 ```
 
 See [macOS Inference Setup](docs/macos_inference_setup.md) for MLX-DINOv3,

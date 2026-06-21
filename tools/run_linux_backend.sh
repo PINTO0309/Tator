@@ -1,0 +1,41 @@
+#!/usr/bin/env bash
+set -euo pipefail
+
+ROOT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+VENV_DIR="${VENV_DIR:-${ROOT_DIR}/.venv}"
+ENV_FILE="${ENV_FILE:-${ROOT_DIR}/.env}"
+HOST="${HOST:-127.0.0.1}"
+PORT="${PORT:-8000}"
+
+if [[ ! -x "${VENV_DIR}/bin/python" ]]; then
+  echo "Missing ${VENV_DIR}/bin/python. Run poetry run tator-setup linux first." >&2
+  exit 1
+fi
+
+cd "${ROOT_DIR}"
+
+if [[ -f "${ENV_FILE}" ]]; then
+  set -a
+  # shellcheck disable=SC1090
+  source "${ENV_FILE}"
+  set +a
+fi
+
+export TATOR_INFERENCE_DEVICE="${TATOR_INFERENCE_DEVICE:-auto}"
+export TATOR_ALLOW_MPS="${TATOR_ALLOW_MPS:-0}"
+export SAM3_DEVICE="${SAM3_DEVICE:-auto}"
+export QWEN_DEVICE="${QWEN_DEVICE:-auto}"
+export QWEN_INFERENCE_PLATFORM="${QWEN_INFERENCE_PLATFORM:-auto}"
+
+while true; do
+  set +e
+  "${VENV_DIR}/bin/python" -m uvicorn app:app --host "${HOST}" --port "${PORT}"
+  status=$?
+  set -e
+  if [[ "${status}" == "${TATOR_QWEN_CANCEL_RESTART_EXIT_CODE:-75}" ]]; then
+    echo "Backend exited after Qwen cancellation; restarting..." >&2
+    sleep "${TATOR_BACKEND_RESTART_DELAY:-1}"
+    continue
+  fi
+  exit "${status}"
+done
